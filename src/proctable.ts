@@ -221,7 +221,7 @@ export function signalProcess(id: { pid: number; startTime: string }, signal: No
       const signo = constants.signals[signal];
       if (group === undefined) return nativeFn("pidfdSignal")(fd, signo, false);
       if (row!.pgid !== group) return false;
-      return signalGroupLinux(group, signal);
+      return signalGroupLinux(id, group, signal);
     } finally {
       nativeFn("fdClose")(fd);
     }
@@ -232,17 +232,26 @@ export function signalProcess(id: { pid: number; startTime: string }, signal: No
   return killQuietly(group !== undefined ? -group : id.pid, signal);
 }
 
-/** Linux: signal a process group through its leader's pidfd when possible. */
-function signalGroupLinux(group: number, signal: NodeJS.Signals): boolean {
+/**
+ * Linux: signal a process group through its leader's pidfd when possible.
+ * `member` is a process already verified to be in `group`; it is re-checked
+ * after the leader's pidfd is open, so the pinned leader is the leader of the
+ * group the member is in (the group id cannot change hands while the member
+ * stays in it).
+ */
+function signalGroupLinux(member: { pid: number; startTime: string }, group: number, signal: NodeJS.Signals): boolean {
+  const memberStill = () => {
+    const row = processInfo(member.pid);
+    return matches(row, member) && row!.pgid === group;
+  };
   if (pidfdGroupUsable) {
     const leaderFd = nativeFn("pidfdOpen")(group);
     if (leaderFd >= 0) {
       try {
-        // The PID equals the group id and the process is in that group: it is
-        // the leader of this group, pinned by the pidfd.
-        if (processInfo(group)?.pgid === group) {
+        const leader = processInfo(group);
+        if (leader?.pgid === group && memberStill()) {
           try {
-            return nativeFn("pidfdSignal")(leaderFd, constants.signals[signal], true) || killQuietly(-group, signal);
+            if (nativeFn("pidfdSignal")(leaderFd, constants.signals[signal], true)) return true;
           } catch (error) {
             if (errnoCode(error) !== "EINVAL") throw error;
             pidfdGroupUsable = false; // kernels before 6.9
@@ -253,7 +262,10 @@ function signalGroupLinux(group: number, signal: NodeJS.Signals): boolean {
       }
     }
   }
-  return killQuietly(-group, signal);
+  // Leader gone or kernel without group pidfd signals: kill(-group) after a
+  // fresh check that the member is still in the group. Between this check and
+  // kill() the member could exit and the group id be reused (residual risk).
+  return memberStill() && killQuietly(-group, signal);
 }
 
 function killQuietly(target: number, signal: NodeJS.Signals): boolean {
