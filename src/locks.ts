@@ -226,8 +226,13 @@ function readRecord(file: string, key: string): ReadRecord {
   } catch (error) {
     return { invalid: (error as Error).message };
   }
-  const problem = recordProblem(value, key);
-  return problem ? { invalid: problem } : { record: value };
+  try {
+    const problem = recordProblem(value, key);
+    return problem ? { invalid: problem } : { record: value };
+  } catch (error) {
+    // Stored paths are untrusted; probing them may fail before a key exists.
+    return { invalid: `cannot validate record: ${(error as Error).message}` };
+  }
 }
 
 /** Writes the record atomically (temporary file, then rename). */
@@ -535,8 +540,13 @@ export async function acquireSessionWriterLock(
   assertLocalFilesystem(paths.canonical);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
   if (!raw) return { heldBy: readRecord(paths.record, paths.key).record };
-  const { record, invalid } = readRecord(paths.record, paths.key);
-  return new WriterLock(raw, paths, host, record, invalid);
+  try {
+    const { record, invalid } = readRecord(paths.record, paths.key);
+    return new WriterLock(raw, paths, host, record, invalid);
+  } catch (error) {
+    raw.release();
+    throw error;
+  }
 }
 
 export function isSessionWriterLock(value: SessionWriterLock | SessionLockBusy): value is SessionWriterLock {
@@ -548,9 +558,11 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
-  const { record } = readRecord(paths.record, paths.key);
-  if (!raw) return { held: true, ...(record ? { record } : {}) };
-  raw.release();
-  return { held: false, ...(record ? { record } : {}) };
+  try {
+    const { record } = readRecord(paths.record, paths.key);
+    return { held: !raw, ...(record ? { record } : {}) };
+  } finally {
+    raw?.release();
+  }
 }
 

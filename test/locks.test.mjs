@@ -106,6 +106,61 @@ describe("instance lock", () => {
 });
 
 describe("session writer lock", () => {
+  test("a record whose path probe throws is invalid and never leaks acquire or probe ownership", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const file = f.sessionPath("invalid-record-path");
+    const first = await acquireSessionWriterLock(file, host());
+    await first.recoverPreviousWriter();
+    await first.release();
+    const recordFile = recordPath(first.sessionFile);
+    const record = JSON.parse(readFileSync(recordFile, "utf8"));
+    record.sessionFile = "/\u0000";
+    record.state = "running";
+    const invalid = JSON.stringify(record);
+    writeFileSync(recordFile, invalid);
+    for (let i = 0; i < 2; i++) {
+      assert.equal((await probeSessionWriterLock(file)).held, false);
+      const lock = await acquireSessionWriterLock(file, host());
+      assert.ok(isSessionWriterLock(lock));
+      assert.equal(await lock.recoverPreviousWriter(), "failed");
+      assert.equal(readFileSync(recordFile, "utf8"), invalid);
+    }
+    const again = await acquireSessionWriterLock(file, host());
+    assert.ok(isSessionWriterLock(again));
+    await again.release();
+  });
+
+  test("unexpected errors after raw acquisition release acquire and probe locks", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const file = f.sessionPath("unexpected-record-error");
+    const first = await acquireSessionWriterLock(file, host());
+    await first.recoverPreviousWriter();
+    await first.release();
+    const recordFile = recordPath(first.sessionFile);
+    for (const operation of [acquireSessionWriterLock, probeSessionWriterLock]) {
+      const original = fs.readFileSync;
+      fs.readFileSync = (target, ...args) => {
+        if (target === recordFile) {
+          // An unexpected exception inside the read-error handler exercises the raw guard.
+          throw Object.defineProperty(new Error(), "message", { get() { throw new Error("unexpected record fault"); } });
+        }
+        return original(target, ...args);
+      };
+      syncBuiltinESMExports();
+      try {
+        await assert.rejects(operation(file, host()), /unexpected record fault/);
+      } finally {
+        fs.readFileSync = original;
+        syncBuiltinESMExports();
+      }
+      const again = await acquireSessionWriterLock(file, host());
+      assert.ok(isSessionWriterLock(again));
+      await again.release();
+    }
+  });
+
   test("release refuses an unknown writer state and preserves the record", async () => {
     const f = await piFixture();
     cleanups.push(f.cleanup);
