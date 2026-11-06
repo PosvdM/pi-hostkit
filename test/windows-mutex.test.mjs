@@ -166,7 +166,7 @@ if (!$m) {
     if ($LASTEXITCODE -ne 0) { throw "Challenger exited with $LASTEXITCODE" }
     $acquired = $m.WaitOne(0)
     if ($acquired) { $m.ReleaseMutex() }
-    @{ unavailable = $false; owner = $owner; current = $current.Value; acquiredAfterRejection = $acquired; results = ($reply | ConvertFrom-Json) } | ConvertTo-Json -Depth 5 -Compress
+    @{ unavailable = $false; owner = $owner; current = $current.Value; acquiredAfterRejection = $acquired; resultsJson = [string]($reply -join [Environment]::NewLine) } | ConvertTo-Json -Depth 5 -Compress
   } finally { $m.Dispose() }
 }
 `, {
@@ -183,8 +183,10 @@ if (!$m) {
     }
     assert.notEqual(actual.owner, actual.current);
     assert.equal(actual.acquiredAfterRejection, true, "rejection must leave the mutex unowned");
-    assert.equal(actual.results.length, 16);
-    for (const result of actual.results) {
+    const results = JSON.parse(actual.resultsJson);
+    assert.ok(Array.isArray(results), actual.resultsJson);
+    assert.equal(results.length, 16);
+    for (const result of results) {
       assert.equal(result.code, "EACCES", JSON.stringify(result));
       assert.equal(result.errno, 5);
       assert.match(result.message, /owner verification/);
