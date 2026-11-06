@@ -132,6 +132,13 @@ describe("spawnManaged", () => {
   });
 });
 
+test("a recorded cgroup path that is not a pi-hostkit scope is never killed", { skip: process.platform !== "linux" }, async () => {
+  const me = currentProcessIdentity("test");
+  const report = await stopByIdentity({ ...me, startTime: "0:0", cgroup: "/sys/fs/cgroup/user.slice" }, FAST_STOP);
+  assert.equal(report.coverage, "snapshot_visible");
+  assert.equal(await isSameProcess(me), "alive");
+});
+
 test("Linux CI provides cgroup v2 user scopes", { skip: !process.env.HOSTKIT_TEST_REQUIRE_CGROUP }, async () => {
   assert.ok(await linuxCgroupSupport(), "systemd-run --user --scope is not usable");
 });
@@ -167,7 +174,8 @@ describe("process identity", () => {
       return;
     }
     assert.equal(await isSameProcess(identity), "alive");
-    const wrong = await stopByIdentity({ ...identity, startTime: `${identity.startTime}9` }, FAST_STOP);
+    // Without the cgroup field: a recorded scope is killed as a whole by design.
+    const wrong = await stopByIdentity({ ...identity, startTime: `${identity.startTime}9`, cgroup: undefined }, FAST_STOP);
     assert.equal(wrong.steps.find((s) => s.step === "identity").detail, "gone");
     assert.equal(await isSameProcess(identity), "alive", "a mismatched identity must not be signalled");
     const report = await stopByIdentity(identity, FAST_STOP);

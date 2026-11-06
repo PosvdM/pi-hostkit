@@ -209,6 +209,15 @@ function cgroupKill(dir: string): string {
   return "SIGKILL members";
 }
 
+/**
+ * Only scopes created by spawnManaged are killed as a whole: the unit name
+ * carries a random suffix, so the scope belongs to one run. A recorded path
+ * outside that pattern (for example a parent slice) is ignored.
+ */
+function isOwnScope(dir: string | undefined): boolean {
+  return !!dir && /^\/sys\/fs\/cgroup\/(?:[^/]+\/)*pi-hostkit-[A-Za-z0-9_.-]+-[0-9a-f]{8}\.scope$/.test(dir) && !dir.includes("/../");
+}
+
 function scopeUnit(runId: string): string {
   const safe = runId.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64);
   return `pi-hostkit-${safe}-${randomBytes(4).toString("hex")}`;
@@ -561,7 +570,9 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
 
 /**
  * Stops a process recorded by an earlier host instance (no RPC connection, not
- * a child of this process). Verifies the identity before every signal.
+ * a child of this process). Verifies the identity before every signal. With a
+ * recorded cgroup scope of its own, the whole scope is killed even when pi
+ * itself has exited: the scope holds only that run's processes.
  */
 export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}): Promise<StopReport> {
   const o = { ...DEFAULT_STOP, ...opts };
@@ -584,7 +595,7 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
     return { steps: steps.steps, coverage: "snapshot_visible", leftovers: rowsToLeftovers(leftovers) };
   }
 
-  const cgroup = id.cgroup && existsSync(id.cgroup) ? id.cgroup : undefined;
+  const cgroup = isOwnScope(id.cgroup) && existsSync(id.cgroup!) ? id.cgroup : undefined;
   const records = new SnapshotRecords(id);
   if (!cgroup) records.capture();
   if (alive()) {
