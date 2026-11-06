@@ -328,6 +328,11 @@ describe("session writer lock", () => {
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--continue", "--", "--session", sessionFile]) }), { code: "EINVAL" });
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv([`--session=${sessionFile}`]) }), { code: "EINVAL" });
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile, "--continue"]) }), { code: "EINVAL" });
+    // Paths whose meaning depends on pi's environment or working directory.
+    const homeRelative = `~/${path.relative(home.dir, sessionFile).split(path.sep).join("/")}`;
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", homeRelative]) }), { code: "EINVAL" });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", path.relative(f.cwd, sessionFile)]) }), { code: "EINVAL" });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--tools", "+bash,read", "--session", sessionFile]) }), { code: "EINVAL" });
     const writer = await lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) });
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) }), { code: "EHOSTKIT_LOCK_STATE" });
     await writer.stop(FAST_STOP);
@@ -371,12 +376,15 @@ describe("session writer lock", () => {
     assert.equal(afterDashes.exitCode, null, "a gate whose --session is only a message must not be stopped");
 
     const relative = await startGate(path.basename(sessionFile));
+    const tilde = await startGate("~/sessions/x.jsonl");
     const again = await acquireWhenFree(sessionFile, "pi-pane");
     assert.equal(await again.recoverPreviousWriter(FAST_STOP), "failed");
     assert.equal(relative.exitCode, null);
+    assert.equal(tilde.exitCode, null, "a ~ path is not resolved with this host's home");
     other.kill("SIGKILL");
     afterDashes.kill("SIGKILL");
     relative.kill("SIGKILL");
+    tilde.kill("SIGKILL");
   });
 
   test("a record with valid JSON but invalid content fails closed", async () => {

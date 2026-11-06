@@ -274,9 +274,9 @@ type Candidates = { found: ProcessIdentity[]; uncertain: boolean };
  *
  * The command line is `<node> <gate.js> <cli.js> <pi arguments…>`; the pi
  * arguments are interpreted with pi's own rules (`parsePiArgs`), so a
- * `--session` after `--`, or one that pi ignores, does not count. A relative
- * `--session` cannot be resolved without the process's working directory and
- * makes the search uncertain. A loaded pi sets `process.title`, which
+ * `--session` after `--`, or one that pi ignores, does not count. A
+ * `--session` whose meaning depends on that process (relative, `~`, Windows
+ * path without a drive) cannot be resolved here and makes the search uncertain. A loaded pi sets `process.title`, which
  * overwrites its command line on macOS and Linux, so it is usually not found
  * there. Not finding one is therefore never taken as proof that no writer exists.
  */
@@ -290,8 +290,8 @@ function findWritersByCommandLine(canonical: string): Candidates {
     if (!args) continue;
     const gate = gateIndex(args);
     if (gate < 0) continue;
-    const target = rpcSessionFile(args.slice(gate + 2), undefined);
-    if (target.relative) {
+    const target = rpcSessionFile(args.slice(gate + 2));
+    if (target.uncertain) {
       uncertain = true;
       continue;
     }
@@ -308,13 +308,15 @@ function findWritersByCommandLine(canonical: string): Candidates {
 }
 
 /**
- * pi started with `argv` (`[cliEntry, ...pi arguments]`) in `cwd` must open
- * exactly this lock's file as its RPC session, by pi's own argument rules, and
- * nothing may make it pick another session.
+ * pi started with `argv` (`[cliEntry, ...pi arguments]`) must open exactly
+ * this lock's file as its RPC session, by pi's own argument rules, and nothing
+ * may make it pick another session. The `--session` value must be an absolute
+ * path that does not depend on pi's environment or working directory (no `~`,
+ * no relative path, on Windows a drive letter or UNC path).
  */
-function assertSessionArg(argv: string[], cwd: string, canonical: string): void {
+function assertSessionArg(argv: string[], canonical: string): void {
   const piArgs = argv.slice(1);
-  const target = rpcSessionFile(piArgs, cwd);
+  const target = rpcSessionFile(piArgs);
   let ok = false;
   try {
     ok = !!target.file && hasOnlyExplicitSession(piArgs) && sameFile(target.file, comparisonKey(canonical));
@@ -461,7 +463,7 @@ class WriterLock implements SessionWriterLock {
       if (!this.writerExited) {
         throw Object.assign(new Error("a writer spawned through this lock is still running"), { code: "EHOSTKIT_LOCK_STATE" });
       }
-      assertSessionArg(spec.argv, spec.cwd, this.paths.canonical);
+      assertSessionArg(spec.argv, this.paths.canonical);
       const proc = await spawnManaged({ ...spec, startHeld: true });
       try {
         this.writeUpdate({ writer: proc.identity, state: "running" });

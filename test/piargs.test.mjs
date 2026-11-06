@@ -42,6 +42,14 @@ const cases = [
   ["--mode", "rpc", "--offline", "-ne", "-ns", "-np", "--no-themes", "-e", "/x/ext.ts", "--session", abs],
   ["--session", abs, "--mode"],
   ["--mode", "rpc", "--thinking", "bogus", "--session", abs],
+  ["--mode", "rpc", "--tools", "+bash,read", "--session", abs],
+  ["--mode", "rpc", "-t", "+bash,-read", "--session", abs],
+  ["--mode", "rpc", "--tools", "+ba*", "--session", abs],
+  ["--mode", "rpc", "--tools", "read, grep ,", "--session", abs],
+  ["--mode", "rpc", "--exclude-tools", "+bash,read", "--session", abs],
+  ["--mode", "rpc", "@notes.md", "--session", abs],
+  ["--mode", "rpc", "--session", abs, "--", "@a", "b"],
+  ["--mode", "rpc", "--session-id", "x", "--session", abs],
 ];
 
 describe("parsePiArgs (differential against pi 1.5.0 parseArgs)", () => {
@@ -54,26 +62,36 @@ describe("parsePiArgs (differential against pi 1.5.0 parseArgs)", () => {
         assert.equal(mine[key], theirs[key], `${key} for ${label}`);
       }
       assert.equal(mine.errors.length > 0, theirs.diagnostics.some((d) => d.type === "error"), `errors for ${label}`);
+      assert.equal(mine.fileArgs, theirs.fileArgs.length, `fileArgs for ${label}`);
     }
   });
 });
 
 describe("rpcSessionFile", () => {
   test("only an effective --session path in RPC mode counts", () => {
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", abs], undefined), { file: abs });
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--continue", "--", "--session", abs], undefined), {});
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", `--session=${abs}`], undefined), {});
-    assert.deepEqual(rpcSessionFile(["--mode", "json", "--session", abs], undefined), {});
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", "abc123"], undefined), {}, "a session id, not a path");
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--no-session", "--session", abs], undefined), {});
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", "rel/a.jsonl"], undefined), { relative: true });
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", "rel/a.jsonl"], path.resolve("/w")), {
-      file: path.resolve("/w", "rel/a.jsonl"),
-    });
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", abs]), { file: abs });
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--continue", "--", "--session", abs]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", `--session=${abs}`]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "json", "--session", abs]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", "abc123"]), {}, "a session id, not a path");
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--no-session", "--session", abs]), {});
+  });
+
+  test("pi exits before opening the session: tool list errors, @file in RPC mode, --session-id with --session", () => {
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--tools", "+bash,read", "--session", abs]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "@notes.md", "--session", abs]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", abs, "--", "@a"]), {});
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session-id", "x", "--session", abs]), {});
+  });
+
+  test("paths that depend on the pi process are uncertain", () => {
+    for (const value of ["rel/a.jsonl", "~/a.jsonl", "a.jsonl", ...(process.platform === "win32" ? ["\\s\\a.jsonl", "/c/s/a.jsonl"] : [])]) {
+      assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", value]), { uncertain: true }, value);
+    }
   });
 
   test("--session wins over --continue in pi, but spawnWriter refuses the combination", () => {
-    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", abs, "--continue"], undefined), { file: abs });
+    assert.deepEqual(rpcSessionFile(["--mode", "rpc", "--session", abs, "--continue"]), { file: abs });
     assert.equal(hasOnlyExplicitSession(["--mode", "rpc", "--session", abs, "--continue"]), false);
     assert.equal(hasOnlyExplicitSession(["--mode", "rpc", "--session", abs]), true);
   });

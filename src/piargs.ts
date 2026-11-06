@@ -1,4 +1,4 @@
-import { resolveSessionArgPath } from "./paths.js";
+import { environmentIndependentPath } from "./paths.js";
 
 // Mirror of pi 1.5.0 `parseArgs` (dist/cli/args.js): which arguments consume
 // a value, `--` ending options, `@file` arguments and unknown flags. Only the
@@ -18,8 +18,19 @@ export interface PiArgs {
   print?: boolean;
   export?: string;
   listModels?: string | true;
+  /** Number of `@file` arguments (pi refuses them in RPC mode). */
+  fileArgs: number;
   /** Parser errors pi would report (pi exits on them). */
   errors: string[];
+}
+
+/** pi 1.5.0 `getToolListError` (dist/core/settings-manager.js). */
+function toolListError(entries: string[]): string | undefined {
+  const modifiers = entries.filter((e) => e.startsWith("+") || e.startsWith("-"));
+  if (modifiers.length === 0) return undefined;
+  if (modifiers.length < entries.length) return "tool names cannot be mixed with +name or -name entries";
+  const pattern = modifiers.find((e) => e.includes("*"));
+  return pattern ? `+name and -name entries take exact tool names, not patterns: ${pattern}` : undefined;
 }
 
 // Options that take the next argument when one is present (`--x` with `i + 1 < length`).
@@ -80,10 +91,14 @@ const FLAGS = new Set([
 ]);
 
 export function parsePiArgs(args: readonly string[]): PiArgs {
-  const result: PiArgs = { errors: [] };
+  const result: PiArgs = { errors: [], fileArgs: 0 };
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    if (arg === "--") break; // everything after is a message or @file
+    if (arg === "--") {
+      // everything after is a message or @file
+      result.fileArgs += args.slice(i + 1).filter((a) => a.startsWith("@")).length;
+      break;
+    }
     if (arg === "--mode") {
       const mode = args[i + 1];
       if (mode === undefined || mode.startsWith("-")) {
@@ -101,7 +116,10 @@ export function parsePiArgs(args: readonly string[]): PiArgs {
       else result.errors.push("--name requires a value");
     } else if (VALUE_IF_PRESENT.has(arg) && i + 1 < args.length) {
       const value = args[++i]!;
-      if (arg === "--session") result.session = value;
+      if (arg === "--tools" || arg === "-t") {
+        const error = toolListError(value.split(",").map((t) => t.trim()).filter((t) => t.length > 0));
+        if (error) result.errors.push(`${arg}: ${error}`);
+      } else if (arg === "--session") result.session = value;
       else if (arg === "--session-id") result.sessionId = value;
       else if (arg === "--fork") result.fork = value;
       else if (arg === "--export") result.export = value;
@@ -130,7 +148,7 @@ export function parsePiArgs(args: readonly string[]): PiArgs {
         if (mode !== "regular" && mode !== "fullscreen") result.errors.push(`Invalid TUI mode "${mode}"`);
       }
     } else if (arg.startsWith("@")) {
-      // file argument
+      result.fileArgs++;
     } else if (arg.startsWith("--")) {
       // Unknown (extension) flag: `--x=value`, or `--x value` when the next
       // argument is not an option or @file.
@@ -147,23 +165,24 @@ export function parsePiArgs(args: readonly string[]): PiArgs {
 }
 
 /**
- * The session file a pi started with `args` in `cwd` opens for writing in RPC
- * mode, following pi 1.5.0 `createSessionManager`. Returns undefined when pi
- * would not run as an RPC writer of a file given by path: not RPC mode, parser
- * errors, `--no-session`, `--help`, `--version`, `--export`, `--list-models`,
- * `--fork`, no `--session`, or a `--session` value that pi treats as a
- * session id instead of a path. `cwd` may be undefined when unknown; a
- * relative path then yields `{ relative: true }`.
+ * The session file a pi started with `args` opens for writing in RPC mode,
+ * following pi 1.5.0 `main` and `createSessionManager`. Returns `{}` when pi
+ * would not run as an RPC writer of a file given by path: parser errors,
+ * `--version`, `--export`, not RPC mode, `@file` arguments in RPC mode,
+ * `--fork`, `--session-id` together with `--session`, `--no-session`,
+ * `--help`, `--list-models`, no `--session`, or a value pi treats as a session
+ * id. Returns `{ uncertain: true }` when the value is a path whose meaning
+ * depends on the pi process (relative, `~`, Windows path without a drive).
  */
-export function rpcSessionFile(args: readonly string[], cwd: string | undefined): { file?: string; relative?: true } {
+export function rpcSessionFile(args: readonly string[]): { file?: string; uncertain?: true } {
   const p = parsePiArgs(args);
-  if (p.errors.length || p.mode !== "rpc") return {};
-  if (p.noSession || p.help || p.version || p.export !== undefined || p.listModels !== undefined || p.fork !== undefined) return {};
-  if (p.session === undefined) return {};
+  if (p.errors.length || p.version || p.export !== undefined || p.mode !== "rpc" || p.fileArgs > 0) return {};
+  if (p.fork !== undefined || (p.sessionId !== undefined && p.session !== undefined)) return {};
+  if (p.noSession || p.help || p.listModels !== undefined || p.session === undefined) return {};
   // pi treats the value as a path when it contains a separator or ends in .jsonl; otherwise as a session id.
   if (!(p.session.includes("/") || p.session.includes("\\") || p.session.endsWith(".jsonl"))) return {};
-  const resolved = resolveSessionArgPath(p.session, cwd);
-  return resolved === undefined ? { relative: true } : { file: resolved };
+  const file = environmentIndependentPath(p.session);
+  return file === undefined ? { uncertain: true } : { file };
 }
 
 /** True when `args` contain no option that makes pi pick a session other than `--session`. */

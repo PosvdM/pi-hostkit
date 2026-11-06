@@ -50,15 +50,20 @@ export function resolveToolPath(input: string, cwd: string): string {
 }
 
 /**
- * pi's `resolvePath(sessionArg, cwd)` for a `--session` value (no Unicode
- * space or `@` handling, unlike tool paths). Returns undefined for a relative
- * value when `cwd` is unknown.
+ * A `--session` value whose meaning does not depend on the environment or the
+ * working directory of the pi process: a POSIX path starting with `/`, or on
+ * Windows a path with a drive letter (`C:\...` or `C:/...`) or a UNC path.
+ * Values starting with `~` (pi's home), `\x` without a drive (the current
+ * drive), Git Bash forms such as `/c/...` and relative
+ * paths depend on the target process and return undefined. The result is the
+ * path pi opens (`path.resolve` of the value).
  */
-export function resolveSessionArgPath(input: string, cwd: string | undefined): string | undefined {
-  const normalized = normalizeInput(input, {});
-  if (path.isAbsolute(normalized)) return path.resolve(normalized);
-  if (cwd === undefined) return undefined;
-  return path.resolve(normalizeInput(cwd, {}), normalized);
+export function environmentIndependentPath(value: string): string | undefined {
+  if (process.platform === "win32") {
+    if (/^[A-Za-z]:[\\/]/.test(value) || /^[\\/]{2}[^\\/?.]/.test(value)) return path.win32.resolve(value);
+    return undefined;
+  }
+  return value.startsWith("/") ? path.posix.resolve(value) : undefined;
 }
 
 function exists(filePath: string): boolean {

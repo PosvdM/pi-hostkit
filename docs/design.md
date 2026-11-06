@@ -187,7 +187,7 @@ pi 启动后用扩展在 `session_start` 中握手、宿主写入记录后再放
 
 ### 进程身份
 
-判断一个记录中的进程是否还活着，必须 PID 存在、创建时间相同，且不是僵尸进程；只有 PID 相同不算。任何终止操作之前都先做这项检查，不对一个可能已被复用的 PID 发信号。
+判断一个记录中的进程是否还活着，必须 PID 存在、创建时间相同，且不是僵尸进程；只有 PID 相同不算。任何终止操作之前都先做这项检查，身份不符时不发信号。能把目标固定住时（见“快照模式”中的 pidfd 和 Windows 句柄），检查之后 PID 被复用也不会误发；固定不住的情况在检查和发送之间仍有复用的可能，见“剩余风险”。
 
 查询进程表失败（权限、I/O 错误等）时抛出错误，不返回“不存在”：`processInfo` 只在进程确实不存在时返回 `null`，`isSameProcess` 只在确实不存在或身份不符时返回 `gone`。所以“无法判断”不会被当成“已退出”。
 
@@ -418,7 +418,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
    - 命令行的第一或第二个参数是 pi-hostkit 的 gate（绝对路径、文件名 `gate.js`，同一目录下有 `gate-protocol.js`），其后是 pi 的入口和 pi 参数；
    - 按 pi 自己的参数规则（见下文“pi 参数规则”），pi 会以 RPC 模式把 `--session` 给出的路径作为会话文件打开，且这个路径规范化后与该会话文件相同。
 
-   Windows 用 `NtQueryInformationProcess` 读出命令行，再用 `CommandLineToArgvW` 拆成参数；macOS 和 Linux 直接读参数。`--session` 的值是相对路径时，无法得知那个进程的工作目录，视为“无法判断”。找到的候选按第 3 步停止。**没找到，或有无法判断的进程，都不能排除遗留写者**，返回 `failed`。
+   Windows 用 `NtQueryInformationProcess` 读出命令行，再用 `CommandLineToArgvW` 拆成参数；macOS 和 Linux 直接读参数。`--session` 的值的含义取决于那个进程时（相对路径、`~` 开头、Windows 上没有盘符的 `\…` 或 Git Bash 形式的 `/c/…`），无法得知它的工作目录和环境，视为“无法判断”，不代入宿主自己的目录和环境。找到的候选按第 3 步停止。**没找到，或有无法判断的进程，都不能排除遗留写者**，返回 `failed`。
 
 结果的处理：
 
@@ -431,11 +431,12 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 
 恢复成功后，用 `spawnWriter` 拉起新写者。它按协议顺序执行：以 `startHeld` 启动（停在 gate）→ `update({ writer, state: "running" })` → `release()`。所以 pi 加载、打开会话文件之前，它的身份已经在记录里。写记录失败时停止该进程并抛出错误。
 
-- 按 pi 自己的参数规则，`spec.argv`（`[cliEntry, ...pi 参数]`，相对路径按 `spec.cwd` 解析）必须让 pi 以 RPC 模式打开这把锁的会话文件，并且不带 `--continue`、`--resume`、`--session-id`、`--print` 等会另选会话的选项，否则抛出 `EINVAL`。
+- 按 pi 自己的参数规则，`spec.argv`（`[cliEntry, ...pi 参数]`）必须让 pi 以 RPC 模式打开这把锁的会话文件，并且不带 `--continue`、`--resume`、`--session-id`、`--print` 等会另选会话的选项，否则抛出 `EINVAL`。
+- `--session` 的值必须是不依赖 pi 的环境和工作目录的绝对路径：POSIX 上以 `/` 开头，Windows 上带盘符（`C:\…`、`C:/…`）或是 UNC 路径。`~`、相对路径、Windows 上没有盘符的路径都被拒绝：pi 按自己的 `HOME`（`spec.env`）、工作目录（`spec.cwd`）或当前盘解析它们，与宿主校验时看到的可能不是同一个文件。
 
 #### pi 参数规则
 
-判断“pi 实际打开哪个会话文件”时，不能只在参数里找字符串：`--` 之后的参数都是消息，`--session=…` 和 `--mode=rpc` 在 pi 1.5.0 里只是未知选项，很多选项会吃掉下一个参数。`src/piargs.ts` 照搬 pi 1.5.0 `parseArgs`（`dist/cli/args.js`）的规则，再按 `createSessionManager`（`dist/main.js`）判断：只有 RPC 模式、没有解析错误、没有 `--no-session`、`--help`、`--version`、`--export`、`--list-models`、`--fork`，并且 `--session` 的值像路径（含 `/` 或 `\`，或以 `.jsonl` 结尾；否则 pi 把它当会话 id）时，pi 才以这个路径为会话文件。路径按 pi 的 `resolvePath` 相对工作目录解析。`test/piargs.test.mjs` 把这套规则与 pi 的 `parseArgs` 逐项比对。
+判断“pi 实际打开哪个会话文件”时，不能只在参数里找字符串：`--` 之后的参数都是消息，`--session=…` 和 `--mode=rpc` 在 pi 1.5.0 里只是未知选项，很多选项会吃掉下一个参数。`src/piargs.ts` 照搬 pi 1.5.0 `parseArgs`（`dist/cli/args.js`）的规则，包括 `--tools` 的写法检查（`getToolListError`），再按 `main` 和 `createSessionManager`（`dist/main.js`）在打开会话之前的退出条件判断。pi 以 `--session` 的路径为会话文件，需要同时满足：没有解析错误；不是 `--version`、`--export`；RPC 模式；RPC 模式下没有 `@file` 参数；没有 `--fork`；`--session-id` 不与 `--session` 同时出现；没有 `--no-session`、`--help`、`--list-models`；`--session` 的值像路径（含 `/` 或 `\`，或以 `.jsonl` 结尾；否则 pi 把它当会话 id）。`test/piargs.test.mjs` 把这套规则与 pi 的 `parseArgs` 逐项比对。
 - 同一把锁一次只能有一个经 `spawnWriter` 拉起、仍在运行的写者；前一个退出之前再次调用抛出 `EHOSTKIT_LOCK_STATE`。
 
 第 4 步只在宿主在“拉起 pi”和“写入 `writer`”之间退出时出现。配合启动门闩，这个窗口里的 pi 还停在 gate，宿主退出后 gate 读到 stdin 结束而自行退出，不会加载 pi。下一个持锁方查找时，gate 进程通常已经退出，结果是 `failed`，需要用户确认后以 `assumeNoWriter` 继续；仍停在 gate 的进程按命令行能找到并停止。pi 加载后会设置 `process.title`，在 macOS 和 Linux 上这会覆盖进程的命令行，所以第 4 步实际只能找到仍停在 gate 的进程；不按协议放行、又没有记录的 pi 找不到，结果仍是 `failed`（fail closed）。只认 pi-hostkit 的 gate 并精确比较 `--session`，是为了不停止无关的进程：例如恢复 `a.jsonl` 时，打开 `a.jsonl.bak` 的进程，或参数里碰巧带有这个路径的其他程序。
@@ -523,7 +524,7 @@ pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-h
 CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模式各一次）、macos-latest、windows-latest 上用 pi 1.5.0 运行全部测试。测试用本地假 provider（`test/fixtures/fake-provider.ts`）驱动真实的 pi 进程，不联网。覆盖：
 
 - **锁**：单实例锁在同一进程内重复获取被拒、持有进程被强杀后由操作系统释放；会话写锁的获取、记录、占用结果和释放；`recoverPreviousWriter` 之前 `update` 被拒；恢复与释放并发时按调用顺序执行、释放后不能再拉起写者；`spawnWriter` 按 pi 的参数规则校验（`--` 之后的 `--session`、`--session=…`、带 `--continue` 都被拒）并限制同时一个写者。
-- **pi 参数规则**：`parsePiArgs` 与 pi 1.5.0 的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models` 等情况。
+- **pi 参数规则**：`parsePiArgs` 与 pi 1.5.0 的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models`、`--tools` 写法错误、`@file` 等情况；依赖 pi 环境的路径（相对、`~`、Windows 无盘符）判为无法判断，`spawnWriter` 拒绝它们。
 - **跨宿主恢复**：宿主进程用 `spawnWriter` 拉起 pi 后被强杀，另一个宿主取锁并停止遗留写者（用例以 pi-pane 为前者、pi-agora 为后者；`app` 字段只是标签，两个方向走同一代码路径）。Windows 上 pi 随 Job 终止，结果为 `none` 或 `stopped`（Job 结束可能略晚于 mutex 被释放）。
 - **fail closed**：宿主在 pi 停在 gate 时被杀，gate 自行退出，下一个持锁方得到 `failed`，`assumeNoWriter` 后为 `none`；仍停在 gate 的未记录进程按命令行找到并停止；打开 `<会话>.bak` 的 gate、`--session <会话>` 出现在 `--` 之后（只是消息）的 gate、`--session` 为相对路径的 gate 都不被停止，结果为 `failed`；不按协议放行的未记录 pi 无法排除时返回 `failed`；记录不是合法 JSON 或内容不完整时返回 `failed` 且记录不变。
 - **启动门闩**：用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
@@ -557,7 +558,7 @@ CI 还为 linux x64/arm64、darwin arm64/x64、win32 x64/arm64 构建预编译�
   2. `bash` 用 `nohup … &` 起了后台进程，而该命令在第一次快照之前就结束了（pi 正常停止时也会遗漏）。
 
   可以调研的办法：在 pi 里用扩展包住 `bash` 工具，命令一启动就把进程组上报给宿主，以兜住早退的后台进程（视 pi 扩展接口能力而定，目前不承诺）。
-- **身份检查到发信号的竞态**：每次发信号前都核对进程身份，但只有能把目标固定住时，核对和发送之间才没有空当。固定得住的情况：Windows（在已核对身份的句柄上 `TerminateProcess`）、Linux 的单个进程（pidfd）、Linux 6.9 起组长仍在的进程组（组长的 pidfd，打开后再核对已记录的成员仍在组内）、宿主停止自己尚未回收的子进程 pi。固定不住、存在“检查后再 `kill`”空当的情况：macOS 上终止 pi 以外的进程（pi 的后代、进程组），Linux 上组长已退出或内核早于 6.9 时的进程组信号（`kill(-pgid)`，发送前重新核对已记录的成员仍在组内），以及没有 pidfd 的 Linux 内核（5.3 之前）。空当只有核对到发送的几微秒；要在其间发错信号，目标必须恰好退出、它的 PID（或组号）又被新进程用上，两个系统都按顺序分配 PID，这要求 PID 空间在几微秒内用完一圈。这项风险已确认接受，没有消除。
+- **身份检查到发信号的竞态**：每次发信号前都核对进程身份，但只有能把目标固定住时，核对和发送之间才没有空当。固定得住的情况：Windows（在已核对身份的句柄上 `TerminateProcess`）、Linux 的单个进程（pidfd）、Linux 6.9 起组长仍在的进程组（组长的 pidfd，打开后再核对已记录的成员仍在组内）、宿主停止自己尚未回收的子进程 pi。固定不住、存在“检查后再 `kill`”空当的情况：macOS 上终止 pi 以外的进程（pi 的后代、进程组），Linux 上组长已退出或内核早于 6.9 时的进程组信号（`kill(-pgid)`，发送前重新核对已记录的成员仍在组内），以及没有 pidfd 的 Linux 内核（5.3 之前）。要在其间发错信号，目标必须恰好退出、它的 PID（或组号）又被新进程用上；两个系统都按顺序分配 PID，需要在这段时间里把 PID 空间用完一圈。正常执行时这段时间很短，但宿主进程可能在核对之后被系统调度暂停，所以没有时间上限的保证。这项风险已确认接受，没有消除。
 - **写者已退出、后代仍在（无 cgroup）**：macOS 和不用 cgroup 的 Linux 上，`recoverPreviousWriter` 判断记录的 `writer` 已退出时返回 `none`，不清理它可能留下的后代进程（这些进程不写会话文件，但可能占用资源）：pi 已退出后，按 PID 或进程组号找到的进程无法确认属于它。Linux cgroup 模式下会清空它的 scope；Windows 上 Job 已终止这些进程。
 - **非受管进程**：不是由受管进程启动的进程（如通过计划任务、系统服务、`launchd`、`systemd` 启动的）不在 Job、scope、进程组或进程树里，无法清理。
 - **未记录的已放行 pi**：不按协议（不经 `spawnWriter` 或不写 `writer`）放行的 pi，在 macOS 和 Linux 上无法按命令行找到，恢复只能返回 `failed`，由用户确认。
