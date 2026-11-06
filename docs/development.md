@@ -16,7 +16,8 @@
 | `src/locate.ts` | `locatePi`、支持的 pi 版本区间（`SUPPORTED_PI_RANGE`） |
 | `src/rpc.ts` | `JsonlSplitter`（按 LF 分帧）和 `StdioRpcTransport`（命令与响应关联、事件分发、错误类） |
 | `src/process.ts` | `spawnManaged`、`ManagedProcess.stop`、`stopByIdentity`、`isSameProcess`；Linux cgroup scope 的检测与终止；快照模式的记录与终止 |
-| `src/snapshots.ts` | 快照记录及逐目标停止、错误收集、退出复查；不作为包入口导出，测试通过内部依赖注入模拟权限和查询错误 |
+| `src/snapshots.ts` | 快照记录及逐目标停止、错误收集、退出复查；父身份查询失败只丢弃相关分支，快照错误写入报告；不作为包入口导出 |
+| `src/cgroups.ts` | cgroup 整体终止及旧内核逐 PID 退回、pi 身份保底、部分列举与未知残留报告；内部依赖注入用于确定性故障测试；人口检查供恢复路径复用 |
 | `src/gate.ts` | 启动门闩，编译为独立入口 `dist/gate.js`，由 `spawnManaged` 作为子进程的脚本运行 |
 | `src/gate-protocol.ts` | 门闩放行行和拒绝退出码，宿主和 gate 共用 |
 | `src/proctable.ts` | 进程表与进程身份：Linux 读 `/proc`，macOS 和 Windows 调用原生模块；后代查找、身份比较、读取命令行 |
@@ -65,7 +66,8 @@ npm test
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
 | `test/locate.test.mjs` | 临时 HOME 的官方安装布局、环境变量优先级、激活切换、npm 回退；只在隔离模块副本中替换 npm 查询 |
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
-| `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、继续清理与 `StopReport` |
+| `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、部分分支保留、最后快照失败与 `StopReport` |
+| `test/cgroup-faults.test.mjs` | cgroup 旧内核退回、逐 PID 信号与查询错误、部分/最终列举失败、已知身份及未知哨兵、独立 pi 保底 |
 | `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
 | `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
 | `test/gate.test.mjs` | 启动门闩本身：用 `test/fixtures/marker-entry.mjs` 代替 pi 的入口，检查拒绝放行时入口没有加载、放行后入口拿到的参数和下一行输入 |
@@ -75,6 +77,8 @@ npm test
 | `test/misc.test.mjs` | 密钥权限、本地磁盘检查、`locatePi` |
 | `test/helpers.mjs` | pi 测试现场（隔离的 HOME、agent 目录、会话目录和环境变量）、pi 参数、等待工具 |
 | `test/fixtures/host.mjs` | 测试用宿主进程：执行一个动作、输出一行 JSON 后等待被杀，用于强杀宿主的用例 |
+| `test/fixtures/capture-fault.mjs` | POSIX 子进程用 Node 模块 mock 注入快照失败，验证真实 `Managed.stop` 返回报告并缓存成功结果 |
+| `test/fixtures/cgroup-verify-fault.mjs` | Linux 真实 user scope 启动后临时替换内置 fs 调用，验证最终检查失败也返回带未知 scope 的可重复报告 |
 | `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |
 | `test/fixtures/fake-provider.ts` | 按脚本回复的本地 provider，pi 以 `-e` 加载；测试不联网，也不需要模型服务的密钥 |
 
@@ -123,5 +127,5 @@ npm test
 - **原生函数**：增加或修改原生函数时，同时修改对应的 C 文件和 `src/native.ts` 的 `NativeBinding`。只在部分平台存在的函数声明为可选，经 `nativeFn` 调用（不存在时抛出 `ENOTSUP`）。
 - **`pi-hostkit/paths`**：`src/paths.ts` 不导入 `src/native.ts` 或其他会加载原生模块的文件，因为这个入口在 pi 进程里的扩展中使用。
 - **发信号和终止进程**：一律经过核对进程身份的函数（POSIX 用 `src/proctable.ts` 的 `signalProcess`，Linux 上经 pidfd；Windows 用按创建时间核对的 `terminateProcess`），不直接对 PID 调用 `process.kill`。没有 `cgroup.kill` 的内核上逐个终止 scope 成员时，同样经 `signalProcess`，并在发信号前核对该进程仍在这个 scope 里。
-- **进程表遍历**：按父子关系找后代用 `verifiedDescendants`，它在读完进程表后重新核对每个父进程，丢掉经由已换了进程的 PID 找到的行。
+- **进程表遍历**：按父子关系找后代用内部 `verifiedDescendants`，它在读完进程表后重新核对每个父进程，丢掉经由已换了进程的 PID 找到的行。快照提供逐父核对函数，将查询错误记入报告并只否决相关分支。`stopCgroup` 的调用方必须确认是 hostkit 自己的 scope，并提供有界的 settle 等待。
 - **pi 参数规则**：`src/piargs.ts` 照搬 pi 1.5.0 的 `parseArgs`，`test/piargs.test.mjs` 与 pi 的实现做差分比对。升级支持的 pi 版本时先跑这组测试，pi 增减选项时同步修改。
