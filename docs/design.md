@@ -86,7 +86,7 @@ export interface PiInstall {
 查找顺序：
 
 1. 配置项 `piPath`（pane 与 agora 各自的配置文件里同名）：可以是包目录，也可以是包内的文件（通常是 `cli.js`）；指向文件时向上最多查 6 层找到包目录。
-2. 官方安装目录：依次尝试 `PI_MANAGED_INSTALL_ROOT`、`PI_CODING_AGENT_DIR/install`、`~/.pi/agent/install`，去重后检查。`PI_CODING_AGENT_DIR` 按 pi 1.5.0 `getAgentDir` 的默认 `normalizePath` 规则处理：支持 `~`、`file://` URL 和 Windows 的 `/c/...`、`/mnt/c/...`、`/cygdrive/c/...`；保留开头的 `@`、Unicode 空格和普通空白，不使用工具参数特有的剥除规则。`PI_MANAGED_INSTALL_ROOT` 仍只去除两端空白后按宿主当前目录解析。根目录的 `managed-install.json` 必须满足 `kind = "pi-managed-install"`、`schemaVersion = 1`、`layout = "releases-v1"`；读 `current-version`，再取 `releases/<版本>/node_modules/@earendil-works/pi-coding-agent`，包版本必须与该版本相同。不按最大版本挑选，也不缓存激活版本。版本文件只允许单个合法版本目录名，拒绝路径穿越。安装缺失或损坏时继续后续候选；找到结构完整但不受支持的版本时返回 `supported: false`，不跳过它去选 npm 版本。
+2. 官方安装目录：依次尝试 `PI_MANAGED_INSTALL_ROOT`、`PI_CODING_AGENT_DIR/install`、`~/.pi/agent/install`，去重后检查。`PI_CODING_AGENT_DIR` 按 pi 1.5.0 `getAgentDir` 的默认 `normalizePath` 规则处理：支持 `~`、`file://` URL 和 Windows 的 `/c/...`、`/mnt/c/...`、`/cygdrive/c/...`；保留开头的 `@`、Unicode 空格和普通空白，不使用工具参数特有的剥除规则。`PI_MANAGED_INSTALL_ROOT` 仍只去除两端空白后按宿主当前目录解析。根目录的 `managed-install.json` 必须满足 `kind = "pi-managed-install"`、`schemaVersion = 1`、`layout = "releases-v1"`；读 `current-version`，再取 `releases/<版本>/node_modules/@earendil-works/pi-coding-agent`，包版本必须与该版本相同。不按最大版本挑选，也不缓存激活版本。版本文件只允许单个合法版本目录名，拒绝路径穿越。确认安装缺失或元数据损坏时继续后续候选；权限与 I/O 等系统查询错误直接传播，不把未知候选当成不存在。找到结构完整但不受支持的版本时返回 `supported: false`，不跳过它去选 npm 版本。
 3. 全局 npm 根目录：执行 `npm root -g`，取 `<root>/@earendil-works/pi-coding-agent`。Windows 上 `npm` 是 `.cmd` 脚本，经 `%SystemRoot%\System32\cmd.exe /d /s /c "npm root -g"` 调用，参数固定，不拼接任何外部输入。结果缓存到进程退出（失败时不缓存）。
 4. 都找不到时抛出 `EHOSTKIT_PI_NOT_FOUND`，提示安装 pi 或设置 `piPath`。
 
@@ -266,7 +266,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 ### Windows
 
 - 启动：每个受管 pi 放进一个独立的 Job Object，设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，不允许 breakaway。加入 Job 前再次核对进程身份。加入发生在 gate 等待放行期间，pi 尚未加载，所以不会有子进程在加入 Job 之前启动。
-- 最终终止：`TerminateJobObject`（`step` 为 `TerminateJobObject`），然后复查 Job 内进程数为 0。
+- 最终终止：`TerminateJobObject`（`step` 为 `TerminateJobObject`），然后复查 Job 内进程数为 0。Job 列举或逐成员身份查询失败时继续其他可确认成员，失败写入 `steps`，已知身份保留在 `leftovers`；Job 范围无法确认时加 `pid: 0`、`startTime: ""`、`exe: "Job Object <句柄>"` 哨兵。句柄在 `finally` 关闭，关闭失败也写入报告；重复 `stop()` 返回同一报告。
 - Job 内的后代进程不论父进程是否已退出都在 Job 里，所以“pi 主进程先退出、孙进程还在”的情况同样能清理。
 - Job 句柄不可继承，只由宿主持有。宿主（daemon 或 pane 服务端）退出或被强杀时句柄关闭，Job 内所有进程随之终止。
 
@@ -373,6 +373,7 @@ export interface SessionLockRecord {
 
 - Windows 的名称为 `Global\pi-hostkit-v1-<当前用户 SID>-<purpose>-<sha256>`。`Global\` 让同一个用户的不同登录会话互斥；SID 将不同系统用户隔离，避免它们互相占用名称。创建时原子设置仅当前用户完全控制的受保护 DACL，并显式指定当前用户为所有者；打开后在同一句柄上核对所有者。所有者不是当前用户或无法查询时拒绝（fail closed），不会视为取得锁。现存对象的 DACL 不被重设。
 - 获取都不等待：已被占用时立即返回。
+- 原生释放失败后，内核资源是否仍可安全操作属于未知；进程内 held key 保留，后续释放返回同一个错误，不重放可能已关闭或复用的描述符/句柄。仅记录提交失败仍可安全重试释放。该保守占用直到宿主退出才清除。
 - 同一进程内重复获取同一把锁视为已被占用，与 `flock` 在不同打开文件描述之间互斥的语义一致；Windows 的 mutex 本身允许同一线程重复获取，由 pi-hostkit 在进程内拒绝。这项检查只在同一份 pi-hostkit 模块内有效：一个进程加载了两份 pi-hostkit 时，Windows 上两份可以重复取得同一把锁。宿主进程只应加载一份。
 
 ### 单实例锁
@@ -559,13 +560,13 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **启动门闩**：小于放行行的发送限额在 spawn 前被拒；从不读取 stdin 的真实子进程验证发送队列限额与停止。用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
 - **进程树终止**：`bash` 工具及脱离 pi 进程组（POSIX 用 `setsid`）的后台进程都被清理，除 `leftovers` 为空外还在测试进程里独立确认该后台进程已不存在（三个平台）；pi 先被 SIGKILL、后代仍在时，`stop` 仍清理后代（三种覆盖方式）；`abort` 超时仍完成停止；`stop` 重复调用返回同一结果；`StopOptions` 显式 `undefined` 用默认值、`NaN` 和 `Infinity` 被拒；`coverage` 与平台和模式相符。
 - **进程身份**：创建时间不符的身份判为 `gone`；`stopByIdentity` 不对创建时间不符的身份发信号，并能停止被强杀宿主留下的 pi（macOS、Linux；Windows 上验证 pi 随 Job 终止）；记录的 PID 已成为另一个进程组的组长时，该组不会收到信号（macOS、Linux）；读进程表期间父进程的 PID 换了进程时，经由它找到的行被丢掉（用构造的进程表测试）；不是 pi-hostkit 创建的 cgroup 路径不会被整体终止（Linux）。
-- **Linux cgroup**：CI 开启用户 systemd 实例并要求 cgroup 可用；另一轮以 `containment: "snapshot"` 覆盖快照模式。内部故障测试覆盖旧内核逐 PID 的 EPERM、身份和成员资格查询失败、部分子树及最终列举错误、已知身份与未知 scope 同时保留、人口和目录查询不明、pi 保底及 PID 复用。真实 user scope 中注入验证 I/O 失败，确认 `stop()` 解析为带 scope 哨兵的报告且可重复读取。
+- **Linux cgroup**：CI 开启用户 systemd 实例并要求 cgroup 可用；另建 `Delegate=yes` scope 的两个真实子 cgroup，验证整棵子树清理及局部查询故障时独立子树仍清理；另一轮以 `containment: "snapshot"` 覆盖快照模式。内部故障测试覆盖旧内核逐 PID 的 EPERM、身份和成员资格查询失败、部分子树及最终列举错误、已知身份与未知 scope 同时保留、人口和目录查询不明、pi 保底及 PID 复用。真实 user scope 中注入验证 I/O 失败，确认 `stop()` 解析为带 scope 哨兵的报告且可重复读取。
 - **密钥权限**：`ensurePrivateDir` 创建与收紧、`writePrivateFile` 排他且私有、父目录不私密时拒绝写入、Windows 上带私密 DACL 创建文件、`checkPrivate` 报告过宽的权限；macOS 上扩展 ACL 被报告并被 `ensurePrivateDir` 清除。
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。隔离注入覆盖远程挂载边界、目标/祖先查询失败、原生卷查询失败、根目录缺失及悬空链接的实际写入位置。Linux auto CI 使用本机 SSH 服务经 SSHFS 建立真实远程挂载，验证拒绝挂载内的新路径，并以不可遍历目录验证查询失败不能借用本地祖先的结论。
 - **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法和显式失败不回退、目录入口拒绝；agent 环境变量的 file URL、Windows shell 路径、波浪号和默认规范化差分边界；临时 HOME 的官方安装布局、环境变量优先级、激活版本切换、损坏 marker/路径穿越/版本不符/CLI 缺失后的 npm 回退；自动定位安装。测试通过隔离副本注入 npm 根目录，不依赖 CI 机器有官方安装。
 - **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
 - **故障注入**：记录路径探测抛错按损坏处理、获取或探测的意外异常后仍可重新取锁；严格存在性判断只把 ENOENT/ENODEV 当不存在，recorded scope 查询失败仍保留 cgroup 覆盖和未知 scope，gate 协议文件查询不明不能被其他已恢复候选掩盖；快照最后一次读取失败可见、单父查询失败保留独立分支。释放记录改名失败后锁与记录保持原样、可重试（含会话切换）；活写者和查询失败拒绝普通释放、显式切走可释放；单个后代 `EPERM` 或查询失败时其他后代与 pi 进程组继续清理，失败进入报告；RPC gate/命令/UI 有序背压、UTF-8/LF 字节限额、超限恢复、序列化抛错无 pending/计时器残留、写回调或同步写失败清理。Windows 验证 Global/SID 名称、创建的 owner/DACL、真实异主对象即使 DACL 允许 FullControl 也拒绝；CI 要求该异主测试执行，本机未提权可明确跳过。
-- **macOS 卷检测**：隔离测试副本注入探测函数及文件系统调用，覆盖敏感、不明、权限错误、挂载边界、文件级挂载、大小写硬链接、符号链接目标；确认 `pi-hostkit/paths` 禁用 native 加载仍可工作。测试接口不进入生产源码或公开类型化 API；快照依赖注入只在不导出的内部模块，进程查询模拟只在显式启用 Node 测试模块 mock 的子进程中使用。没有生产环境变量测试开关。
+- **macOS 卷检测**：CI 用 `hdiutil` 创建并挂载真实大小写敏感 APFS 磁盘映像，在其中验证路径比较、待创建路径和会话锁被拒绝。隔离测试副本注入探测函数及文件系统调用，覆盖敏感、不明、权限错误、挂载边界、文件级挂载、大小写硬链接、符号链接目标；确认 `pi-hostkit/paths` 禁用 native 加载仍可工作。测试接口不进入生产源码或公开类型化 API；快照依赖注入只在不导出的内部模块，进程查询模拟只在显式启用 Node 测试模块 mock 的子进程中使用。没有生产环境变量测试开关。
 - **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超过 1024 次超时后迟到响应也不会交给复用了调用方 id 的新命令、非法 JSON、stdout 结束、监听器异常。
 
 CI 还为 linux x64/arm64、darwin arm64/x64、win32 x64/arm64 构建预编译模块，并在非交叉编译的平台上加载一次。

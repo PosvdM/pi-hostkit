@@ -23,9 +23,11 @@ export function buildFaultBinding() {
   wrap("void *", "malloc", "size_t size", "size", "return NULL;", "if (result) hk_heap++;");
   wrappers.push("static void hk_free(void *p) { if (p) hk_heap--; free(p); }");
   names.push("free");
+  // 关闭/释放故障在真实释放后返回错误，用于检查错误可见及无重复释放。
+  // 这不证明操作系统真正拒绝释放时资源已经消失；该状态仍应视为未知。
   if (win) {
     wrap("HANDLE", "OpenProcess", "DWORD a, BOOL b, DWORD c", "a,b,c", "return NULL;", "if (result) hk_handles++;");
-    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; return FALSE;", "if (result) hk_handles--;");
+    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; SetLastError(hk_error); return FALSE;", "if (result) hk_handles--;");
     wrap("DWORD", "WaitForSingleObject", "HANDLE h, DWORD t", "h,t", "return WAIT_FAILED;");
     wrap("BOOL", "GetProcessTimes", "HANDLE h, LPFILETIME a, LPFILETIME b, LPFILETIME c, LPFILETIME d", "h,a,b,c,d", "return FALSE;");
     wrap("BOOL", "TerminateProcess", "HANDLE h, UINT c", "h,c", "return FALSE;");
@@ -45,7 +47,7 @@ export function buildFaultBinding() {
     wrap("BOOL", "SetSecurityDescriptorControl", "PSECURITY_DESCRIPTOR p, SECURITY_DESCRIPTOR_CONTROL a, SECURITY_DESCRIPTOR_CONTROL b", "p,a,b", "return FALSE;");
     wrap("HANDLE", "CreateMutexW", "LPSECURITY_ATTRIBUTES a, BOOL b, LPCWSTR n", "a,b,n", "return NULL;", "if (result) hk_handles++;");
     wrap("DWORD", "GetSecurityInfo", "HANDLE h, SE_OBJECT_TYPE t, SECURITY_INFORMATION i, PSID *o, PSID *g, PACL *d, PACL *s, PSECURITY_DESCRIPTOR *p", "h,t,i,o,g,d,s,p", "return hk_error;", "if (result == ERROR_SUCCESS && *p) hk_local++;");
-    wrap("BOOL", "ReleaseMutex", "HANDLE h", "h", "ReleaseMutex(h); return FALSE;");
+    wrap("BOOL", "ReleaseMutex", "HANDLE h", "h", "ReleaseMutex(h); SetLastError(hk_error); return FALSE;");
     wrap("BOOL", "GetVolumePathNameW", "LPCWSTR p, LPWSTR r, DWORD n", "p,r,n", "return FALSE;");
     wrap("UINT", "GetDriveTypeW", "LPCWSTR p", "p", "return DRIVE_UNKNOWN;");
     wrap("DWORD", "SetNamedSecurityInfoW", "LPWSTR p, SE_OBJECT_TYPE t, SECURITY_INFORMATION i, PSID o, PSID g, PACL d, PACL s", "p,t,i,o,g,d,s", "return hk_error;");
@@ -81,7 +83,7 @@ export function buildFaultBinding() {
   } else {
     wrap("int", "open", "const char *p, int f, mode_t m", "p,f,m", "return -1;", "if (result >= 0) hk_handles++;");
     wrap("int", "flock", "int fd, int op", "fd,op", "return -1;");
-    wrap("int", "close", "int fd", "fd", "int rc = close(fd); if (!rc) hk_handles--; return -1;", "if (!result) hk_handles--;");
+    wrap("int", "close", "int fd", "fd", "int rc = close(fd); if (!rc) hk_handles--; errno = (int)hk_error; return -1;", "if (!result) hk_handles--;");
     wrap("int", "statfs", "const char *p, struct statfs *s", "p,s", "return -1;");
     if (process.platform === "linux") {
       wrappers.push(`static long hk_syscall(long op, ...) {
@@ -98,10 +100,10 @@ export function buildFaultBinding() {
       }`);
       names.push("syscall");
     } else {
-      wrap("int", "sysctl", "int *m, u_int n, void *p, size_t *l, void *v, size_t s", "m,n,p,l,v,s", "return -1;", "", `if (p && hk_hit("sysctlPartial")) { *l = 1; return 0; }`);
+      wrap("int", "sysctl", "int *m, u_int n, void *p, size_t *l, void *v, size_t s", "m,n,p,l,v,s", "return -1;", "", `if (p && hk_hit("sysctlGrow")) { errno = ENOMEM; return -1; } if (p && hk_hit("sysctlPartial")) { *l = 1; return 0; }`);
       wrap("acl_t", "acl_get_link_np", "const char *p, acl_type_t t", "p,t", "return NULL;", "if (result) hk_local++;");
       wrap("int", "acl_get_entry", "acl_t a, int i, acl_entry_t *e", "a,i,e", "return -1;");
-      wrap("int", "acl_free", "void *p", "p", "acl_free(p); if (p) hk_local--; return -1;", "if (!result && p) hk_local--;");
+      wrap("int", "acl_free", "void *p", "p", "acl_free(p); if (p) hk_local--; errno = (int)hk_error; return -1;", "if (!result && p) hk_local--;");
       wrap("acl_t", "acl_init", "int n", "n", "return NULL;", "if (result) hk_local++;");
       wrap("int", "acl_set_link_np", "const char *p, acl_type_t t, acl_t a", "p,t,a", "return -1;");
     }
@@ -139,7 +141,7 @@ static napi_value hk_stats(napi_env e, napi_callback_info i) {
   return a;
 }
 ${wrappers.join("\n")}
-${names.map(n => `#define ${n} hk_${n}`).join("\n")}
+${names.map(n => `#define ${n}(...) hk_${n}(__VA_ARGS__)`).join("\n")}
 `;
   try {
     const filename = win ? "hostkit_win.c" : "hostkit_posix.c";

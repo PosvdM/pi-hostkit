@@ -66,6 +66,14 @@ npm test
 | --- | --- |
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
 | `test/locate.test.mjs` | 临时 HOME 的官方安装布局、环境变量优先级、激活切换、npm 回退；只在隔离模块副本中替换 npm 查询 |
+| `test/locate-faults.test.mjs` | 显式、官方、npm 候选的系统查询失败分类与失败缓存重试 |
+| `test/locks-faults.test.mjs` | 获取/释放与恢复查询、临时记录创建/写入/提交/删除、候选之间的独立清理、启动写者及回收双失败 |
+| `test/secrets-faults.test.mjs` | 私密目录与文件的查询、ACL、创建/写入/sync/关闭、最终复查与失败删除 |
+| `test/paths-faults.test.mjs` | 读取变体、真实路径/链接和 macOS 卷探测的失败分类 |
+| `test/rpc-faults.test.mjs` | 输出流错误/关闭、挂起请求与背压队列清理、关闭输入时首错与收尾错误同时保留 |
+| `test/process-faults.test.mjs` | 独立模块 mock 进程的 Windows Job/恢复停止/启动回收与 Linux 进程表、pidfd/进程组退路故障 |
+| `test/native-faults.test.mjs` | 临时编译带系统调用包装器的原生副本；原生查询、信号、截断、资源回收与结果构造故障 |
+| `test/native-loader.test.mjs` | 原生模块懒加载、加载失败后重试、函数缺失与调用错误 |
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
 | `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、部分分支保留、最后快照失败与 `StopReport` |
 | `test/existence-faults.test.mjs` | 严格存在性错误分类、记录 scope 查询失败的覆盖保留、gate 协议查询不明不能被其他候选掩盖 |
@@ -87,6 +95,10 @@ npm test
 | `test/fixtures/capture-fault.mjs` | POSIX 子进程用 Node 模块 mock 注入快照失败，验证真实 `Managed.stop` 返回报告并缓存成功结果 |
 | `test/fixtures/cgroup-verify-fault.mjs` | Linux 真实 user scope 启动后临时替换内置 fs 调用，验证最终检查失败也返回带未知 scope 的可重复报告 |
 | `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |
+| `test/fixtures/boundary-module.mjs` | 隔离源码副本的模块依赖替换；不改变生产导出 |
+| `test/fixtures/process-faults.mjs`、`test/fixtures/proctable-faults.mjs` | 独立 Node 模块 mock 子进程中的逐进程查询、信号和回收故障 |
+| `test/fixtures/native-fault-build.mjs`、`test/fixtures/native-fault-worker.mjs` | 在临时目录构建/加载原生故障副本，按系统调用注入并核对资源净变化；子进程退出后删除 DLL 和目录 |
+| `test/fixtures/cgroup-subtree.mjs` | 进入真实委派 scope 后创建两棵子 cgroup 并放入实际子进程 |
 | `test/fixtures/fake-provider.ts` | 按脚本回复的本地 provider，pi 以 `-e` 加载；测试不联网，也不需要模型服务的密钥 |
 
 `test/locks.test.mjs` 把 `HOME`（Windows 上 `USERPROFILE`）指向临时目录，不碰真实的 `~/.pi/hostkit/locks`。释放记录失败通过测试进程临时替换内置 fs 调用注入，并在 `finally` 恢复；写者查询错误在 `test/fixtures/release-query-fault.mjs` 的独立子进程中用 `--experimental-test-module-mocks` 注入，不改变生产 API。Windows 异主 mutex 测试需要可指定其他 owner 的提权令牌，本机未提权时明确跳过；CI 要求真正执行。

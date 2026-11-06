@@ -17,7 +17,7 @@
 | `locate.ts:fromPiPath` | 显式路径 `stat`、`realpath`、逐层包查询 | 显式失败不回退，查询错误可见；`test/locate-faults.test.mjs`。 |
 | `locate.ts:fromManagedInstall` | `managed-install.json`、`current-version`、激活包查询 | 损坏元数据可继续候选，权限/I/O 错误保留；`test/locate-faults.test.mjs`。 |
 | `locate.ts:npmRootGlobal`、`locatePi` | `execFile` 调用 npm；失败缓存清理 | 命令失败可重试，不留下拒绝的缓存；`test/locate-faults.test.mjs`。 |
-| `native.ts:native`、`nativeFn` | `node-gyp-build` 加载、原生函数存在性 | 加载失败不缓存半成品；函数缺失抛出 `ENOTSUP`；`test/native-loader-faults.test.mjs`。 |
+| `native.ts:native`、`nativeFn` | `node-gyp-build` 加载、原生函数存在性 | 加载失败不缓存半成品；函数缺失抛出 `ENOTSUP`；`test/native-loader.test.mjs`。 |
 | `locks.ts:acquireInstanceLock`、会话锁入口 | 创建目录、真实路径、本地卷与私密目录检查 | 前置查询失败不取得原生锁；`test/locks-faults.test.mjs`。 |
 | `locks.ts:acquireRaw` | `flockAcquire` 或 `userSid`/`mutexAcquire` | 只在确实竞争时返回占用；获取后校验异常回收；`test/locks-faults.test.mjs`、`test/locks.test.mjs`、`test/windows-mutex.test.mjs`。 |
 | `locks.ts:RawLock.release` | `fdClose` 或 `mutexRelease`、进程内 held key | 释放失败不能宣布已释放，也不能重放可能已关闭或复用的资源编号；`test/locks-faults.test.mjs`。 |
@@ -96,5 +96,11 @@
 | 远程挂载与查询失败 | Linux auto CI：SSHFS 连接本机 SSH server，`test/platform-mounts.test.mjs` | 未实测 NFS、SMB；SSH 服务运行在同一 runner，未测真实网络中断。 |
 | Windows Global mutex | Windows CI：跨进程、owner/DACL、提权异主对象，`test/windows-mutex.test.mjs` | 没有两个真实登录会话。 |
 | 原生查询/信号失败 | 三平台测试专用构建与原生故障 worker | 故障注入不代表真实内核异常、资源耗尽或 PID 复用已实测；真实竞态见设计文档“剩余风险”。 |
+
+### 注入覆盖限制
+
+- 资源释放的故障包装器先执行真实释放，再返回失败，用于检查错误可见、退出路径和不重复关闭。它不能证明操作系统真正拒绝释放后资源已经不存在；生产代码把这类结果视为未知。
+- 原生模块尚未注入 `LocalFree` 失败、主操作与资源回收同时失败的完整组合，以及全部 N-API/错误构造的内存耗尽分支。系统查询、信号与记录的主要边界已有逐入口注入，不等于穷尽所有失败组合。
+- SID 非法、罕见等待返回值、NT 缓冲的全部极端布局、所有 Windows 驱动器类型仍不具备完整矩阵；异主 mutex 有真实提权测试。
 
 完整的未实测项以 [design.md 的验证状态](design.md#验证状态) 为准；issue #3 在真实 Windows 双登录会话与旧内核仍未验证时保持打开。

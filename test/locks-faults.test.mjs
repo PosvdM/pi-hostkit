@@ -12,7 +12,11 @@ async function fixture(platform = "linux") {
   const failures = new Map();
   const calls = [];
   let held = false;
-  const status = { identities: [], scopes: [], rows: [{ pid: 456 }], args: new Map(), report: { steps: [], leftovers: [] } };
+  const status = {
+    identities: [], scopes: [], rows: [{ pid: 456 }], args: new Map(),
+    report: { steps: [], leftovers: [] }, reports: [], stopErrors: [], stopped: [],
+    commandErrors: new Map(), protocolErrors: [], spawnReport: { steps: [], leftovers: [] },
+  };
   const dir = path.resolve("lock-home");
   const file = path.resolve("session.jsonl");
   const recordFile = path.join(dir, ".pi", "hostkit", "locks", `session-${createHash("sha256").update(file).digest("hex")}.json`);
@@ -47,11 +51,35 @@ async function fixture(platform = "linux") {
     "./process.js": {
       isSameProcess: async () => { invoke("identity"); const value = status.identities.shift() ?? "gone"; if (value instanceof Error) throw value; return value; },
       scopePopulated: () => { invoke("scope"); const value = status.scopes.shift() ?? false; if (value instanceof Error) throw value; return value; },
-      stopByIdentity: async () => { invoke("stop"); return status.report; },
-      spawnManaged: async () => { invoke("spawn"); return { identity, exited: new Promise(() => {}), release() { invoke("gate-release"); }, stop: async () => { invoke("spawn-stop"); } }; },
+      stopByIdentity: async (candidate) => {
+        invoke("stop");
+        status.stopped.push(candidate.pid);
+        const error = status.stopErrors.shift();
+        if (error) throw error;
+        return status.reports.shift() ?? status.report;
+      },
+      spawnManaged: async () => {
+        invoke("spawn");
+        return {
+          identity, exited: new Promise(() => {}), release() { invoke("gate-release"); },
+          stop: async () => { invoke("spawn-stop"); return status.spawnReport; },
+        };
+      },
     },
-    "./fs-probe.js": { pathExistsStrict: () => { invoke("gate-protocol"); return true; } },
-    "./proctable.js": { listProcesses: () => { invoke("processes"); return status.rows; }, processCommandLine: (pid) => { invoke("commandline"); return status.args.has(pid) ? status.args.get(pid) : []; } },
+    "./fs-probe.js": { pathExistsStrict: () => {
+      invoke("gate-protocol");
+      const error = status.protocolErrors.shift();
+      if (error) throw error;
+      return true;
+    } },
+    "./proctable.js": {
+      listProcesses: () => { invoke("processes"); return status.rows; },
+      processCommandLine: (pid) => {
+        invoke("commandline");
+        if (status.commandErrors.has(pid)) throw status.commandErrors.get(pid);
+        return status.args.has(pid) ? status.args.get(pid) : [];
+      },
+    },
   } });
   const setFault = (name, code = "EIO") => { const error = fault(code, name); failures.set(name, error); return error; };
   const acquire = () => mod.acquireSessionWriterLock(file, host);
@@ -134,12 +162,12 @@ test("临时记录独占创建失败不得删除别人的临时文件", async ()
   assert.equal(f.held(), false);
 });
 
-for (const platform of ["linux", "win32"]) {
-  test(`${platform} 原生释放失败保留未知占用且不得重放关闭`, async () => {
+for (const [platform, code] of [["linux", "EIO"], ["linux", "EINTR"], ["win32", "EIO"]]) {
+  test(`${platform}/${code} 原生释放失败保留未知占用且不得重放关闭`, async () => {
     const f = await fixture(platform);
     const lock = await f.acquire();
     const operation = platform === "win32" ? "mutexRelease" : "fdClose";
-    const error = f.setFault(operation);
+    const error = f.setFault(operation, code);
     await assert.rejects(lock.release(), (e) => e === error);
     assert.equal(f.held(), true);
     assert.equal((await f.mod.probeSessionWriterLock(f.file)).held, true);
@@ -235,16 +263,14 @@ for (const firstFails of ["leftovers", "query", "stop"]) {
     for (const row of f.status.rows) f.status.args.set(row.pid, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
     const lock = await f.acquire();
     const error = fault();
-    f.status.identities.push(...(firstFails === "query" ? [error, "alive"] : ["alive", "gone", "alive"]));
-    if (firstFails === "leftovers") f.status.report.leftovers.push(identity);
-    if (firstFails === "stop") {
-      const stop = f.setFault("stop");
-      // 只让第一个目标失败。
-      f.failures.set("stop", Object.defineProperty(stop, "unused", { value: 1 }));
-    }
+    // 首个候选失败时没有最终身份查询，第二个候选必须仍然返回 alive。
+    f.status.identities.push(...(firstFails === "query" ? [error, "alive", "gone"] : ["alive", "alive", "gone"]));
+    if (firstFails === "leftovers") f.status.reports.push({ steps: [], leftovers: [identity] });
+    if (firstFails === "stop") f.status.stopErrors.push(error);
     if (firstFails === "leftovers") assert.equal(await lock.recoverPreviousWriter(), "failed");
-    else await assert.rejects(lock.recoverPreviousWriter());
-    assert.equal(f.calls.filter((c) => c === "stop").length, firstFails === "query" ? 1 : 2);
+    else await assert.rejects(lock.recoverPreviousWriter(), (e) => e === error);
+    assert.deepEqual(f.status.stopped, firstFails === "query" ? [789] : [456, 789]);
+    assert.deepEqual(lock.recoveryReports.at(-1).leftovers, []);
     assert.equal(f.held(), false);
   });
 }
@@ -256,15 +282,29 @@ for (const unreadable of [null, "throws", "gate-protocol"]) {
     f.status.rows = [{ pid: 456, startTime: "a" }, { pid: 789, startTime: "b" }];
     f.status.args.set(456, unreadable === "gate-protocol" ? [path.resolve("gate.js")] : null);
     f.status.args.set(789, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
-    if (unreadable === "throws") f.setFault("commandline");
-    if (unreadable === "gate-protocol") f.setFault("gate-protocol");
+    if (unreadable === "throws") f.status.commandErrors.set(456, fault());
+    if (unreadable === "gate-protocol") f.status.protocolErrors.push(fault());
     const lock = await f.acquire();
     f.status.identities.push("alive", "gone");
     assert.equal(await lock.recoverPreviousWriter(), "failed");
-    if (unreadable === null) assert.equal(f.calls.filter((c) => c === "stop").length, 1);
+    assert.deepEqual(f.status.stopped, [789]);
     assert.equal(f.held(), false);
   });
 }
+
+test("多个候选的停止错误一并报告且每个目标均已尝试", async () => {
+  const f = await fixture();
+  f.files.set(f.recordFile, JSON.stringify({ version: 1, sessionFile: f.file, host, state: "starting", updatedAt: "old" }));
+  f.status.rows = [{ pid: 456, startTime: "a" }, { pid: 789, startTime: "b" }];
+  for (const row of f.status.rows) f.status.args.set(row.pid, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
+  f.status.identities.push("alive", "alive");
+  const errors = [fault("EACCES"), fault("EIO")];
+  f.status.stopErrors.push(...errors);
+  const lock = await f.acquire();
+  await assert.rejects(lock.recoverPreviousWriter(), (e) => e instanceof AggregateError && errors.every((error) => e.errors.includes(error)));
+  assert.deepEqual(f.status.stopped, [456, 789]);
+  assert.equal(f.held(), false);
+});
 
 for (const stage of ["stop", "final-identity", "final-scope", "leftovers"]) {
   test(`恢复停止的 ${stage} 失败保留旧记录并释放锁`, async () => {
@@ -299,6 +339,47 @@ test("spawnManaged 失败不改变记录和持锁状态", async () => {
 });
 
 for (const operation of ["write", "gate-release"]) {
+  for (const cleanup of ["leftovers", "failed-step"]) {
+    test(`spawnWriter ${operation} 失败及停止报告 ${cleanup} 可见，活写者不能普通释放或再次启动`, async () => {
+      const f = await fixture();
+      const lock = await f.acquire();
+      await lock.recoverPreviousWriter();
+      const error = f.setFault(operation);
+      const report = f.status.spawnReport;
+      if (cleanup === "leftovers") report.leftovers.push(identity);
+      else report.steps.push({ step: "kill", ok: false, detail: "EPERM", at: "now" });
+      const spec = { argv: ["cli.js", "--mode", "rpc", "--session", f.file] };
+      await assert.rejects(lock.spawnWriter(spec), (e) => e instanceof AggregateError && e.errors[0] === error && e.errors[1].cause === report);
+      f.failures.clear();
+      const before = f.files.get(f.recordFile);
+      f.status.identities.push("alive");
+      await assert.rejects(lock.release(), { code: "EHOSTKIT_LOCK_STATE" });
+      const query = f.setFault("identity", "EACCES");
+      await assert.rejects(lock.release(), (e) => e.code === "EHOSTKIT_LOCK_STATE" && e.cause === query);
+      await assert.rejects(lock.spawnWriter(spec), { code: "EHOSTKIT_LOCK_STATE" });
+      assert.equal(f.calls.filter((c) => c === "spawn").length, 1);
+      assert.equal(f.files.get(f.recordFile), before);
+      assert.equal(f.held(), true);
+      f.failures.clear();
+      await lock.release();
+      assert.equal(f.held(), false);
+    });
+  }
+
+  test(`spawnWriter ${operation} 失败后的正常停止报告保留首错，grace 和未放行 abort 不构成清理失败`, async () => {
+    const f = await fixture();
+    const lock = await f.acquire();
+    await lock.recoverPreviousWriter();
+    const error = f.setFault(operation);
+    f.status.spawnReport.steps.push(
+      { step: "grace", ok: false, at: "now" },
+      { step: "abort", ok: false, detail: "process held at the start gate", at: "now" },
+    );
+    await assert.rejects(lock.spawnWriter({ argv: ["cli.js", "--mode", "rpc", "--session", f.file] }), (e) => e === error);
+    f.failures.clear();
+    await lock.release();
+  });
+
   test(`spawnWriter 的 ${operation} 与停止同时失败时两项错误可见且锁保持占用`, async () => {
     const f = await fixture();
     const lock = await f.acquire();

@@ -158,6 +158,13 @@ if (win) {
     const fd = b.flockAcquire(lockPath);
     try { assert.equal(b.flockAcquire(lockPath), -1); } finally { b.fdClose(fd); }
   });
+  succeeds("flockAcquire：竞争后的 close 失败不能伪装成 busy", () => {
+    const fd = b.flockAcquire(lockPath);
+    try {
+      b._fault("close", 1, 5);
+      assert.throws(() => b.flockAcquire(lockPath), { code: "EIO" });
+    } finally { reset(); b.fdClose(fd); }
+  });
   succeeds("flockAcquire：EINTR 仅重试 flock，不泄漏 fd", () => {
     b._fault("flock", 1, 4);
     const fd = b.flockAcquire(lockPath);
@@ -195,7 +202,7 @@ if (win) {
       fails(`${name}：sysctl 失败可见`, "sysctl", () => b[name](process.pid));
     fails("processInfo：部分记录不能当不存在", "sysctlPartial", () => b.processInfo(process.pid));
     fails("listProcesses：部分记录不能返回部分快照", "sysctlPartial", () => b.listProcesses());
-    fails("listProcesses：扩容耗尽可见且不泄漏", "sysctl", () => b.listProcesses(), { nth: 0, error: 12 });
+    fails("listProcesses：扩容耗尽可见且不泄漏", "sysctlGrow", () => b.listProcesses(), { nth: 0, error: 12 });
     fails("listProcesses：填充快照失败回收缓冲区", "sysctl", () => b.listProcesses(), { nth: 2 });
     fails("processArgs：参数查询失败不能返回 null", "sysctl", () => b.processArgs(process.pid), { nth: 2 });
     fails("processArgs：缓冲区分配失败可见", "malloc", () => b.processArgs(process.pid));

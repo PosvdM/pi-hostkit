@@ -538,33 +538,37 @@ class WriterLock implements SessionWriterLock {
       }
       assertSessionArg(spec.argv, this.paths.canonical);
       const proc = await spawnManaged({ ...spec, startHeld: true });
-      try {
-        this.writeUpdate({ writer: proc.identity, state: "running" });
-      } catch (error) {
-        try {
-          await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
-        } catch (cleanup) {
-          throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
-        }
-        throw error;
-      }
+      // 记录提交失败时仍须记住活写者，防止普通 release 或后续 spawn 绕过身份核对。
       this.writer = proc;
       this.writerExited = false;
       void proc.exited.then(() => {
         if (this.writer === proc) this.writerExited = true;
       });
       try {
+        this.writeUpdate({ writer: proc.identity, state: "running" });
         proc.release();
       } catch (error) {
-        try {
-          await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
-        } catch (cleanup) {
-          throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
-        }
-        throw error;
+        await this.stopFailedWriter(proc, error);
       }
       return proc;
     });
+  }
+
+  private async stopFailedWriter(proc: ManagedProcess, error: unknown): Promise<never> {
+    let report: StopReport;
+    try {
+      report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+    } catch (cleanup) {
+      throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+    }
+    const failed = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
+      !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")));
+    if (report.leftovers.length || failed.length) {
+      // 调用方拿不到失败的 ManagedProcess，停止报告必须随抛出的错误保留。
+      const cleanup = new Error(`Cannot stop failed session writer: ${failed.length} failed steps; ${report.leftovers.length} leftovers`, { cause: report });
+      throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+    }
+    throw error;
   }
 
   /** Commit the released record before changing ownership or in-memory state. */
@@ -572,10 +576,14 @@ class WriterLock implements SessionWriterLock {
     return this.serial(async () => {
       if (this.state === "released") return;
       const record = this.current ?? (this.previous?.state !== "released" ? this.previous : undefined);
-      if (!opts.writerSwitchedAway && record?.writer) {
+      if (!opts.writerSwitchedAway) {
+        const writers = [record?.writer];
+        if (this.writer && !this.writerExited && !writers.includes(this.writer.identity)) writers.push(this.writer.identity);
         try {
-          if ((await isSameProcess(record.writer)) !== "gone") {
-            throw new Error("the session writer is still running");
+          for (const writer of writers) {
+            if (writer && (await isSameProcess(writer)) !== "gone") {
+              throw new Error("the session writer is still running");
+            }
           }
         } catch (cause) {
           throw Object.assign(new Error("release: writer exit cannot be confirmed", { cause }), { code: "EHOSTKIT_LOCK_STATE" });

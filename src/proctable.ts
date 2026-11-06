@@ -79,7 +79,7 @@ export class ProcessTableError extends AggregateError {
   }
 }
 
-/** Lists processes; query failures throw, with readable rows retained internally. */
+/** 列出进程；查询失败抛错，内部保留可读行供清理和报告使用。 */
 export function listProcesses(): ProcessRow[] {
   if (process.platform === "linux") {
     const rows: ProcessRow[] = [];

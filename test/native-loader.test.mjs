@@ -9,10 +9,12 @@ import { test } from "node:test";
 async function fixture(run) {
   const dir = mkdtempSync(path.join(tmpdir(), "hostkit-loader-fault-"));
   const key = `hostkit-test-${path.basename(dir)}`;
-  const state = { calls: 0, fail: false, binding: {} };
+  const state = { calls: 0, requires: 0, fail: false, failRequire: false, binding: {} };
   globalThis[key] = state;
   const loader = path.join(dir, "loader.cjs");
-  writeFileSync(loader, `module.exports = function(root) {
+  writeFileSync(loader, `const initial = globalThis[${JSON.stringify(key)}]; initial.requires++;
+  if (initial.failRequire) throw Object.assign(new Error("原生加载器不可用"), { code: "EREQUIRE" });
+  module.exports = function(root) {
     const state = globalThis[${JSON.stringify(key)}]; state.calls++; state.root = root;
     if (state.fail) throw Object.assign(new Error("原生加载失败"), { code: "ELOAD" });
     return state.binding;
@@ -26,10 +28,22 @@ async function fixture(run) {
 
 test("native：模块导入不查询系统，首次使用加载一次并缓存", () => fixture((m, state) => {
   assert.equal(state.calls, 0);
+  assert.equal(state.requires, 0);
   assert.equal(m.native(), state.binding);
   assert.equal(m.native(), state.binding);
   assert.equal(state.calls, 1);
   assert.ok(path.isAbsolute(state.root));
+}));
+
+test("native：require 失败可见，不缓存半成品，下一次允许重试", () => fixture((m, state) => {
+  state.failRequire = true;
+  assert.throws(() => m.native(), { code: "EREQUIRE" });
+  assert.equal(state.calls, 0);
+  state.failRequire = false;
+  assert.equal(m.native(), state.binding);
+  assert.equal(m.native(), state.binding);
+  assert.equal(state.requires, 2);
+  assert.equal(state.calls, 1);
 }));
 
 test("native：加载失败可见，不缓存失败，下一次允许重试", () => fixture((m, state) => {

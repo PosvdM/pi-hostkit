@@ -201,3 +201,32 @@ test("组 leader 消失时经成员复查降级 kill，成员查询失败不能�
   assert.ok(!state.calls.some(([name]) => name === "kill"));
   assert.equal(state.calls.filter(([name]) => name === "fdClose").length, 1);
 });
+
+test("Linux 命令行查询失败保留既有 unknown 契约，不能拿来证明退出", async () => {
+  reset();
+  const { processCommandLine, processInfo } = await load();
+  state.files.set("/proc/100/cmdline", "node\0entry\0");
+  assert.deepEqual(processCommandLine(100), ["node", "entry"]);
+  state.read = (file) => { if (file.endsWith("/cmdline")) throw fault("EACCES", "命令行不可读"); };
+  assert.equal(processCommandLine(100), null);
+  assert.equal(processInfo(100).startTime, id.startTime);
+});
+
+test("原生进程查询及进程表错误传播，macOS 的 kill 仅把 ESRCH 当退出", async () => {
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    reset();
+    const { processInfo, listProcesses, signalProcess } = await load();
+    state.processInfo = () => { throw fault("EIO", "原生身份查询失败"); };
+    state.listProcesses = () => { throw fault("EACCES", "原生进程表失败"); };
+    assert.throws(() => processInfo(100), /原生身份查询失败/);
+    assert.throws(listProcesses, /原生进程表失败/);
+    state.processInfo = () => ({ ...id, ppid: 1, pgid: 100, zombie: false });
+    state.kill = () => { throw fault("ESRCH"); };
+    assert.equal(signalProcess(id, "SIGKILL", 100), false);
+    state.kill = () => { throw fault("EPERM"); };
+    assert.throws(() => signalProcess(id, "SIGKILL", 100), { code: "EPERM" });
+  } finally {
+    Object.defineProperty(process, "platform", { value: "linux" });
+  }
+});

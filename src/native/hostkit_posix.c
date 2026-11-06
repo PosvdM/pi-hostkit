@@ -149,8 +149,10 @@ static napi_value flock_acquire(napi_env env, napi_callback_info info) {
     return result;
   }
   int err = errno;
-  close(fd);
+  int closed = close(fd);
+  int close_err = errno;
   if (err == EWOULDBLOCK || err == EAGAIN) {
+    if (closed != 0) return throw_errno(env, "close lock file", close_err);
     CHECK(napi_create_int32(env, -1, &result));
     return result;
   }

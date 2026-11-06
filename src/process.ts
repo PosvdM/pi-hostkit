@@ -586,14 +586,25 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
       try {
         report = await managed.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
       } catch (stopError) {
-        throw new AggregateError([error, stopError], `${errorDetail(error)}; stop after release failure: ${errorDetail(stopError)}`);
+        const failures = [error, stopError];
+        // stop 的 Job 句柄由其 finally 处理；这里只回收仍由本机持有的子进程，避免重复关闭句柄。
+        try {
+          child.kill("SIGKILL");
+        } catch (killError) {
+          failures.push(killError);
+        }
+        throw Object.assign(new AggregateError(failures, failures.map(errorDetail).join("; ")), {
+          code: (error as NodeJS.ErrnoException | null)?.code,
+        });
       }
       // 放行失败时没有 ManagedProcess 可交给调用方，清理报告必须随错误保留。
       const failures = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
         !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")));
       if (report.leftovers.length || failures.length) {
         const cleanup = new Error(`stop after release failure: ${failures.map((step) => `${step.step}: ${step.detail ?? "failed"}`).join("; ")}; ${report.leftovers.length} leftovers`, { cause: report });
-        throw new AggregateError([error, cleanup], `${errorDetail(error)}; ${cleanup.message}`);
+        throw Object.assign(new AggregateError([error, cleanup], `${errorDetail(error)}; ${cleanup.message}`), {
+          code: (error as NodeJS.ErrnoException | null)?.code,
+        });
       }
       throw error;
     }

@@ -20,7 +20,7 @@ function reset() {
 const query = (pid) => state.query ? state.query(pid) : state.live.get(pid) ?? null;
 mock.module("node:fs", { namedExports: {
   ...fs,
-  existsSync: (file) => state?.support ? true : fs.existsSync(file),
+  existsSync: (file) => state?.exists ? state.exists(file) : state?.support ? true : fs.existsSync(file),
   readFileSync: (file, ...args) => state?.readFile ? state.readFile(file) : fs.readFileSync(file, ...args),
 } });
 mock.module(new URL("../../dist/proctable.js", import.meta.url), { namedExports: {
@@ -58,10 +58,12 @@ mock.module(new URL("../../dist/native.js", import.meta.url), { namedExports: {
 } });
 mock.module("node:child_process", { namedExports: {
   execFile: (...args) => {
+    if (state.execFile) return state.execFile(...args);
     if (state.support) return args.at(-1)(null, "/test.scope\n");
     throw new Error("不应探测 Linux scope");
   },
-  spawn: () => {
+  spawn: (...args) => {
+    state.spawnArgs = args;
     const child = new EventEmitter();
     child.pid = root.pid;
     child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
@@ -289,6 +291,7 @@ test("gate 放行失败且停止报告含 Job 错误时保留原错与完整报�
     assert.ok(error instanceof AggregateError);
     assert.match(error.message, /gate 放行失败/);
     assert.match(error.message, /放行后 Job 清理失败/);
+    assert.equal(error.code, "EIO");
     assert.ok(error.errors[1].cause.steps.some((step) => !step.ok && step.step === "TerminateJobObject"));
     return true;
   });
@@ -339,11 +342,16 @@ test("gate 放行和 stop 同时拒绝时，两种错误都返回调用方", asy
     reset();
     state.release = () => { throw fault("原始放行错误"); };
     state.stopSnapshot = async () => { throw fault("停止本身拒绝"); };
+    state.killChild = () => { throw fault("停止拒绝后的子进程回收失败"); };
     await assert.rejects(spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), (error) => {
       assert.ok(error instanceof AggregateError);
       assert.match(error.message, /原始放行错误/); assert.match(error.message, /停止本身拒绝/);
+      assert.match(error.message, /停止拒绝后的子进程回收失败/);
+      assert.equal(error.errors.length, 3);
+      assert.equal(error.code, "EIO");
       return true;
     });
+    assert.ok(state.calls.some(([name]) => name === "child.kill"));
   } finally {
     Object.defineProperty(process, "platform", { value: "win32" });
   }
@@ -358,6 +366,49 @@ for (const content of [null, "broken unified cgroup", "0::relative-path\n"]) {
       const { spawnManaged: spawnLinux } = await import(`../../dist/process.js?scope-fault=${encodeURIComponent(String(content))}`);
       await assert.rejects(spawnLinux({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), /scope 查询失败|cannot read unified cgroup/);
       assert.ok(state.calls.some(([name]) => name === "child.kill"));
+    } finally {
+      Object.defineProperty(process, "platform", { value: "win32" });
+    }
+  });
+}
+
+for (const kind of ["controllers", "executable", "exec-error", "malformed-probe"]) {
+  test(`Linux 能力探测的 ${kind} 只降级覆盖范围，不报告进程已退出`, async () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      reset();
+      state.exists = (file) => kind === "controllers" ? false : kind === "executable" ? file.endsWith("cgroup.controllers") : true;
+      state.execFile = (...args) => args.at(-1)(kind === "exec-error" ? fault("探测失败") : null, "无 scope 输出\n");
+      const module = await import(`../../dist/process.js?probe=${kind}`);
+      assert.equal(await module.linuxCgroupSupport(), null);
+      const proc = await module.spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i", startHeld: true });
+      assert.equal(proc.coverage, "snapshot_visible");
+      assert.equal(await module.isSameProcess(root), "alive");
+      state.child.emit("exit", 0, null);
+    } finally {
+      Object.defineProperty(process, "platform", { value: "win32" });
+    }
+  });
+}
+
+for (const code of ["ENOENT", "ESRCH"]) {
+  test(`Linux 启动 scope 的暂时 ${code} 继续等待，不误判 gate 已退出`, async () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      reset(); state.support = true;
+      let reads = 0;
+      state.readFile = () => {
+        if (++reads === 1) throw Object.assign(new Error(code), { code });
+        const unit = state.spawnArgs[1].find((arg) => arg.startsWith("--unit=")).slice(7);
+        return `0::/test/${unit}.scope\n`;
+      };
+      const module = await import(`../../dist/process.js?scope-retry=${code}`);
+      const proc = await module.spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i", startHeld: true });
+      assert.equal(proc.coverage, "cgroup");
+      assert.ok(proc.identity.cgroup.endsWith(".scope"));
+      assert.equal(reads, 2);
+      assert.ok(!state.calls.some(([name]) => name === "child.kill"));
+      state.child.emit("exit", 0, null);
     } finally {
       Object.defineProperty(process, "platform", { value: "win32" });
     }
