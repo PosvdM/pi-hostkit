@@ -432,7 +432,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 恢复成功后，用 `spawnWriter` 拉起新写者。它按协议顺序执行：以 `startHeld` 启动（停在 gate）→ `update({ writer, state: "running" })` → `release()`。所以 pi 加载、打开会话文件之前，它的身份已经在记录里。写记录失败时停止该进程并抛出错误。
 
 - 按 pi 自己的参数规则，`spec.argv`（`[cliEntry, ...pi 参数]`）必须让 pi 以 RPC 模式打开这把锁的会话文件，并且不带 `--continue`、`--resume`、`--session-id`、`--print` 等会另选会话的选项，否则抛出 `EINVAL`。
-- `--session` 的值必须是不依赖 pi 的环境和工作目录的绝对路径：POSIX 上以 `/` 开头，Windows 上带盘符（`C:\…`、`C:/…`）或是 UNC 路径。`~`、相对路径、Windows 上没有盘符的路径都被拒绝：pi 按自己的 `HOME`（`spec.env`）、工作目录（`spec.cwd`）或当前盘解析它们，与宿主校验时看到的可能不是同一个文件。
+- `--session` 的值必须是不依赖 pi 的环境和工作目录的绝对路径：POSIX 上以 `/` 开头，Windows 上带盘符（`C:\…`、`C:/…`）或是服务器名和共享名都不为空的 UNC 路径（`\\server\share\…`）。`~`、相对路径、Windows 上没有盘符的路径都被拒绝：pi 按自己的 `HOME`（`spec.env`）、工作目录（`spec.cwd`）或当前盘解析它们，与宿主校验时看到的可能不是同一个文件。
 
 #### pi 参数规则
 

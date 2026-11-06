@@ -10,6 +10,7 @@ import {
   isAncestorOf,
   isWithin,
   normalizeWindowsShellPath,
+  environmentIndependentPathFor,
   resolveReadToolPath,
   resolveToolPath,
 } from "../dist/paths.js";
@@ -118,6 +119,39 @@ describe("canonicalPath", () => {
   test("applies pi's input rules before resolving", () => {
     mkdirSync(path.join(root, "rules"), { recursive: true });
     assert.equal(canonicalPathSync("@rules/a\u00A0b.txt", root, "write"), path.join(root, "rules", "a b.txt"));
+  });
+});
+
+describe("environment-independent --session paths", () => {
+  test("Windows: drive letters and complete UNC paths only", () => {
+    const ok = {
+      "C:\\s\\a.jsonl": "C:\\s\\a.jsonl",
+      "c:/s/a.jsonl": "c:\\s\\a.jsonl",
+      "\\\\srv\\share\\a.jsonl": "\\\\srv\\share\\a.jsonl",
+      "//srv/share/a.jsonl": "\\\\srv\\share\\a.jsonl",
+      "\\\\srv/share\\a.jsonl": "\\\\srv\\share\\a.jsonl",
+    };
+    for (const [input, expected] of Object.entries(ok)) {
+      assert.equal(environmentIndependentPathFor(input, "win32"), expected, input);
+    }
+    const uncertain = [
+      "\\\\a.jsonl", // no share: Node resolves it against the current drive
+      "\\\\srv\\", // trailing separator, no share
+      "//srv",
+      "\\\\?\\C:\\a.jsonl",
+      "\\\\.\\pipe\\x",
+      "\\s\\a.jsonl", // current drive
+      "/c/s/a.jsonl", // Git Bash form
+      "C:a.jsonl", // drive-relative
+      "~/a.jsonl",
+      "a.jsonl",
+    ];
+    for (const input of uncertain) assert.equal(environmentIndependentPathFor(input, "win32"), undefined, input);
+  });
+
+  test("POSIX: paths starting with / only", () => {
+    assert.equal(environmentIndependentPathFor("/s/../a.jsonl", "linux"), "/a.jsonl");
+    for (const input of ["~/a.jsonl", "a.jsonl", "./a.jsonl"]) assert.equal(environmentIndependentPathFor(input, "darwin"), undefined, input);
   });
 });
 

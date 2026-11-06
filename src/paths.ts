@@ -59,8 +59,17 @@ export function resolveToolPath(input: string, cwd: string): string {
  * path pi opens (`path.resolve` of the value).
  */
 export function environmentIndependentPath(value: string): string | undefined {
-  if (process.platform === "win32") {
-    if (/^[A-Za-z]:[\\/]/.test(value) || /^[\\/]{2}[^\\/?.]/.test(value)) return path.win32.resolve(value);
+  return environmentIndependentPathFor(value, process.platform);
+}
+
+/** `environmentIndependentPath` for a given platform (exported for tests). */
+export function environmentIndependentPathFor(value: string, platform: NodeJS.Platform): string | undefined {
+  if (platform === "win32") {
+    if (/^[A-Za-z]:[\\/]/.test(value)) return path.win32.resolve(value);
+    // UNC needs a non-empty server and share (`\\server\share...`), as in
+    // Node's win32 path rules; `\\x` alone resolves against the current drive.
+    // Device paths (`\\?\`, `\\.\`) are not accepted.
+    if (/^[\\/]{2}[^\\/?.][^\\/]*[\\/]+[^\\/]+/.test(value)) return path.win32.resolve(value);
     return undefined;
   }
   return value.startsWith("/") ? path.posix.resolve(value) : undefined;
