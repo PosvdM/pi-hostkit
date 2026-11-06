@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import { test } from "node:test";
-import { stopCgroup } from "../dist/cgroups.js";
+import { cgroupPopulated, stopCgroup } from "../dist/cgroups.js";
 
 const dir = "/sys/fs/cgroup/pi-hostkit-faults-deadbeef.scope";
 const root = { pid: 100, startTime: "root", runId: "r", instanceId: "i" };
@@ -294,7 +294,8 @@ test("unexpected cgroup.kill errors and rejected settle waits become report data
   assert.ok(sent.some(([pid]) => pid === root.pid));
   assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("cgroup.kill unavailable")));
   assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("settle failed")));
-  assert.equal(inReport(report, 101)?.startTime, "101");
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(sent.some(([pid]) => pid === 101));
 });
 
 test("successful cgroup.kill does not enter the per-PID fallback", async () => {
@@ -415,4 +416,92 @@ test("missing cgroup.procs in an existing scope is incomplete enumeration", asyn
   const report = await stopCgroup(dir, root, once, ops);
   assert.ok(inReport(report, 0));
   assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("missing procs in existing scope")));
+});
+
+for (const code of ["EIO", "ENOSPC", "EBUSY", "EROFS"]) {
+  test(`cgroup.kill 的 ${code} 不阻断逐 PID 退路`, async () => {
+    const { ops, sent } = fixture([row(101), row(102)]);
+    oldKernel(ops, code);
+    const report = await stopCgroup(dir, root, once, ops);
+    assert.deepEqual(report.leftovers, []);
+    assert.ok(sent.some(([pid]) => pid === 101));
+    assert.ok(sent.some(([pid]) => pid === 102));
+    assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes(code)));
+  });
+}
+
+test("缺失 cgroup.kill 后目录查询失败仍继续逐成员和 pi 清理", async () => {
+  const { ops, sent } = fixture([row(101)]);
+  oldKernel(ops);
+  ops.exists = () => { throw fault("EIO", "scope 目录查询失败"); };
+  const report = await stopCgroup(dir, root, once, ops);
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(sent.some(([pid]) => pid === 101));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("scope 目录查询失败")));
+});
+
+test("子树 procs 缺失且目录查询失败保留未知哨兵，其他子树继续", async () => {
+  const { ops, sent } = fixture([row(101)]);
+  oldKernel(ops);
+  const read = ops.readFile;
+  const hidden = path.join(dir, "hidden"), good = path.join(dir, "good");
+  ops.readDirectories = (current) => current === dir ? ["hidden", "good"] : [];
+  ops.exists = (current) => { if (current === hidden) throw fault("EIO", "子树存在性查询失败"); return true; };
+  ops.readFile = (file) => {
+    if (file === path.join(dir, "cgroup.events")) return "populated 1\n";
+    if (file === path.join(hidden, "cgroup.procs")) throw fault("ENOENT", "子树 procs 缺失");
+    if (file === path.join(good, "cgroup.procs")) return "101\n";
+    return read(file);
+  };
+  const report = await stopCgroup(dir, root, once, ops);
+  assert.ok(sent.some(([pid]) => pid === 101));
+  assert.ok(inReport(report, 0));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("子树存在性查询失败")));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("子树 procs 缺失")));
+});
+
+test("子树目录列举缺失且存在性查询失败不能当作已移除", async () => {
+  const { ops } = fixture([row(101)]);
+  ops.readDirectories = () => { throw fault("ENOENT", "子目录列表缺失"); };
+  ops.exists = () => { throw fault("EACCES", "目录不可查"); };
+  const report = await stopCgroup(dir, root, once, ops);
+  assert.ok(inReport(report, 0));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("子目录列表缺失")));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("目录不可查")));
+});
+
+test("无效 PID 行不能伪造空 scope，合法 PID 仍可清理", async () => {
+  const { ops, sent } = fixture([row(101)]);
+  oldKernel(ops);
+  const read = ops.readFile;
+  ops.readFile = (file) => {
+    if (file === path.join(dir, "cgroup.events")) return "populated 1\n";
+    if (file === path.join(dir, "cgroup.procs")) return "101\n-1\nNaN\n9007199254740992\n";
+    return read(file);
+  };
+  const report = await stopCgroup(dir, root, once, ops);
+  assert.ok(sent.some(([pid]) => pid === 101));
+  assert.ok(inReport(report, 0));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("invalid PID")));
+});
+
+test("cgroup 成员资格内容损坏不发信号，其他成员及 pi 继续", async () => {
+  const { ops, sent } = fixture([row(101), row(102)]);
+  oldKernel(ops);
+  const read = ops.readFile;
+  ops.readFile = (file) => file === "/proc/101/cgroup" ? "0::relative-path\n" : read(file);
+  const report = await stopCgroup(dir, root, once, ops);
+  assert.ok(!sent.some(([pid]) => pid === 101));
+  assert.ok(sent.some(([pid]) => pid === 102));
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }]);
+  assert.ok(report.steps.some((step) => !step.ok && step.step === "query cgroup membership"));
+});
+
+test("cgroupPopulated 只在明确移除时把 events 缺失当作空", () => {
+  for (const code of ["ENOENT", "ENODEV", "EIO", "EACCES"]) {
+    const ops = { readFile: () => { throw fault(code); }, exists: () => false };
+    if (["ENOENT", "ENODEV"].includes(code)) assert.equal(cgroupPopulated(dir, ops), false);
+    else assert.throws(() => cgroupPopulated(dir, ops), { code });
+  }
+  assert.throws(() => cgroupPopulated(dir, { readFile: () => "populated ?\n", exists: () => false }), /cannot read populated/);
 });

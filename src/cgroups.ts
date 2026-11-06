@@ -184,7 +184,7 @@ export async function stopCgroup(
 
   const inScope = (pid: number): boolean => {
     const line = ops.readFile(`/proc/${pid}/cgroup`).split("\n").find((entry) => entry.startsWith("0::"));
-    if (!line) throw new Error(`cannot read unified cgroup from /proc/${pid}/cgroup`);
+    if (!line || !line.slice(3).startsWith("/")) throw new Error(`cannot read unified cgroup from /proc/${pid}/cgroup`);
     const current = path.posix.join("/sys/fs/cgroup", line.slice(3));
     return current === dir || current.startsWith(`${dir}/`);
   };
@@ -208,8 +208,7 @@ export async function stopCgroup(
           failed("check cgroup directory", existsError, dir);
         }
       }
-      const code = (error as NodeJS.ErrnoException | null)?.code;
-      if (!isMissing(error) && code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") return;
+      // cgroup.kill 的任意失败都不阻止逐 PID 退路；每次查询和信号仍单独验证身份。
     }
     // Kernels before 5.14 lack cgroup.kill. Each PID has its own error boundary,
     // and population/listing failures do not prevent readable members' cleanup.

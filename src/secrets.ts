@@ -116,7 +116,13 @@ export async function writePrivateFile(file: string, data: Uint8Array): Promise<
     try {
       handle = await open(file, "r+");
     } catch (error) {
-      await unlink(file).catch(() => {});
+      try {
+        await unlink(file);
+      } catch (cleanup) {
+        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw new AggregateError([error, cleanup], `Cannot remove incomplete private file ${file}`);
+        }
+      }
       throw error;
     }
   } else {
@@ -126,12 +132,27 @@ export async function writePrivateFile(file: string, data: Uint8Array): Promise<
     if (process.platform === "darwin" && nativeFn("aclEntryCount")(file)) nativeFn("aclClear")(file);
     await handle.writeFile(data);
     await handle.sync();
+    const closing = handle;
+    handle = undefined;
+    await closing.close();
+    const check = await checkPrivate(file);
+    if (!check.ok) throw privateError(file, check.problem);
   } catch (error) {
-    await handle.close().catch(() => {});
-    await unlink(file).catch(() => {});
+    const failures: unknown[] = [error];
+    if (handle) {
+      try {
+        await handle.close();
+      } catch (cleanup) {
+        failures.push(cleanup);
+      }
+    }
+    try {
+      await unlink(file);
+    } catch (cleanup) {
+      // 文件已消失不构成清理失败；其他失败必须报告。
+      if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") failures.push(cleanup);
+    }
+    if (failures.length > 1) throw new AggregateError(failures, `Cannot finish private file ${file}`);
     throw error;
   }
-  await handle.close();
-  const check = await checkPrivate(file);
-  if (!check.ok) throw privateError(file, check.problem);
 }

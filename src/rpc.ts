@@ -195,6 +195,7 @@ export class StdioRpcTransport implements RpcTransport {
   private waitingDrain = false;
   private pumping = false;
   private inputClosing = false;
+  private closingErrors: unknown[] | undefined;
   private readonly onDrain = () => {
     this.waitingDrain = false;
     this.flushWrites();
@@ -403,7 +404,10 @@ export class StdioRpcTransport implements RpcTransport {
   }
 
   private fail(error: Error, report = true): void {
-    if (this.failure) return;
+    if (this.failure) {
+      this.closingErrors?.push(error);
+      return;
+    }
     this.failure = error;
     this.writes.length = 0;
     this.queuedBytes = 0;
@@ -411,12 +415,18 @@ export class StdioRpcTransport implements RpcTransport {
     this.stdin.removeListener("drain", this.onDrain);
     for (const id of [...this.pending.keys()]) this.settle(id, undefined, error);
     if (this.inputClosing && !this.stdin.writableEnded) {
+      const cleanupErrors: unknown[] = [];
+      this.closingErrors = cleanupErrors;
       try {
         this.stdin.end();
-      } catch {
-        // Preserve the first failure if ending a broken stream also throws.
+      } catch (cleanup) {
+        cleanupErrors.push(cleanup);
+      } finally {
+        this.closingErrors = undefined;
       }
+      // end 抛错或同步发出 error 时，清理失败与首个传输错误一并报告。
+      if (cleanupErrors.length) this.failure = new AggregateError([error, ...new Set(cleanupErrors)], "RPC failure while closing stdin");
     }
-    if (report) this.errors.emit(error);
+    if (report || this.failure !== error) this.errors.emit(this.failure);
   }
 }

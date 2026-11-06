@@ -69,6 +69,10 @@ npm test
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
 | `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、部分分支保留、最后快照失败与 `StopReport` |
 | `test/existence-faults.test.mjs` | 严格存在性错误分类、记录 scope 查询失败的覆盖保留、gate 协议查询不明不能被其他候选掩盖 |
+| `test/localfs-faults.test.mjs` | 本地磁盘探测的严格上溯、跨挂载边界、原生查询失败与悬空链接目标 |
+| `test/gate-faults.test.mjs` | 门闩读取的暂不可读、管道结束、权限与 I/O 错误；失败不能加载入口 |
+| `test/platform-mounts.test.mjs` | 真实大小写敏感 APFS 的路径与锁拒绝、真实 SSHFS 远程挂载及其中的权限查询失败 |
+| `test/cgroup-subtree.test.mjs` | 真实委派 scope 的两棵子 cgroup；整体清理与部分查询失败时独立清理 |
 | `test/cgroup-faults.test.mjs` | cgroup 旧内核退回、逐 PID 信号与查询错误、部分/最终列举失败、已知身份及未知哨兵、独立 pi 保底 |
 | `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
 | `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
@@ -94,6 +98,8 @@ npm test
 | `PI_PACKAGE` | pi 的包目录。设置后测试使用该安装，并跳过自动定位 smoke 用例；隔离 HOME 的定位测试仍执行 |
 | `HOSTKIT_TEST_CONTAINMENT` | `auto`（默认）或 `snapshot`，传给 `spawnManaged` 的 `containment`；在 Linux 上用 `snapshot` 测试快照模式 |
 | `HOSTKIT_TEST_REQUIRE_CGROUP` | 设为 `1` 时，Linux 上 cgroup v2 user scope 不可用则测试失败；用于防止 CI 静默退回快照模式 |
+| `HOSTKIT_TEST_APFS` | CI 用 `hdiutil` 创建并挂载的大小写敏感 APFS 测试卷；未设置时只跳过该真实挂载用例 |
+| `HOSTKIT_TEST_REMOTE` | Linux auto CI 用 SSHFS 挂载的远程目录；未设置时只跳过该真实挂载用例 |
 | `KEEP_FIXTURES` | 设置后保留测试的临时目录，便于排查 |
 
 在 Linux 上本地测试 cgroup 模式，需要当前用户的 systemd 实例，且环境中有 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；可先运行 `systemd-run --user --scope true` 确认。
@@ -106,7 +112,9 @@ npm test
 
 - 矩阵：ubuntu-latest、macos-latest、windows-latest 各以 `containment=auto` 运行一次，ubuntu-latest 再以 `containment=snapshot` 运行一次。
 - 步骤：安装 Node 24，`npm ci`（构建原生模块和 `dist/`），全局安装 pi 1.5.0，`npm test`。
-- Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。
+- Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。子树用例另建带 `Delegate=yes` 的 scope，创建两个实际子 cgroup；CI 不允许因缺少 cgroup 支持跳过。
+- macOS 用 `hdiutil create -fs APFSX` 创建 128 MiB 的大小写敏感 APFS 磁盘映像并挂载，在其中验证路径比较与会话锁拒绝；测试结束后卸载。
+- Linux auto 安装 SSHFS 与 OpenSSH server，用运行器临时目录中的专用密钥启动本机端口 2222 的 SSH 服务并挂载 SFTP 目录。远程卷用例同时检查明确非本地和无法遍历目录的 `EACCES`，不改宿主真实 HOME 下的 SSH 配置；测试结束后卸载并停止该 SSH 服务。
 
 `prebuild` 任务为六个目标构建预编译模块：
 
@@ -120,6 +128,8 @@ npm test
 | windows-11-arm | win32 arm64 |
 
 每个任务 `npm ci --ignore-scripts` 后运行 `prebuildify --napi --strip`，非交叉编译的目标再用 `node-gyp-build` 加载一次并调用 `fsInfo`，然后上传 `prebuilds-<运行器>` artifact。`collect prebuilds` 任务把它们合并成一个 `prebuilds` artifact。预编译模块目前不随包分发，见 [README](../README.md#安装)。
+
+系统边界的逐检查点、故障注入与真实平台测试映射见 [failure-boundaries.md](failure-boundaries.md)；[设计不变式](design.md#故障处理不变式)约束测试预期。
 
 ## 修改约定
 

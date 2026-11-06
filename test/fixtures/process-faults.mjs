@@ -1,0 +1,365 @@
+// 独立子进程中的模块替身，不向生产代码开放测试开关。
+import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import * as fs from "node:fs";
+import { mock, test } from "node:test";
+import * as table from "../../dist/proctable.js";
+
+Object.defineProperty(process, "platform", { value: "win32" });
+const root = { pid: 100, startTime: "1", runId: "r", instanceId: "i" };
+const row = (pid, ppid = 100) => ({ pid, ppid, startTime: String(pid), zombie: false });
+const fault = (message) => Object.assign(new Error(message), { code: "EIO" });
+let state;
+function reset() {
+  state = {
+    live: new Map([[100, { ...root, ppid: 1, zombie: false }]]),
+    pids: [], calls: [], closeCount: 0,
+  };
+}
+const query = (pid) => state.query ? state.query(pid) : state.live.get(pid) ?? null;
+mock.module("node:fs", { namedExports: {
+  ...fs,
+  existsSync: (file) => state?.support ? true : fs.existsSync(file),
+  readFileSync: (file, ...args) => state?.readFile ? state.readFile(file) : fs.readFileSync(file, ...args),
+} });
+mock.module(new URL("../../dist/proctable.js", import.meta.url), { namedExports: {
+  ...table,
+  processInfo: query,
+  listProcesses: () => state.list ? state.list() : [...state.live.values()],
+  signalProcess: (id, signal, group) => {
+    state.calls.push(["signal", id.pid, signal, group]);
+    if (state.signal) return state.signal(id, signal, group);
+    state.live.delete(id.pid);
+    return true;
+  },
+} });
+mock.module(new URL("../../dist/native.js", import.meta.url), { namedExports: {
+  nativeFn: (name) => (...args) => {
+    state.calls.push([name, ...args]);
+    switch (name) {
+      case "jobCreate": return 42;
+      case "jobAssign": if (state.assign) return state.assign(); return;
+      case "jobTerminate":
+        if (state.terminateJob) return state.terminateJob();
+        state.live.clear(); state.pids = []; return;
+      case "jobProcessIds": return state.jobQuery ? state.jobQuery() : state.pids;
+      case "handleClose":
+        state.closeCount++;
+        if (state.close) return state.close();
+        return;
+      case "terminateProcess":
+        if (state.terminate) return state.terminate(...args);
+        if (!table.matches(state.live.get(args[0]), { pid: args[0], startTime: args[1] })) return false;
+        state.live.delete(args[0]); return true;
+      default: throw new Error(`意外的 native 调用 ${name}`);
+    }
+  },
+} });
+mock.module("node:child_process", { namedExports: {
+  execFile: (...args) => {
+    if (state.support) return args.at(-1)(null, "/test.scope\n");
+    throw new Error("不应探测 Linux scope");
+  },
+  spawn: () => {
+    const child = new EventEmitter();
+    child.pid = root.pid;
+    child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
+    child.kill = () => { state.calls.push(["child.kill"]); if (state.killChild) return state.killChild(); return true; };
+    if (state.constructManaged) child.stderr.setEncoding = () => { throw fault("Managed 构造失败"); };
+    state.child = child;
+    queueMicrotask(() => child.emit("spawn"));
+    return child;
+  },
+} });
+mock.module(new URL("../../dist/rpc.js", import.meta.url), { namedExports: {
+  StdioRpcTransport: class {
+    constructor() { if (state.constructRpc) throw fault("RPC 构造失败"); }
+    block() {}
+    writeRaw() { if (state.release) state.release(); }
+    onEvent() {}
+    async send() { if (state.abort) return state.abort(); return { success: true }; }
+    closeInput() {
+      if (!state.keepRoot) state.child.emit("exit", 0, null);
+      if (state.eof) state.eof();
+    }
+  },
+} });
+const snapshots = await import("../../dist/snapshots.js");
+mock.module(new URL("../../dist/snapshots.js", import.meta.url), { namedExports: {
+  ...snapshots,
+  stopSnapshot: (...args) => state.stopSnapshot ? state.stopSnapshot(...args) : snapshots.stopSnapshot(...args),
+} });
+const { spawnManaged, stopByIdentity, isSameProcess, readIdentity } = await import("../../dist/process.js");
+const fast = { abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 };
+const spawn = () => spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i", startHeld: true });
+const failed = (report, text) => report.steps.some((step) => !step.ok && step.detail?.includes(text));
+// 只压缩等待时间；保留真实异步定时器和 poll 的每轮查询。
+const timeout = globalThis.setTimeout;
+mock.method(globalThis, "setTimeout", (fn, ms, ...args) => timeout(fn, Math.min(ms, 1), ...args));
+let clock = 0;
+mock.method(Date, "now", () => (clock += 1_000));
+
+test("Job 持续查询失败返回未知哨兵，关闭句柄且重复 stop 共享报告", async () => {
+  reset();
+  const proc = await spawn();
+  state.jobQuery = () => { throw fault("Job 查询失败"); };
+  const a = proc.stop(fast), b = proc.stop(fast);
+  assert.equal(a, b);
+  const report = await a;
+  assert.equal(await proc.stop(), report);
+  assert.ok(failed(report, "Job 查询失败"));
+  assert.ok(report.leftovers.some((entry) => entry.pid === 0 && /Job Object/.test(entry.exe)));
+  assert.equal(state.closeCount, 1);
+  assert.equal(report.steps.filter((step) => step.step === "query Job Object").length, 1);
+});
+
+test("Job 最终查询失败保留已知成员并添加未知范围哨兵", async () => {
+  reset();
+  const child = row(101);
+  state.live.set(101, child);
+  const proc = await spawn();
+  state.terminateJob = () => {};
+  let reads = 0;
+  state.jobQuery = () => { if (++reads > 1) throw fault("最终 Job 查询失败"); return [101]; };
+  const report = await proc.stop(fast);
+  assert.ok(report.leftovers.some((entry) => entry.pid === 101 && entry.startTime === child.startTime));
+  assert.ok(report.leftovers.some((entry) => entry.pid === 0));
+  assert.ok(failed(report, "最终 Job 查询失败"));
+  assert.equal(state.closeCount, 1);
+});
+
+test("Job 暂时查询失败后确认空，只保留失败步骤而不伪造残留", async () => {
+  reset();
+  const proc = await spawn();
+  let reads = 0;
+  state.jobQuery = () => { if (++reads === 1) throw fault("暂时 Job 查询失败"); return []; };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(failed(report, "暂时 Job 查询失败"));
+  assert.equal(state.closeCount, 1);
+});
+
+test("Job 单个 PID 查询失败不跳过其他成员，已知身份不丢失", async () => {
+  reset();
+  state.live.set(101, row(101)); state.live.set(102, row(102));
+  const proc = await spawn();
+  state.terminateJob = () => {};
+  state.pids = [101, 102];
+  let reads = 0;
+  state.query = (pid) => {
+    if (pid === 101 && ++reads > 1) throw fault("成员查询失败");
+    return state.live.get(pid) ?? null;
+  };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }, { pid: 102, startTime: "102" }]);
+  assert.ok(failed(report, "成员查询失败"));
+});
+
+test("Job 成员第一次查询失败保留未知 PID，不能当作 gone", async () => {
+  reset();
+  const proc = await spawn();
+  state.terminateJob = () => {};
+  state.pids = [101];
+  state.query = () => { throw fault("身份不可读"); };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "" }]);
+  assert.ok(failed(report, "身份不可读"));
+});
+
+test("Job 终止与句柄关闭同时失败都写入报告", async () => {
+  reset();
+  const proc = await spawn();
+  state.terminateJob = () => { throw fault("Job 终止失败"); };
+  state.close = () => { throw fault("句柄关闭失败"); };
+  const report = await proc.stop(fast);
+  assert.ok(failed(report, "Job 终止失败"));
+  assert.ok(failed(report, "句柄关闭失败"));
+  assert.equal(state.closeCount, 1);
+});
+
+test("关闭输入及 abort 异常不阻止 Job 清理，字符串异常保留原因", async () => {
+  reset();
+  const proc = await spawn();
+  proc.release();
+  state.abort = () => { throw "abort 字符串异常"; };
+  state.eof = () => { throw fault("关闭输入失败"); };
+  const report = await proc.stop(fast);
+  assert.ok(failed(report, "abort 字符串异常"));
+  assert.ok(failed(report, "关闭输入失败"));
+  assert.ok(state.calls.some(([name]) => name === "jobTerminate"));
+});
+
+test("Managed 最终 pi 查询失败保留原身份，不把未知当退出", async () => {
+  reset();
+  const proc = await spawn();
+  state.keepRoot = true;
+  state.query = () => { throw fault("最终 pi 查询失败"); };
+  const report = await proc.stop(fast);
+  assert.ok(failed(report, "最终 pi 查询失败"));
+  assert.deepEqual(report.leftovers, [{ pid: root.pid, startTime: root.startTime }]);
+});
+
+test("Windows 恢复停止逐目标隔离终止错误，查询未知保留身份", async () => {
+  reset();
+  state.live.set(101, row(101)); state.live.set(102, row(102));
+  const sent = [];
+  state.terminate = (pid) => {
+    sent.push(pid);
+    if (pid === 101 || pid === 100) throw fault(`终止失败 ${pid}`);
+    state.live.delete(pid); return true;
+  };
+  const report = await stopByIdentity(root, fast);
+  assert.deepEqual(sent, [100, 101, 102]);
+  assert.deepEqual(report.leftovers.map((entry) => entry.pid), [101, 100]);
+  assert.ok(failed(report, "终止失败 101"));
+  assert.ok(failed(report, "终止失败 100"));
+});
+
+test("Windows 恢复停止列表失败也终止 pi 并输出快照失败", async () => {
+  reset();
+  state.list = () => { throw fault("恢复列表失败"); };
+  const report = await stopByIdentity(root, fast);
+  assert.ok(failed(report, "恢复列表失败"));
+  assert.ok(state.calls.some(([name, pid]) => name === "terminateProcess" && pid === 100));
+  assert.deepEqual(report.leftovers, []);
+});
+
+test("Windows 恢复停止单父查询失败只丢弃该分支，其他分支继续", async () => {
+  reset();
+  for (const entry of [row(101), row(102), row(103, 101), row(104, 102)]) state.live.set(entry.pid, entry);
+  state.query = (pid) => { if (pid === 101) throw fault("父身份失败"); return state.live.get(pid) ?? null; };
+  const report = await stopByIdentity(root, fast);
+  const sent = state.calls.filter(([name]) => name === "terminateProcess").map(([, pid]) => pid);
+  assert.ok(sent.includes(104)); assert.ok(!sent.includes(103));
+  assert.ok(report.leftovers.some((entry) => entry.pid === 101));
+  assert.ok(failed(report, "父身份失败"));
+});
+
+test("Windows 恢复停止 pi 查询失败返回 unknown，仍尝试身份校验终止", async () => {
+  reset();
+  state.query = () => { throw fault("pi 查询不可用"); };
+  state.terminate = () => { throw fault("pi 终止不可用"); };
+  const report = await stopByIdentity(root, fast);
+  assert.equal(report.steps.find((step) => step.step === "identity").detail, "unknown");
+  assert.ok(report.leftovers.some((entry) => entry.pid === 100 && entry.startTime === "1"));
+  assert.ok(failed(report, "pi 查询不可用"));
+  assert.ok(failed(report, "pi 终止不可用"));
+});
+
+test("readIdentity 和 isSameProcess 的查询错误向调用方传播", async () => {
+  reset();
+  state.query = () => { throw fault("身份查询失败"); };
+  assert.throws(() => readIdentity(100, "r", "i"), /身份查询失败/);
+  await assert.rejects(isSameProcess(root), /身份查询失败/);
+});
+
+test("spawn 的 Job 分配失败回收子进程和已创建句柄", async () => {
+  reset();
+  state.assign = () => { throw fault("Job 分配失败"); };
+  await assert.rejects(spawn(), /Job 分配失败/);
+  assert.ok(state.calls.some(([name]) => name === "child.kill"));
+  assert.equal(state.closeCount, 1);
+});
+
+for (const kind of ["constructRpc", "constructManaged"]) {
+  test(`${kind} 构造失败回收 gate 和 Job，回收双错全部保留`, async () => {
+    reset();
+    state[kind] = true;
+    state.killChild = () => { throw fault("gate 回收失败"); };
+    state.close = () => { throw fault("Job 回收失败"); };
+    await assert.rejects(spawn(), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /构造失败/);
+      assert.match(error.message, /gate 回收失败/);
+      assert.match(error.message, /Job 回收失败/);
+      assert.equal(error.errors.length, 3);
+      assert.equal(error.code, "EIO");
+      return true;
+    });
+    assert.equal(state.closeCount, 1);
+  });
+}
+
+test("gate 放行失败且停止报告含 Job 错误时保留原错与完整报告", async () => {
+  reset();
+  state.release = () => { throw fault("gate 放行失败"); };
+  state.terminateJob = () => { throw fault("放行后 Job 清理失败"); };
+  await assert.rejects(spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), (error) => {
+    assert.ok(error instanceof AggregateError);
+    assert.match(error.message, /gate 放行失败/);
+    assert.match(error.message, /放行后 Job 清理失败/);
+    assert.ok(error.errors[1].cause.steps.some((step) => !step.ok && step.step === "TerminateJobObject"));
+    return true;
+  });
+  assert.equal(state.closeCount, 1);
+});
+
+test("POSIX SIGTERM 失败不阻止最终快照和后代清理", async () => {
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    reset();
+    state.live.set(101, { ...row(101), pgid: 101 });
+    const proc = await spawn();
+    state.keepRoot = true;
+    state.signal = (id, signal) => {
+      if (signal === "SIGTERM") throw fault("SIGTERM 失败");
+      state.live.delete(id.pid); return true;
+    };
+    const report = await proc.stop(fast);
+    assert.ok(failed(report, "SIGTERM 失败"));
+    assert.deepEqual(report.leftovers, []);
+    assert.ok(state.calls.some(([name, pid, signal]) => name === "signal" && pid === 101 && signal === "SIGKILL"));
+  } finally {
+    Object.defineProperty(process, "platform", { value: "win32" });
+  }
+});
+
+test("POSIX 恢复停止的单目标信号失败不中断其他后代及 pi", async () => {
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    reset();
+    state.live.set(101, { ...row(101), pgid: 101 }); state.live.set(102, { ...row(102), pgid: 102 });
+    state.signal = (id, signal) => {
+      if (id.pid === 101 || signal === "SIGTERM") throw fault(`目标信号失败 ${id.pid}`);
+      state.live.delete(id.pid); return true;
+    };
+    const report = await stopByIdentity(root, fast);
+    assert.deepEqual(report.leftovers.map((entry) => entry.pid), [101]);
+    assert.ok(state.calls.some(([name, pid, signal]) => name === "signal" && pid === 102 && signal === "SIGKILL"));
+    assert.ok(failed(report, "目标信号失败 101"));
+  } finally {
+    Object.defineProperty(process, "platform", { value: "win32" });
+  }
+});
+
+test("gate 放行和 stop 同时拒绝时，两种错误都返回调用方", async () => {
+  Object.defineProperty(process, "platform", { value: "darwin" });
+  try {
+    reset();
+    state.release = () => { throw fault("原始放行错误"); };
+    state.stopSnapshot = async () => { throw fault("停止本身拒绝"); };
+    await assert.rejects(spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), (error) => {
+      assert.ok(error instanceof AggregateError);
+      assert.match(error.message, /原始放行错误/); assert.match(error.message, /停止本身拒绝/);
+      return true;
+    });
+  } finally {
+    Object.defineProperty(process, "platform", { value: "win32" });
+  }
+});
+
+for (const content of [null, "broken unified cgroup", "0::relative-path\n"]) {
+  test(`Linux 启动 scope 查询失败或内容损坏直接失败并回收 gate：${content}`, async () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    try {
+      reset(); state.support = true;
+      state.readFile = () => { if (content === null) throw fault("scope 查询失败"); return content; };
+      const { spawnManaged: spawnLinux } = await import(`../../dist/process.js?scope-fault=${encodeURIComponent(String(content))}`);
+      await assert.rejects(spawnLinux({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), /scope 查询失败|cannot read unified cgroup/);
+      assert.ok(state.calls.some(([name]) => name === "child.kill"));
+    } finally {
+      Object.defineProperty(process, "platform", { value: "win32" });
+    }
+  });
+}

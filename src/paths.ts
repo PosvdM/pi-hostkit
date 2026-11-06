@@ -79,8 +79,9 @@ function exists(filePath: string): boolean {
   try {
     accessSync(filePath, constants.F_OK);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
   }
 }
 
@@ -101,7 +102,7 @@ export function resolveReadToolPath(input: string, cwd: string): string {
 
 function isMissing(error: unknown): boolean {
   const code = (error as NodeJS.ErrnoException).code;
-  return code === "ENOENT" || code === "ENOTDIR";
+  return code === "ENOENT";
 }
 
 /**

@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         containment: [auto]
         include:
-          # Second Linux run without the cgroup scope, to cover the snapshot fallback.
+          # Linux 的第二轮覆盖快照退路，不使用 cgroup scope。
           - os: ubuntu-latest
             containment: snapshot
     runs-on: ${{ matrix.os }}
@@ -46,7 +46,37 @@ jobs:
           echo "XDG_RUNTIME_DIR=/run/user/$uid" >> "$GITHUB_ENV"
           echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus" >> "$GITHUB_ENV"
           if [ "${{ matrix.containment }}" = auto ]; then echo "HOSTKIT_TEST_REQUIRE_CGROUP=1" >> "$GITHUB_ENV"; fi
+      - name: 创建大小写敏感 APFS 磁盘映像
+        if: runner.os == 'macOS'
+        run: |
+          hdiutil create -size 128m -fs APFSX -volname HostkitCase "$RUNNER_TEMP/hostkit-case.dmg"
+          mkdir -p "$RUNNER_TEMP/hostkit-case"
+          hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/hostkit-case" "$RUNNER_TEMP/hostkit-case.dmg"
+          echo "HOSTKIT_TEST_APFS=$RUNNER_TEMP/hostkit-case" >> "$GITHUB_ENV"
+      - name: 创建真实 SSHFS 远程挂载
+        if: runner.os == 'Linux' && matrix.containment == 'auto'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y sshfs openssh-server
+          mkdir -p "$RUNNER_TEMP/hostkit-remote-source" "$RUNNER_TEMP/hostkit-remote"
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/hostkit-ssh-key"
+          cp "$RUNNER_TEMP/hostkit-ssh-key.pub" "$RUNNER_TEMP/hostkit-authorized-keys"
+          sudo mkdir -p /run/sshd
+          sudo /usr/sbin/sshd -p 2222 -o "AuthorizedKeysFile=$RUNNER_TEMP/hostkit-authorized-keys" -o PasswordAuthentication=no -o StrictModes=no -o "PidFile=$RUNNER_TEMP/hostkit-sshd.pid"
+          sshfs -p 2222 -o "IdentityFile=$RUNNER_TEMP/hostkit-ssh-key" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$USER@127.0.0.1:$RUNNER_TEMP/hostkit-remote-source" "$RUNNER_TEMP/hostkit-remote"
+          echo "HOSTKIT_TEST_REMOTE=$RUNNER_TEMP/hostkit-remote" >> "$GITHUB_ENV"
       - run: npm test
+      - name: 卸载平台测试卷
+        if: always() && runner.os != 'Windows'
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = macOS ] && mount | grep -q "$RUNNER_TEMP/hostkit-case"; then
+            hdiutil detach "$RUNNER_TEMP/hostkit-case"
+          fi
+          if [ "$RUNNER_OS" = Linux ] && mountpoint -q "$RUNNER_TEMP/hostkit-remote"; then
+            fusermount -u "$RUNNER_TEMP/hostkit-remote"
+          fi
+          if [ -f "$RUNNER_TEMP/hostkit-sshd.pid" ]; then sudo kill "$(sudo cat "$RUNNER_TEMP/hostkit-sshd.pid")"; fi
 
   prebuild:
     name: prebuild (${{ matrix.os }}${{ matrix.arch && format(', {0}', matrix.arch) || '' }})

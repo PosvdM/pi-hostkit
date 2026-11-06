@@ -66,6 +66,8 @@ static const char *errno_code(int err) {
     case ESRCH: return "ESRCH";
     case ENOSYS: return "ENOSYS";
     case ENOMEM: return "ENOMEM";
+    case EIO: return "EIO";
+    case EINTR: return "EINTR";
     default: return "EUNKNOWN";
   }
 }
@@ -101,8 +103,8 @@ static char *get_string(napi_env env, napi_callback_info info, size_t index) {
     napi_throw_error(env, "ENOMEM", "out of memory");
     return NULL;
   }
-  napi_get_value_string_utf8(env, argv[index], buf, len + 1, &len);
-  if (strlen(buf) != len) {
+  if (napi_get_value_string_utf8(env, argv[index], buf, len + 1, &len) != napi_ok ||
+      strlen(buf) != len) {
     free(buf);
     napi_throw_type_error(env, "EINVAL", "string must not contain NUL");
     return NULL;
@@ -139,7 +141,11 @@ static napi_value flock_acquire(napi_env env, napi_callback_info info) {
   } while (rc != 0 && errno == EINTR);
   napi_value result;
   if (rc == 0) {
-    CHECK(napi_create_int32(env, fd, &result));
+    if (napi_create_int32(env, fd, &result) != napi_ok) {
+      close(fd);
+      napi_throw_error(env, "EHOSTKIT", "cannot return lock descriptor");
+      return NULL;
+    }
     return result;
   }
   int err = errno;
@@ -155,7 +161,8 @@ static napi_value flock_acquire(napi_env env, napi_callback_info info) {
 static napi_value fd_close(napi_env env, napi_callback_info info) {
   int32_t fd;
   if (!get_int(env, info, 0, &fd)) return NULL;
-  if (close(fd) != 0 && errno != EINTR) return throw_errno(env, "close", errno);
+  // close 被中断时不能盲目重试，描述符编号可能已经被复用；仍须报告失败。
+  if (close(fd) != 0) return throw_errno(env, "close", errno);
   napi_value undefined;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -241,7 +248,8 @@ static napi_value process_info(napi_env env, napi_callback_info info) {
   struct kinfo_proc k;
   size_t len = sizeof(k);
   if (sysctl(mib, 4, &k, &len, NULL, 0) != 0) return throw_errno(env, "sysctl(KERN_PROC_PID)", errno);
-  if (len < sizeof(k)) return null_value;
+  if (len == 0) return null_value;
+  if (len != sizeof(k)) return throw_errno(env, "sysctl(KERN_PROC_PID): incomplete result", EIO);
   return process_object(env, &k);
 }
 
@@ -264,8 +272,13 @@ static napi_value list_processes(napi_env env, napi_callback_info info) {
   }
   if (!procs) return throw_errno(env, "sysctl(KERN_PROC_ALL)", ENOMEM);
   napi_value array;
+  if (len % sizeof(struct kinfo_proc) != 0) {
+    free(procs);
+    return throw_errno(env, "sysctl(KERN_PROC_ALL): incomplete result", EIO);
+  }
   if (napi_create_array(env, &array) != napi_ok) {
     free(procs);
+    napi_throw_error(env, "EHOSTKIT", "cannot return process table");
     return NULL;
   }
   size_t count = len / sizeof(struct kinfo_proc);
@@ -277,7 +290,11 @@ static napi_value list_processes(napi_env env, napi_callback_info info) {
       free(procs);
       return NULL;
     }
-    napi_set_element(env, array, index++, obj);
+    if (napi_set_element(env, array, index++, obj) != napi_ok) {
+      free(procs);
+      napi_throw_error(env, "EHOSTKIT", "cannot return process table row");
+      return NULL;
+    }
   }
   free(procs);
   return array;
@@ -292,33 +309,55 @@ static napi_value process_args(napi_env env, napi_callback_info info) {
   int argmax = 0;
   size_t size = sizeof(argmax);
   int mib_max[2] = {CTL_KERN, KERN_ARGMAX};
-  if (sysctl(mib_max, 2, &argmax, &size, NULL, 0) != 0 || argmax <= 0) return null_value;
+  if (sysctl(mib_max, 2, &argmax, &size, NULL, 0) != 0)
+    return throw_errno(env, "sysctl(KERN_ARGMAX)", errno);
+  if (size != sizeof(argmax) || argmax < (int)sizeof(int))
+    return throw_errno(env, "sysctl(KERN_ARGMAX): invalid result", EIO);
   char *buf = malloc((size_t)argmax);
-  if (!buf) return null_value;
+  if (!buf) return throw_errno(env, "process args allocation", ENOMEM);
   int mib[3] = {CTL_KERN, KERN_PROCARGS2, pid};
   size = (size_t)argmax;
-  if (sysctl(mib, 3, buf, &size, NULL, 0) != 0 || size < sizeof(int)) {
+  if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) {
+    int err = errno;
     free(buf);
-    return null_value;
+    if (err == ESRCH) return null_value;
+    return throw_errno(env, "sysctl(KERN_PROCARGS2)", err);
+  }
+  if (size < sizeof(int) || size > (size_t)argmax) {
+    free(buf);
+    return throw_errno(env, "sysctl(KERN_PROCARGS2): incomplete result", EIO);
   }
   int argc;
   memcpy(&argc, buf, sizeof(argc));
   char *p = buf + sizeof(int);
   char *end = buf + size;
-  // Skip the executable path and the NUL padding after it.
+  // 跳过可执行路径及其后的填充；每个参数都必须有结尾 NUL。
   while (p < end && *p) p++;
+  if (argc < 0 || p == end) {
+    free(buf);
+    return throw_errno(env, "process args: invalid header", EIO);
+  }
   while (p < end && !*p) p++;
   napi_value array;
   if (napi_create_array(env, &array) != napi_ok) {
     free(buf);
+    napi_throw_error(env, "EHOSTKIT", "cannot return process args");
     return NULL;
   }
-  for (int i = 0; i < argc && p < end; i++) {
+  for (int i = 0; i < argc; i++) {
     char *start = p;
     while (p < end && *p) p++;
+    if (p == end) {
+      free(buf);
+      return throw_errno(env, "process args: incomplete argument", EIO);
+    }
     napi_value s;
-    napi_create_string_utf8(env, start, (size_t)(p - start), &s);
-    napi_set_element(env, array, (uint32_t)i, s);
+    if (napi_create_string_utf8(env, start, (size_t)(p - start), &s) != napi_ok ||
+        napi_set_element(env, array, (uint32_t)i, s) != napi_ok) {
+      free(buf);
+      napi_throw_error(env, "EHOSTKIT", "cannot return process argument");
+      return NULL;
+    }
     p++;
   }
   free(buf);
@@ -348,7 +387,10 @@ static napi_value acl_entry_count(napi_env env, napi_callback_info info) {
     count++;
     id = ACL_NEXT_ENTRY;
   }
-  acl_free(acl);
+  err = errno;
+  int freed = acl_free(acl);
+  if (err != EINVAL) return throw_errno(env, "acl_get_entry", err);
+  if (freed != 0) return throw_errno(env, "acl_free", errno);
   CHECK(napi_create_int32(env, count, &result));
   return result;
 }
@@ -365,9 +407,11 @@ static napi_value acl_clear(napi_env env, napi_callback_info info) {
   }
   int rc = acl_set_link_np(path, ACL_TYPE_EXTENDED, acl);
   int err = errno;
-  acl_free(acl);
+  int freed = acl_free(acl);
+  int free_err = errno;
   free(path);
   if (rc != 0) return throw_errno(env, "acl_set_link_np", err);
+  if (freed != 0) return throw_errno(env, "acl_free", free_err);
   napi_value undefined;
   napi_get_undefined(env, &undefined);
   return undefined;
@@ -389,7 +433,11 @@ static napi_value pidfd_open(napi_env env, napi_callback_info info) {
     }
     return throw_errno(env, "pidfd_open", errno);
   }
-  CHECK(napi_create_int32(env, (int32_t)fd, &result));
+  if (napi_create_int32(env, (int32_t)fd, &result) != napi_ok) {
+    close((int)fd);
+    napi_throw_error(env, "EHOSTKIT", "cannot return pidfd");
+    return NULL;
+  }
   return result;
 }
 

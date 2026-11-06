@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -130,12 +130,22 @@ function acquireRaw(purpose: string, key: string, posixFile: string): RawLock | 
   }
   heldKeys.add(key);
   let released = false;
+  let failed = false;
+  let releaseFailure: unknown;
   return {
     release() {
       if (released) return;
+      // close 失败后描述符或句柄可能已经失效，不能重试关闭已复用的编号。
+      if (failed) throw releaseFailure;
+      try {
+        release();
+      } catch (error) {
+        failed = true;
+        releaseFailure = error;
+        throw error;
+      }
       released = true;
       heldKeys.delete(key);
-      release();
     },
   };
 }
@@ -236,25 +246,48 @@ function readRecord(file: string, key: string): ReadRecord {
   }
 }
 
-/** Writes the record atomically (temporary file, then rename). */
+/** 原子提交记录；仅清理由本次调用独占创建的临时文件。 */
 function writeRecord(file: string, record: SessionLockRecord): void {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  for (let attempt = 0; ; attempt++) {
-    try {
-      renameSync(tmp, file);
-      return;
-    } catch (error) {
-      // Windows refuses to replace a file another process has open for a moment.
-      const code = (error as NodeJS.ErrnoException).code;
-      if (process.platform !== "win32" || attempt >= 20 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) {
-        try {
-          unlinkSync(tmp);
-        } catch {}
-        throw error;
+  const data = `${JSON.stringify(record, null, 2)}\n`;
+  let fd: number | undefined;
+  let created = false;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    created = true;
+    writeFileSync(fd, data);
+    const closing = fd;
+    fd = undefined;
+    closeSync(closing);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        renameSync(tmp, file);
+        return;
+      } catch (error) {
+        // Windows 可能因其他进程短暂打开目标记录而拒绝替换。
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== "win32" || attempt >= 20 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
+  } catch (error) {
+    const failures: unknown[] = [error];
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch (cleanup) {
+        failures.push(cleanup);
+      }
+    }
+    if (created) {
+      try {
+        unlinkSync(tmp);
+      } catch (cleanup) {
+        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") failures.push(cleanup);
+      }
+    }
+    if (failures.length > 1) throw new AggregateError(failures, `Cannot clean up lock record ${tmp}`);
+    throw error;
   }
 }
 
@@ -294,8 +327,17 @@ function findWritersByCommandLine(canonical: string): Candidates {
   let uncertain = false;
   for (const row of listProcesses()) {
     if (row.pid === process.pid || row.zombie) continue;
-    const args = processCommandLine(row.pid);
-    if (!args) continue;
+    let args: string[] | null;
+    try {
+      args = processCommandLine(row.pid);
+    } catch {
+      uncertain = true;
+      continue;
+    }
+    if (!args) {
+      uncertain = true;
+      continue;
+    }
     let gate: number;
     try {
       gate = gateIndex(args);
@@ -380,8 +422,17 @@ class WriterLock implements SessionWriterLock {
 
   /** Releases the OS lock without touching the record (failure paths). */
   private abandon(): void {
-    this.state = "released";
     this.raw.release();
+    this.state = "released";
+  }
+
+  private abandonAfter(error: unknown): never {
+    try {
+      this.abandon();
+    } catch (cleanup) {
+      throw new AggregateError([error, cleanup], "Cannot release failed session lock");
+    }
+    throw error;
   }
 
   recoverPreviousWriter(opts: RecoverOptions = {}): Promise<RecoverResult> {
@@ -391,8 +442,7 @@ class WriterLock implements SessionWriterLock {
       try {
         result = await this.recover(opts);
       } catch (error) {
-        this.abandon();
-        throw error;
+        this.abandonAfter(error);
       }
       if (result === "failed") {
         this.abandon();
@@ -408,8 +458,7 @@ class WriterLock implements SessionWriterLock {
       try {
         writeRecord(this.paths.record, record);
       } catch (error) {
-        this.abandon();
-        throw error;
+        this.abandonAfter(error);
       }
       this.current = record;
       this.state = "recovered";
@@ -440,11 +489,21 @@ class WriterLock implements SessionWriterLock {
     // No writer recorded: the previous host may have died between spawn and record.
     const { found, uncertain } = findWritersByCommandLine(this.paths.canonical);
     let stopped = false;
+    let failed = false;
+    const failures: unknown[] = [];
     for (const candidate of found) {
-      const result = await this.stopWriter(candidate, stopOpts);
-      if (result === "failed") return "failed";
-      if (result === "stopped") stopped = true;
+      try {
+        const result = await this.stopWriter(candidate, stopOpts);
+        if (result === "failed") failed = true;
+        if (result === "stopped") stopped = true;
+      } catch (error) {
+        // 一个候选的停止失败不能阻断其他已知候选的清理。
+        failures.push(error);
+      }
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "Cannot recover session writers");
+    if (failed) return "failed";
     if (stopped && !uncertain) return "stopped";
     // Not finding one does not prove there is none (overwritten, truncated or
     // unreadable command lines, relative --session values).
@@ -482,7 +541,11 @@ class WriterLock implements SessionWriterLock {
       try {
         this.writeUpdate({ writer: proc.identity, state: "running" });
       } catch (error) {
-        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        try {
+          await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        } catch (cleanup) {
+          throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+        }
         throw error;
       }
       this.writer = proc;
@@ -493,7 +556,11 @@ class WriterLock implements SessionWriterLock {
       try {
         proc.release();
       } catch (error) {
-        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        try {
+          await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        } catch (cleanup) {
+          throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+        }
         throw error;
       }
       return proc;
@@ -551,7 +618,11 @@ export async function acquireSessionWriterLock(
     const { record, invalid } = readRecord(paths.record, paths.key);
     return new WriterLock(raw, paths, host, record, invalid);
   } catch (error) {
-    raw.release();
+    try {
+      raw.release();
+    } catch (cleanup) {
+      throw new AggregateError([error, cleanup], "Cannot release failed session acquisition");
+    }
     throw error;
   }
 }
@@ -565,11 +636,20 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
+  const failures: unknown[] = [];
   try {
     const { record } = readRecord(paths.record, paths.key);
     return { held: !raw, ...(record ? { record } : {}) };
+  } catch (error) {
+    failures.push(error);
+    throw error;
   } finally {
-    raw?.release();
+    try {
+      raw?.release();
+    } catch (cleanup) {
+      if (failures.length) throw new AggregateError([...failures, cleanup], "Cannot release failed session probe");
+      throw cleanup;
+    }
   }
 }
 
