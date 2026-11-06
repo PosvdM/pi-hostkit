@@ -63,7 +63,7 @@ export function assertLocalFilesystem(target: string): void; // 非本地时抛�
 - 先解析目标的真实写入路径，包括悬空符号链接的目标，再检查最深的已存在祖先；`path` 是实际检查的路径。仅 `ENOENT` 允许上溯，权限、I/O、非目录等错误直接传播，不能借用祖先卷的本地结论。原生卷查询失败也直接传播。
 - macOS：`statfs` 的 `MNT_LOCAL` 标志；`type` 为 `f_fstypename`。
 - Linux：按 `statfs` 的魔数把 nfs、smb、cifs、smb2、coda、afs、9p、fuse、ceph、gpfs、lustre、kafs、ncp、ncpfs 视为非本地，其余视为本地；`type` 为文件系统名或十六进制魔数。
-- Windows：卷的驱动器类型为 remote、cdrom 或无法识别，或卷根是 UNC 路径（不含 `\\?\`、`\\.\` 设备路径）时视为非本地。
+- Windows：卷的驱动器类型为 remote、cdrom，或卷根是 UNC 路径（不含 `\\?\`、`\\.\` 设备路径）时视为非本地；卷路径查询失败或驱动器类型未知时直接抛错。
 - `acquireInstanceLock` 检查 `scopeDir`，会话写锁检查共享锁目录。使用方的数据目录（如 agora 的 `AGORA_HOME`）由使用方自己调用 `assertLocalFilesystem`。
 
 ## 定位 pi
@@ -276,7 +276,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 
 - 检测：第一次需要时检测一次并缓存结果。条件是 `/sys/fs/cgroup/cgroup.controllers` 存在，并且 `systemd-run --user --scope` 能实际运行一个命令并进入 `.scope`。这需要当前用户的 systemd 实例（用户已登录，或开启了 lingering），并且宿主进程的环境能连到这个实例（通常靠 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`）。
 - 启动：`systemd-run --user --scope --quiet --collect --unit=pi-hostkit-<runId>-<8 位十六进制随机数> -- node gate.js …`。`runId` 中 `[A-Za-z0-9_.-]` 以外的字符换成 `_`，最长 64 个字符。systemd-run 把自己移入 scope 后 exec node，PID 不变。宿主环境中的 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 会传给 systemd-run（`spec.env` 中同名变量优先），因此 pi 也能看到这两个变量。宿主等待进程进入 `<unit>.scope` 后，把 scope 目录记入 `ProcessIdentity.cgroup`。
-- 最终终止：向 scope 的 `cgroup.kill` 写 `1`（`step` 为 `kill cgroup`），它作用于整棵子树。写入报 `ENOENT` 时，只有 scope 目录确实已不存在才算已清空；目录还在说明内核没有 `cgroup.kill`，按下面的旧内核方式处理。内核早于 5.14 没有 `cgroup.kill` 时，逐个向 scope 及其子 cgroup 中的进程发 SIGKILL，每次发信号前确认该进程仍在这个 scope 里且身份一致。逐 PID 的身份查询、成员资格查询和信号错误分别记录，继续处理其余 PID，最多遍历 5 轮；人口或部分子树列举失败也不跳过可读成员。最终独立调用按身份核对的 pi SIGKILL，不依赖 scope 列举或人口查询成功。
+- 最终终止：向 scope 的 `cgroup.kill` 写 `1`（`step` 为 `kill cgroup`），它作用于整棵子树。任意写入失败都记录错误并尝试有界的逐 PID 退路。写入报 `ENOENT`/`ENODEV` 时，只有 scope 目录确实已不存在才算已清空；目录仍在或查询失败时不能据此证明清空。内核早于 5.14 没有 `cgroup.kill` 时，逐个向 scope 及其子 cgroup 中的进程发 SIGKILL，每次发信号前确认该进程仍在这个 scope 里且身份一致。逐 PID 的身份查询、成员资格查询和信号错误分别记录，继续处理其余 PID，最多遍历 5 轮；人口或部分子树列举失败也不跳过可读成员。最终独立调用按身份核对的 pi SIGKILL，不依赖 scope 列举或人口查询成功。
 - 复查：读 `cgroup.events` 的 `populated`，它反映整棵子树；为 0 或 scope 目录经查询确认已被回收才算清空。事件文件缺失但目录仍存在、目录查询失败、其他读取或解析错误均不算清空。共享的检查同样用于遗留写者恢复。
 - `cgroup.procs`、子目录和逐 PID 的最终查询错误写入 `steps`，停止仍返回 `StopReport`，重复 `stop()` 返回同一份报告。部分列举失败时保留可读子树以及此前已知、未确认退出的身份，并追加 `pid: 0`、`startTime: ""`、`exe: "cgroup <目录>"` 表示 scope 中还有状态未知的残留。已列举 PID 查询失败时保留原身份；从未读到创建时间时以该 PID 和空 `startTime` 表示未知，不能据此发信号。人口不明或没有可列出的存活进程但 scope 未确认清空时也保留 scope 哨兵。scope 确认清空后仍单独核对 pi 是否退出。
 - `containment: "snapshot"` 时不使用 scope，按快照模式处理。检测不通过（没有 cgroup v2、没有 `systemd-run` 或没有用户 systemd 实例）时同样退回快照模式。

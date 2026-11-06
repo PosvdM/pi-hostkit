@@ -125,7 +125,7 @@ npm test
 - 矩阵：ubuntu-latest、macos-latest、windows-latest 各以 `containment=auto` 运行一次，ubuntu-latest 再以 `containment=snapshot` 运行一次。
 - 步骤：安装 Node 24，`npm ci`（构建原生模块和 `dist/`），全局安装 pi 1.5.0，`npm test`。
 - Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。子树用例另建带 `Delegate=yes` 的 scope，创建两个实际子 cgroup；CI 不允许因缺少 cgroup 支持跳过。
-- macOS 用 `hdiutil create -fs APFSX` 创建 128 MiB 的大小写敏感 APFS 磁盘映像并挂载，在其中验证路径比较与会话锁拒绝；测试结束后卸载。
+- macOS 用 `hdiutil create -fs "Case-sensitive APFS"` 创建 256 MiB 的大小写敏感 APFS 磁盘映像并挂载，在其中验证路径比较与会话锁拒绝；测试结束后卸载。
 - Linux auto 安装 SSHFS 与 OpenSSH server，用运行器临时目录中的专用密钥启动本机端口 2222 的 SSH 服务并挂载 SFTP 目录。远程卷用例同时检查明确非本地和无法遍历目录的 `EACCES`，不改宿主真实 HOME 下的 SSH 配置；测试结束后卸载并停止该 SSH 服务。
 
 `prebuild` 任务为六个目标构建预编译模块：

@@ -64,6 +64,15 @@ static napi_value throw_win(napi_env env, const char *op, DWORD err) {
   return NULL;
 }
 
+// 保留主错误的码和 errno，同时让清理失败的操作与系统错误号可见。
+static napi_value throw_win_pair(napi_env env, const char *op, DWORD err,
+                                const char *cleanup, DWORD cleanup_err) {
+  char operations[256];
+  snprintf(operations, sizeof(operations), "%s; %s failed (Windows error %lu)",
+           op, cleanup, (unsigned long)cleanup_err);
+  return throw_win(env, operations, err);
+}
+
 static napi_value js_null(napi_env env) {
   napi_value v;
   napi_get_null(env, &v);
@@ -704,6 +713,8 @@ static napi_value mutex_release(napi_env env, napi_callback_info info) {
   DWORD err = GetLastError();
   BOOL closed = CloseHandle(h);
   DWORD close_err = GetLastError();
+  if (!released && !closed)
+    return throw_win_pair(env, "ReleaseMutex", err, "CloseHandle(mutex)", close_err);
   if (!released) return throw_win(env, "ReleaseMutex", err);
   if (!closed) return throw_win(env, "CloseHandle(mutex)", close_err);
   return js_undefined(env);
@@ -907,9 +918,21 @@ static napi_value create_private_file(napi_env env, napi_callback_info info) {
   err = GetLastError();
   LocalFree(acl);
   free(sid);
+  if (h == INVALID_HANDLE_VALUE) {
+    free(path);
+    return throw_win(env, "CreateFile", err);
+  }
+  if (!CloseHandle(h)) {
+    DWORD close_err = GetLastError();
+    // CREATE_NEW 已确认文件属于本次创建；失败返回前尝试删除，不重放可能失效的句柄。
+    BOOL deleted = DeleteFileW(path);
+    DWORD delete_err = GetLastError();
+    free(path);
+    if (!deleted)
+      return throw_win_pair(env, "CloseHandle(file)", close_err, "DeleteFileW", delete_err);
+    return throw_win(env, "CloseHandle(file)", close_err);
+  }
   free(path);
-  if (h == INVALID_HANDLE_VALUE) return throw_win(env, "CreateFile", err);
-  if (!CloseHandle(h)) return throw_win(env, "CloseHandle(file)", GetLastError());
   return js_undefined(env);
 }
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -119,6 +119,19 @@ if (win) {
     b._fault("ReleaseMutex", 1, 288);
     assert.throws(() => b.mutexRelease(h), (e) => e.errno === 288);
   });
+  succeeds("mutexRelease：ReleaseMutex 与 CloseHandle 双失败同时可见且不重试关闭", () => {
+    const h = b.mutexAcquire(mutex());
+    b._fault("ReleaseMutex", 1, 288, "CloseHandle", 1, 6);
+    assert.throws(() => b.mutexRelease(h), (e) => {
+      assert.equal(e.errno, 288);
+      assert.equal(e.code, "EWIN288");
+      assert.match(e.message, /ReleaseMutex/);
+      assert.match(e.message, /Windows error 288/);
+      assert.match(e.message, /CloseHandle\(mutex\).*Windows error 6/);
+      return true;
+    });
+    assert.deepEqual(b._stats().slice(3, 6), [1, 1, 1]);
+  });
   succeeds("mutexRelease：CloseHandle 失败可见", () => {
     const h = b.mutexAcquire(mutex());
     b._fault("CloseHandle", 1, 6);
@@ -135,10 +148,41 @@ if (win) {
   // 独立文件名避免 CREATE_NEW 的正常 EEXIST 掩盖注入。
   for (const op of ["SetEntriesInAclW", "InitializeSecurityDescriptor", "SetSecurityDescriptorDacl", "SetSecurityDescriptorControl", "CreateFileW"])
     fails(`createPrivateFile：${op} 失败回收临时资源`, op, () => b.createPrivateFile(path.join(dir, randomUUID())));
-  succeeds("createPrivateFile：关闭失败可见，文件仍存在而句柄已执行关闭", () => {
+  succeeds("createPrivateFile：真实关闭后报错仍删除本次文件，且不重试关闭", () => {
     const target = path.join(dir, randomUUID());
     b._fault("CloseHandle", 2, 6); // 第一次关闭 token，第二次关闭文件。
-    assert.throws(() => b.createPrivateFile(target), (e) => e.errno === 6);
+    assert.throws(() => b.createPrivateFile(target), (e) => {
+      assert.equal(e.errno, 6);
+      assert.match(e.message, /CloseHandle\(file\)/);
+      return true;
+    });
+    assert.throws(() => statSync(target), { code: "ENOENT" });
+    assert.deepEqual(b._stats().slice(5, 7), [2, 1]);
+  });
+  succeeds("createPrivateFile：关闭与删除双失败同时可见，不重试关闭", () => {
+    const target = path.join(dir, randomUUID());
+    b._fault("CloseHandle", 2, 6, "DeleteFileW", 1, 5);
+    try {
+      assert.throws(() => b.createPrivateFile(target), (e) => {
+        assert.equal(e.errno, 6);
+        assert.equal(e.code, "EWIN6");
+        assert.match(e.message, /CloseHandle\(file\)/);
+        assert.match(e.message, /Windows error 6/);
+        assert.match(e.message, /DeleteFileW.*Windows error 5/);
+        return true;
+      });
+      assert.equal(statSync(target).size, 0);
+      assert.deepEqual(b._stats().slice(3, 7), [2, 1, 2, 1]);
+    } finally { rmSync(target, { force: true }); }
+  });
+  succeeds("createPrivateFile：成功保留新文件，CREATE_NEW 失败不删除已有文件", () => {
+    const target = path.join(dir, randomUUID());
+    b.createPrivateFile(target);
+    writeFileSync(target, "原有内容");
+    b._fault("CloseHandle", 2, 6, "DeleteFileW", 1, 5);
+    assert.throws(() => b.createPrivateFile(target), { code: "EEXIST" });
+    assert.equal(readFileSync(target, "utf8"), "原有内容");
+    assert.deepEqual(b._stats().slice(5, 7), [1, 0]);
   });
   succeeds("私有文件与 ACL 正常读写", () => {
     b.setPrivateAcl(file, false);

@@ -22,7 +22,7 @@
 | `locks.ts:acquireRaw` | `flockAcquire` 或 `userSid`/`mutexAcquire` | 只在确实竞争时返回占用；获取后校验异常回收；`test/locks-faults.test.mjs`、`test/locks.test.mjs`、`test/windows-mutex.test.mjs`。 |
 | `locks.ts:RawLock.release` | `fdClose` 或 `mutexRelease`、进程内 held key | 释放失败不能宣布已释放，也不能重放可能已关闭或复用的资源编号；`test/locks-faults.test.mjs`。 |
 | `locks.ts:readRecord`、`recordProblem` | 记录读取、JSON、记录路径比较与卷探测 | 非 `ENOENT` 读取失败和路径校验异常属于损坏/未知；不得当成没有前任；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
-| `locks.ts:writeRecord` | 排他创建临时记录、写入、`renameSync`、失败 `unlinkSync` | 创建/部分写/改名失败回收本次临时文件；清理错误可见；更新与释放提交失败保持旧记录和占用；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
+| `locks.ts:writeRecord` | `openSync(wx)`、`writeFileSync(fd)`、`closeSync`、`renameSync`、失败 `unlinkSync` | 创建/部分写/改名失败回收本次临时文件；清理错误可见；更新与释放提交失败保持旧记录和占用；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
 | `locks.ts:probeSessionWriterLock`、获取后的记录读取 | 原生锁取得后的记录读取与临时释放 | 任意异常都走回收路径；`test/locks.test.mjs`、`test/locks-faults.test.mjs`。 |
 | `locks.ts:findWritersByCommandLine`、`gateIndex` | 进程列表、命令行、gate 协议文件存在性、路径比较 | 不可读候选属于未知，不能被另一已停止候选掩盖；`test/existence-faults.test.mjs`、`test/locks.test.mjs`。 |
 | `locks.ts:recoverPreviousWriter` | 写者身份、scope 人口、停止前任、提交 `starting` | 查询失败释放取得的锁且保留旧记录；停止报告保留；原始故障与释放故障同时可见；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
@@ -81,17 +81,17 @@
 | `handleClose` | `CloseHandle` | 关闭错误可见。 |
 | `current_user_sid`、`userSid` | `OpenProcessToken`、两阶段 `GetTokenInformation`、SID 复制、`ConvertSidToStringSidW` | 各查询与分配失败抛错，token、SID 与转换缓冲回收，不能返回 null SID。 |
 | `user_mutex`、`mutexAcquire` | SID、`SetEntriesInAclW`、安全描述符初始化/owner/DACL/control、`CreateMutexW`、`GetSecurityInfo`、owner 验证、`WaitForSingleObject` | 任一步失败拒绝，清理 ACL/SD/SID/句柄；取得所有权后结果构造失败也释放所有权。 |
-| `mutexRelease` | `ReleaseMutex`、`CloseHandle` | 释放与关闭失败可见；释放失败仍进入关闭路径。 |
+| `mutexRelease` | `ReleaseMutex`、`CloseHandle` | 释放与关闭失败可见；释放失败仍进入关闭路径；双失败保留两项原因。 |
 | `fsInfo` | `GetVolumePathNameW`、`GetDriveTypeW` | 卷查询失败与未知卷类型不得返回可靠的本地结论；明确 UNC/remote 被拒绝。 |
 | `setPrivateAcl` | SID、`SetEntriesInAclW`、`SetNamedSecurityInfoW` | ACL 构造/设置失败抛错，释放临时资源。 |
-| `createPrivateFile` | SID、ACL、安全描述符初始化/DACL/control、`CreateFileW(CREATE_NEW)`、`CloseHandle` | 原子私密创建失败可见，不覆盖既有文件；关闭错误可见。 |
+| `createPrivateFile` | SID、ACL、安全描述符初始化/DACL/control、`CreateFileW(CREATE_NEW)`、`CloseHandle` | 原子私密创建失败可见，不覆盖既有文件；关闭失败后尝试删除本次文件，删除失败与关闭失败同时可见。 |
 | `readAcl` | `GetNamedSecurityInfoW`、`GetSecurityDescriptorControl`、逐项 `GetAce`、SID 转换、LocalFree 与返回结构构造 | 权限查询和结果构造失败不能返回不完整的安全结论，安全描述符和转换缓冲回收。 |
 
 ## 真实平台场景与边界
 
 | 场景 | 运行位置与测试 | 未覆盖的部分 |
 | --- | --- | --- |
-| 大小写敏感 APFS | macOS CI：`hdiutil -fs APFSX` 磁盘映像，`test/platform-mounts.test.mjs` | 不等于测试所有 APFS 卷配置或外部设备。 |
+| 大小写敏感 APFS | macOS CI：`hdiutil -fs "Case-sensitive APFS"` 磁盘映像，`test/platform-mounts.test.mjs` | 不等于测试所有 APFS 卷配置或外部设备。 |
 | 子 cgroup 残留与局部失败 | Linux auto CI：真实 `Delegate=yes` scope 的两个子 cgroup，`test/cgroup-subtree.test.mjs` | 旧内核缺少 `cgroup.kill` 由注入模拟，不是旧内核实测。 |
 | 远程挂载与查询失败 | Linux auto CI：SSHFS 连接本机 SSH server，`test/platform-mounts.test.mjs` | 未实测 NFS、SMB；SSH 服务运行在同一 runner，未测真实网络中断。 |
 | Windows Global mutex | Windows CI：跨进程、owner/DACL、提权异主对象，`test/windows-mutex.test.mjs` | 没有两个真实登录会话。 |

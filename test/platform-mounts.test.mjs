@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -9,6 +9,10 @@ import { assertLocalFilesystem, filesystemInfo } from "../dist/localfs.js";
 
 const sensitive = process.env.HOSTKIT_TEST_APFS;
 const remote = process.env.HOSTKIT_TEST_REMOTE;
+if (process.env.CI && process.platform === "darwin") assert.ok(sensitive, "macOS CI 必须提供真实敏感 APFS 测试卷");
+if (process.env.HOSTKIT_TEST_REQUIRE_CGROUP === "1" && process.platform === "linux") {
+  assert.ok(remote, "Linux auto CI 必须提供真实 SSHFS 测试卷");
+}
 
 test("真实大小写敏感 APFS 拒绝路径比较和会话锁", { skip: !sensitive && "需要 CI 创建 APFSX 磁盘映像" }, async (t) => {
   assert.equal(process.platform, "darwin");
@@ -16,6 +20,8 @@ test("真实大小写敏感 APFS 拒绝路径比较和会话锁", { skip: !sensi
   t.after(() => rm(root, { recursive: true, force: true }));
   await writeFile(path.join(root, "Probe"), "A");
   await writeFile(path.join(root, "probe"), "B");
+  assert.equal(await readFile(path.join(root, "Probe"), "utf8"), "A", "测试卷必须真实区分大小写");
+  assert.equal(await readFile(path.join(root, "probe"), "utf8"), "B");
   assert.throws(() => comparisonKey(root), { code: "EHOSTKIT_CASE_SENSITIVE_FS" });
   assert.throws(() => canonicalPathSync("pending/session.jsonl", root, "write"), { code: "EHOSTKIT_CASE_SENSITIVE_FS" });
   assert.throws(() => isWithin(tmpdir(), root), { code: "EHOSTKIT_CASE_SENSITIVE_FS" });

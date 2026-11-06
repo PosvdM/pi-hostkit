@@ -425,7 +425,11 @@ export class StdioRpcTransport implements RpcTransport {
         this.closingErrors = undefined;
       }
       // end 抛错或同步发出 error 时，清理失败与首个传输错误一并报告。
-      if (cleanupErrors.length) this.failure = new AggregateError([error, ...new Set(cleanupErrors)], "RPC failure while closing stdin");
+      if (cleanupErrors.length) {
+        const failure = new AggregateError([error, ...new Set(cleanupErrors)], "RPC failure while closing stdin");
+        const code = (error as NodeJS.ErrnoException).code;
+        this.failure = code === undefined ? failure : Object.assign(failure, { code });
+      }
     }
     if (report || this.failure !== error) this.errors.emit(this.failure);
   }

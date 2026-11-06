@@ -72,6 +72,12 @@ export async function checkPrivate(target: string): Promise<PrivateCheck> {
   return problem ? { ok: false, problem: `${target} ${problem}` } : { ok: true };
 }
 
+function aggregateFailure(errors: unknown[], message: string): AggregateError {
+  const failure = new AggregateError(errors, message);
+  const code = (errors[0] as NodeJS.ErrnoException | null | undefined)?.code;
+  return code === undefined ? failure : Object.assign(failure, { code });
+}
+
 function privateError(target: string, problem: string | undefined): Error {
   return Object.assign(new Error(problem ?? `${target} is not private`), { code: "EHOSTKIT_NOT_PRIVATE", path: target });
 }
@@ -120,7 +126,7 @@ export async function writePrivateFile(file: string, data: Uint8Array): Promise<
         await unlink(file);
       } catch (cleanup) {
         if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw new AggregateError([error, cleanup], `Cannot remove incomplete private file ${file}`);
+          throw aggregateFailure([error, cleanup], `Cannot remove incomplete private file ${file}`);
         }
       }
       throw error;
@@ -152,7 +158,7 @@ export async function writePrivateFile(file: string, data: Uint8Array): Promise<
       // 文件已消失不构成清理失败；其他失败必须报告。
       if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") failures.push(cleanup);
     }
-    if (failures.length > 1) throw new AggregateError(failures, `Cannot finish private file ${file}`);
+    if (failures.length > 1) throw aggregateFailure(failures, `Cannot finish private file ${file}`);
     throw error;
   }
 }

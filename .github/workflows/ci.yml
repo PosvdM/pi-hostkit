@@ -49,7 +49,7 @@ jobs:
       - name: 创建大小写敏感 APFS 磁盘映像
         if: runner.os == 'macOS'
         run: |
-          hdiutil create -size 128m -fs APFSX -volname HostkitCase "$RUNNER_TEMP/hostkit-case.dmg"
+          hdiutil create -size 256m -fs "Case-sensitive APFS" -volname HostkitCase "$RUNNER_TEMP/hostkit-case.dmg"
           mkdir -p "$RUNNER_TEMP/hostkit-case"
           hdiutil attach -nobrowse -mountpoint "$RUNNER_TEMP/hostkit-case" "$RUNNER_TEMP/hostkit-case.dmg"
           echo "HOSTKIT_TEST_APFS=$RUNNER_TEMP/hostkit-case" >> "$GITHUB_ENV"

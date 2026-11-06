@@ -70,3 +70,51 @@ test("失败收尾期间即使 end 同步发出 error 也只报告一次且不�
   stdin.destroy();
   stdout.destroy();
 });
+
+for (const cleanup of ["success", "throw", "error"]) {
+  test(`健康 closeInput 首次 end 抛错，后续收尾 ${cleanup} 均清理请求并报告首错`, async (t) => {
+    const stdin = new Writable({ write(_chunk, _encoding, callback) { callback(); } });
+    const stdout = new PassThrough();
+    const rpc = new StdioRpcTransport(stdin, stdout);
+    const cleared = t.mock.method(globalThis, "clearTimeout");
+    const errors = [];
+    rpc.onError((error) => errors.push(error));
+    const a = rpc.send({ type: "a" }, { timeoutMs: 60_000 });
+    const b = rpc.send({ type: "b" }, { timeoutMs: 60_000 });
+    const primary = Object.assign(new Error("first end failed"), { code: "EIO" });
+    const secondary = Object.assign(new Error("cleanup end failed"), { code: "EPERM" });
+    const rejected = Promise.all([assert.rejects(a, (e) => e === primary), assert.rejects(b, (e) => e === primary)]);
+    const end = stdin.end;
+    let ends = 0;
+    stdin.end = function (...args) {
+      if (++ends === 1) throw primary;
+      if (cleanup === "throw") throw secondary;
+      if (cleanup === "error") { this.emit("error", secondary); return this; }
+      return end.apply(this, args);
+    };
+    assert.deepEqual(errors, []);
+    assert.equal(stdin.writableEnded, false);
+    assert.equal(stdin.listenerCount("drain"), 0);
+    assert.doesNotThrow(() => rpc.closeInput());
+    await rejected;
+    assert.equal(cleared.mock.callCount(), 2);
+    assert.equal(ends, 2);
+    assert.equal(errors.length, 1);
+    const reported = errors[0];
+    if (cleanup === "success") {
+      assert.equal(reported, primary);
+      assert.equal(stdin.writableEnded, true);
+    } else {
+      assert.ok(reported instanceof AggregateError);
+      assert.equal(reported.code, primary.code);
+      assert.deepEqual(reported.errors, [primary, secondary]);
+    }
+    assert.equal(stdin.listenerCount("drain"), 0);
+    await assert.rejects(rpc.send({ type: "later" }), (e) => e === reported);
+    assert.throws(() => rpc.respondUi({ id: "later" }), (e) => e === reported);
+    rpc.closeInput();
+    assert.equal(ends, 2);
+    stdin.destroy();
+    stdout.destroy();
+  });
+}

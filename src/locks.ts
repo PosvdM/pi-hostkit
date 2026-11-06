@@ -105,6 +105,12 @@ interface RawLock {
   release(): void;
 }
 
+function aggregateFailure(errors: unknown[], message: string): AggregateError {
+  const failure = new AggregateError(errors, message);
+  const code = (errors[0] as NodeJS.ErrnoException | null | undefined)?.code;
+  return code === undefined ? failure : Object.assign(failure, { code });
+}
+
 /**
  * POSIX: `flock(LOCK_EX | LOCK_NB)` on `posixFile`, which is never deleted.
  * Windows: named mutex `Global\pi-hostkit-v1-<SID>-<purpose>-<sha256(key)>`; an
@@ -286,7 +292,7 @@ function writeRecord(file: string, record: SessionLockRecord): void {
         if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") failures.push(cleanup);
       }
     }
-    if (failures.length > 1) throw new AggregateError(failures, `Cannot clean up lock record ${tmp}`);
+    if (failures.length > 1) throw aggregateFailure(failures, `Cannot clean up lock record ${tmp}`);
     throw error;
   }
 }
@@ -430,7 +436,7 @@ class WriterLock implements SessionWriterLock {
     try {
       this.abandon();
     } catch (cleanup) {
-      throw new AggregateError([error, cleanup], "Cannot release failed session lock");
+      throw aggregateFailure([error, cleanup], "Cannot release failed session lock");
     }
     throw error;
   }
@@ -502,7 +508,7 @@ class WriterLock implements SessionWriterLock {
       }
     }
     if (failures.length === 1) throw failures[0];
-    if (failures.length > 1) throw new AggregateError(failures, "Cannot recover session writers");
+    if (failures.length > 1) throw aggregateFailure(failures, "Cannot recover session writers");
     if (failed) return "failed";
     if (stopped && !uncertain) return "stopped";
     // Not finding one does not prove there is none (overwritten, truncated or
@@ -559,14 +565,15 @@ class WriterLock implements SessionWriterLock {
     try {
       report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
     } catch (cleanup) {
-      throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+      throw aggregateFailure([error, cleanup], "Cannot stop failed session writer");
     }
     const failed = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
-      !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")));
+      !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")) &&
+      !(step.step === "SIGKILL pi" && step.detail === "not running or identity changed"));
     if (report.leftovers.length || failed.length) {
       // 调用方拿不到失败的 ManagedProcess，停止报告必须随抛出的错误保留。
       const cleanup = new Error(`Cannot stop failed session writer: ${failed.length} failed steps; ${report.leftovers.length} leftovers`, { cause: report });
-      throw new AggregateError([error, cleanup], "Cannot stop failed session writer");
+      throw aggregateFailure([error, cleanup], "Cannot stop failed session writer");
     }
     throw error;
   }
@@ -629,7 +636,7 @@ export async function acquireSessionWriterLock(
     try {
       raw.release();
     } catch (cleanup) {
-      throw new AggregateError([error, cleanup], "Cannot release failed session acquisition");
+      throw aggregateFailure([error, cleanup], "Cannot release failed session acquisition");
     }
     throw error;
   }
@@ -655,7 +662,7 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
     try {
       raw?.release();
     } catch (cleanup) {
-      if (failures.length) throw new AggregateError([...failures, cleanup], "Cannot release failed session probe");
+      if (failures.length) throw aggregateFailure([...failures, cleanup], "Cannot release failed session probe");
       throw cleanup;
     }
   }

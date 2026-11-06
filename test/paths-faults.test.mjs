@@ -59,3 +59,32 @@ for (const operation of ["statSync", "realpath", "readdirSync", "original", "ali
     assert.throws(() => mod.comparisonKey(dir), { code: "EHOSTKIT_CASE_SENSITIVE_FS" });
   });
 }
+
+for (const kind of ["directory", "file"]) {
+  for (const code of ["EACCES", "EPERM", "EIO"]) {
+    test(`macOS ${kind} 的第二次目录 stat/${code} 失败不得继续枚举或借父卷作结论`, async () => {
+      const dir = path.resolve("case-volume");
+      const target = kind === "directory" ? dir : path.join(dir, "item");
+      const calls = [];
+      let stats = 0;
+      const mod = await boundaryModule("paths", { platform: "darwin", imports: { "node:fs": {
+        ...fs,
+        statSync(p) {
+          calls.push({ operation: "stat", path: p });
+          if (++stats === 1) {
+            assert.equal(p, target);
+            return { dev: 1n, ino: 2n, isDirectory: () => kind === "directory" };
+          }
+          assert.equal(stats, 2);
+          assert.equal(p, dir);
+          throw fault(code);
+        },
+        realpathSync: { native(p) { calls.push({ operation: "realpath", path: p }); return p; } },
+        readdirSync() { assert.fail("第二次 stat 失败后不得枚举目录"); },
+        lstatSync() { assert.fail("第二次 stat 失败后不得读取大小写别名"); },
+      } } });
+      assert.throws(() => mod.comparisonKey(target), { code: "EHOSTKIT_CASE_SENSITIVE_FS" });
+      assert.deepEqual(calls, [{ operation: "stat", path: target }, { operation: "realpath", path: target }, { operation: "stat", path: dir }]);
+    });
+  }
+}

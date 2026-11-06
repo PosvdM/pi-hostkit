@@ -19,7 +19,10 @@ function reset() {
 }
 const query = (pid) => state.query ? state.query(pid) : state.live.get(pid) ?? null;
 mock.module("node:fs", { namedExports: {
-  ...fs,
+  // 只提供依赖需要的导出，避免重定义 constants 等不可配置属性。
+  readdirSync: fs.readdirSync,
+  writeFileSync: fs.writeFileSync,
+  statSync: fs.statSync,
   existsSync: (file) => state?.exists ? state.exists(file) : state?.support ? true : fs.existsSync(file),
   readFileSync: (file, ...args) => state?.readFile ? state.readFile(file) : fs.readFileSync(file, ...args),
 } });
@@ -38,7 +41,7 @@ mock.module(new URL("../../dist/native.js", import.meta.url), { namedExports: {
   nativeFn: (name) => (...args) => {
     state.calls.push([name, ...args]);
     switch (name) {
-      case "jobCreate": return 42;
+      case "jobCreate": if (state.createJob) return state.createJob(); return 42;
       case "jobAssign": if (state.assign) return state.assign(); return;
       case "jobTerminate":
         if (state.terminateJob) return state.terminateJob();
@@ -64,13 +67,14 @@ mock.module("node:child_process", { namedExports: {
   },
   spawn: (...args) => {
     state.spawnArgs = args;
+    if (state.spawnThrow) throw state.spawnThrow;
     const child = new EventEmitter();
     child.pid = root.pid;
     child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
     child.kill = () => { state.calls.push(["child.kill"]); if (state.killChild) return state.killChild(); return true; };
     if (state.constructManaged) child.stderr.setEncoding = () => { throw fault("Managed 构造失败"); };
     state.child = child;
-    queueMicrotask(() => child.emit("spawn"));
+    queueMicrotask(() => state.spawnEvent ? state.spawnEvent(child) : child.emit("spawn"));
     return child;
   },
 } });
@@ -101,6 +105,63 @@ const timeout = globalThis.setTimeout;
 mock.method(globalThis, "setTimeout", (fn, ms, ...args) => timeout(fn, Math.min(ms, 1), ...args));
 let clock = 0;
 mock.method(Date, "now", () => (clock += 1_000));
+
+test("spawn 事件之前不查询身份或创建 Job，事件到达后才返回 Managed", async () => {
+  reset();
+  state.spawnEvent = () => {};
+  let queries = 0;
+  state.query = (pid) => { queries++; return state.live.get(pid) ?? null; };
+  let settled = false;
+  const pending = spawn().then((proc) => { settled = true; return proc; });
+  await new Promise((resolve) => queueMicrotask(resolve));
+  assert.ok(state.child);
+  assert.equal(settled, false);
+  assert.equal(queries, 0);
+  assert.ok(!state.calls.some(([name]) => name === "jobCreate"));
+  state.child.emit("spawn");
+  const proc = await pending;
+  assert.deepEqual(proc.identity, root);
+  assert.equal(queries, 1);
+  assert.ok(state.calls.some(([name]) => name === "jobAssign"));
+  await proc.stop(fast);
+  assert.equal(state.closeCount, 1);
+});
+
+test("spawn 同步抛错直接保留原错，不创建 Job 或回收不存在的子进程", async () => {
+  reset();
+  const error = Object.assign(new Error("spawn 参数错误"), { code: "EINVAL" });
+  state.spawnThrow = error;
+  await assert.rejects(spawn(), (actual) => actual === error);
+  assert.equal(state.child, undefined);
+  assert.deepEqual(state.calls, []);
+});
+
+test("spawn 前 error 事件保留系统原错，不查询身份或创建 Job", async () => {
+  reset();
+  const error = Object.assign(new Error("spawn 找不到程序"), { code: "ENOENT" });
+  state.spawnEvent = (child) => { child.pid = undefined; child.emit("error", error); };
+  state.query = () => { throw new Error("失败的 spawn 不应查询 PID"); };
+  await assert.rejects(spawn(), (actual) => actual === error);
+  assert.deepEqual(state.calls, []);
+  assert.equal(state.closeCount, 0);
+});
+
+test("jobCreate 失败回收已启动的 gate，不关闭尚未创建的句柄", async () => {
+  reset();
+  const error = fault("Job 创建失败");
+  state.createJob = () => { throw error; };
+  await assert.rejects(spawn(), (actual) => actual === error);
+  assert.deepEqual(state.calls, [["jobCreate"], ["child.kill"]]);
+  assert.equal(state.closeCount, 0);
+});
+
+test("启动身份为 null 返回 EHOSTKIT_SPAWN 并回收 gate，不创建 Job", async () => {
+  reset();
+  state.query = () => null;
+  await assert.rejects(spawn(), { code: "EHOSTKIT_SPAWN", message: "pi exited during start" });
+  assert.deepEqual(state.calls, [["child.kill"]]);
+  assert.equal(state.closeCount, 0);
+});
 
 test("Job 持续查询失败返回未知哨兵，关闭句柄且重复 stop 共享报告", async () => {
   reset();
@@ -390,6 +451,51 @@ for (const kind of ["controllers", "executable", "exec-error", "malformed-probe"
     }
   });
 }
+
+test("execFile 同步抛错保留拒绝原因，重复探测复用失败结果且不启动 gate", async () => {
+  Object.defineProperty(process, "platform", { value: "linux" });
+  try {
+    reset(); state.support = true;
+    const error = Object.assign(new Error("探测 execFile 同步错误"), { code: "EINVAL" });
+    let calls = 0;
+    state.execFile = () => { calls++; throw error; };
+    const module = await import("../../dist/process.js?probe-sync-throw");
+    const probe = module.linuxCgroupSupport();
+    assert.equal(module.linuxCgroupSupport(), probe);
+    await assert.rejects(probe, (actual) => actual === error);
+    await assert.rejects(module.spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), (actual) => actual === error);
+    assert.equal(calls, 1);
+    assert.equal(state.spawnArgs, undefined);
+    assert.deepEqual(state.calls, []);
+  } finally {
+    Object.defineProperty(process, "platform", { value: "win32" });
+  }
+});
+
+test("execFile 异步超时错误回调降级 snapshot，有效 stdout 不能掩盖超时", async () => {
+  Object.defineProperty(process, "platform", { value: "linux" });
+  try {
+    reset(); state.support = true;
+    let calls = 0;
+    state.execFile = (...args) => {
+      calls++;
+      assert.equal(args[2].timeout, 10_000);
+      const error = Object.assign(new Error("探测超时"), { code: "ETIMEDOUT", killed: true, signal: "SIGTERM" });
+      queueMicrotask(() => args.at(-1)(error, "/test.scope\n"));
+    };
+    const module = await import("../../dist/process.js?probe-timeout-callback");
+    assert.equal(await module.linuxCgroupSupport(), null);
+    const proc = await module.spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i", startHeld: true });
+    assert.equal(proc.coverage, "snapshot_visible");
+    assert.equal(await module.isSameProcess(root), "alive");
+    assert.equal(calls, 1);
+    const report = await proc.stop(fast);
+    assert.equal(report.coverage, "snapshot_visible");
+    assert.deepEqual(report.leftovers, []);
+  } finally {
+    Object.defineProperty(process, "platform", { value: "win32" });
+  }
+});
 
 for (const code of ["ENOENT", "ESRCH"]) {
   test(`Linux 启动 scope 的暂时 ${code} 继续等待，不误判 gate 已退出`, async () => {

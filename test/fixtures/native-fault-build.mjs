@@ -27,7 +27,7 @@ export function buildFaultBinding() {
   // 这不证明操作系统真正拒绝释放时资源已经消失；该状态仍应视为未知。
   if (win) {
     wrap("HANDLE", "OpenProcess", "DWORD a, BOOL b, DWORD c", "a,b,c", "return NULL;", "if (result) hk_handles++;");
-    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; SetLastError(hk_error); return FALSE;", "if (result) hk_handles--;");
+    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; SetLastError(hk_error); return FALSE;", "if (result) hk_handles--;", "hk_close_calls++;");
     wrap("DWORD", "WaitForSingleObject", "HANDLE h, DWORD t", "h,t", "return WAIT_FAILED;");
     wrap("BOOL", "GetProcessTimes", "HANDLE h, LPFILETIME a, LPFILETIME b, LPFILETIME c, LPFILETIME d", "h,a,b,c,d", "return FALSE;");
     wrap("BOOL", "TerminateProcess", "HANDLE h, UINT c", "h,c", "return FALSE;");
@@ -52,6 +52,7 @@ export function buildFaultBinding() {
     wrap("UINT", "GetDriveTypeW", "LPCWSTR p", "p", "return DRIVE_UNKNOWN;");
     wrap("DWORD", "SetNamedSecurityInfoW", "LPWSTR p, SE_OBJECT_TYPE t, SECURITY_INFORMATION i, PSID o, PSID g, PACL d, PACL s", "p,t,i,o,g,d,s", "return hk_error;");
     wrap("HANDLE", "CreateFileW", "LPCWSTR p, DWORD a, DWORD s, LPSECURITY_ATTRIBUTES sa, DWORD c, DWORD f, HANDLE h", "p,a,s,sa,c,f,h", "return INVALID_HANDLE_VALUE;", "if (result != INVALID_HANDLE_VALUE) hk_handles++;");
+    wrap("BOOL", "DeleteFileW", "LPCWSTR p", "p", "return FALSE;", "", "hk_delete_calls++;");
     wrap("DWORD", "GetNamedSecurityInfoW", "LPWSTR p, SE_OBJECT_TYPE t, SECURITY_INFORMATION i, PSID *o, PSID *g, PACL *d, PACL *s, PSECURITY_DESCRIPTOR *sd", "p,t,i,o,g,d,s,sd", "return hk_error;", "if (result == ERROR_SUCCESS && *sd) hk_local++;");
     wrap("BOOL", "GetSecurityDescriptorControl", "PSECURITY_DESCRIPTOR sd, PSECURITY_DESCRIPTOR_CONTROL c, LPDWORD r", "sd,c,r", "return FALSE;");
     wrap("BOOL", "GetAce", "PACL a, DWORD i, LPVOID *p", "a,i,p", "return FALSE;");
@@ -120,24 +121,38 @@ export function buildFaultBinding() {
   const header = `
 #include <stdint.h>
 #include <stdarg.h>
-static char hk_target[128] = "";
+static char hk_target[128] = "", hk_target2[128] = "";
 static int hk_nth = 0, hk_calls = 0, hk_heap = 0, hk_handles = 0, hk_local = 0;
-static uint32_t hk_error = 0;
+static int hk_nth2 = 0, hk_calls2 = 0, hk_close_calls = 0, hk_delete_calls = 0;
+static uint32_t hk_error = 0, hk_error1 = 0, hk_error2 = 0;
 static int hk_hit(const char *name) {
-  if (strcmp(hk_target,name)) return 0;
-  return ++hk_calls == hk_nth || hk_nth == 0;
+  if (!strcmp(hk_target,name)) {
+    hk_error = hk_error1;
+    return ++hk_calls == hk_nth || hk_nth == 0;
+  }
+  if (!strcmp(hk_target2,name)) {
+    hk_error = hk_error2;
+    return ++hk_calls2 == hk_nth2 || hk_nth2 == 0;
+  }
+  return 0;
 }
 static napi_value hk_fault(napi_env e, napi_callback_info i) {
-  napi_value a[3], u; size_t n=3, len;
+  napi_value a[6], u; size_t n=6, len;
   napi_get_cb_info(e,i,&n,a,NULL,NULL);
   napi_get_value_string_utf8(e,a[0],hk_target,sizeof(hk_target),&len);
-  napi_get_value_int32(e,a[1],&hk_nth); napi_get_value_uint32(e,a[2],&hk_error);
-  hk_calls=0; napi_get_undefined(e,&u); return u;
+  napi_get_value_int32(e,a[1],&hk_nth); napi_get_value_uint32(e,a[2],&hk_error1);
+  hk_target2[0]=0; hk_nth2=0; hk_error2=0;
+  if (n == 6) {
+    napi_get_value_string_utf8(e,a[3],hk_target2,sizeof(hk_target2),&len);
+    napi_get_value_int32(e,a[4],&hk_nth2); napi_get_value_uint32(e,a[5],&hk_error2);
+  }
+  hk_calls=hk_calls2=hk_close_calls=hk_delete_calls=0;
+  napi_get_undefined(e,&u); return u;
 }
 static napi_value hk_stats(napi_env e, napi_callback_info i) {
   (void)i; napi_value a,v; napi_create_array(e,&a);
-  int counts[4]={hk_heap,hk_handles,hk_local,hk_calls};
-  for (int k=0;k<4;k++) { napi_create_int32(e,counts[k],&v); napi_set_element(e,a,k,v); }
+  int counts[7]={hk_heap,hk_handles,hk_local,hk_calls,hk_calls2,hk_close_calls,hk_delete_calls};
+  for (int k=0;k<7;k++) { napi_create_int32(e,counts[k],&v); napi_set_element(e,a,k,v); }
   return a;
 }
 ${wrappers.join("\n")}

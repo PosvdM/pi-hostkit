@@ -16,11 +16,18 @@ async function fixture(platform = "linux") {
     identities: [], scopes: [], rows: [{ pid: 456 }], args: new Map(),
     report: { steps: [], leftovers: [] }, reports: [], stopErrors: [], stopped: [],
     commandErrors: new Map(), protocolErrors: [], spawnReport: { steps: [], leftovers: [] },
+    pathErrors: { canonical: new Map(), key: new Map() }, pathQueries: [],
   };
   const dir = path.resolve("lock-home");
   const file = path.resolve("session.jsonl");
   const recordFile = path.join(dir, ".pi", "hostkit", "locks", `session-${createHash("sha256").update(file).digest("hex")}.json`);
   const invoke = (name) => { calls.push(name); if (failures.has(name)) throw failures.get(name); };
+  const probePath = (operation, p) => {
+    invoke(operation);
+    status.pathQueries.push({ operation, path: p });
+    if (status.pathErrors[operation].has(p)) throw status.pathErrors[operation].get(p);
+    return p;
+  };
   const mod = await boundaryModule("locks", { platform, imports: {
     "node:crypto": { createHash, randomBytes: (...args) => { invoke("random"); return randomBytes(...args); } },
     "node:fs": {
@@ -39,7 +46,7 @@ async function fixture(platform = "linux") {
     },
     "node:fs/promises": { mkdir: async () => invoke("instance-mkdir"), realpath: async (p) => { invoke("instance-realpath"); return p; } },
     "node:os": { homedir: () => dir },
-    "./paths.js": { comparisonKey: (p) => { invoke("key"); return p; }, realPathOrPending: (p) => { invoke("canonical"); return p; } },
+    "./paths.js": { comparisonKey: (p) => probePath("key", p), realPathOrPending: (p) => probePath("canonical", p) },
     "./localfs.js": { assertLocalFilesystem: () => invoke("localfs") },
     "./secrets.js": { ensurePrivateDir: async () => invoke("private-dir") },
     "./native.js": { nativeFn: (name) => () => {
@@ -391,5 +398,108 @@ for (const operation of ["write", "gate-release"]) {
     assert.equal(f.held(), true);
     f.failures.clear();
     await lock.release({ writerSwitchedAway: true });
+  });
+}
+
+for (const operation of ["canonical", "key"]) {
+  for (const code of ["EACCES", "EPERM", "EIO"]) {
+    test(`候选 sameFile 的 ${operation}/${code} 失败保留未知状态且仍停止下一写者`, async () => {
+      const f = await fixture();
+      const old = JSON.stringify({ version: 1, sessionFile: f.file, host, state: "starting", updatedAt: "old" });
+      f.files.set(f.recordFile, old);
+      const lock = await f.acquire();
+      const uncertainFile = path.resolve("unknown-session.jsonl");
+      f.status.rows = [{ pid: 456, startTime: "a" }, { pid: 789, startTime: "b" }];
+      f.status.args.set(456, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", uncertainFile]);
+      f.status.args.set(789, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
+      f.status.pathErrors[operation].set(uncertainFile, fault(code));
+      f.status.identities.push("alive", "gone");
+      const start = f.status.pathQueries.length;
+      assert.equal(await lock.recoverPreviousWriter(), "failed");
+      assert.ok(f.status.pathQueries.slice(start).some((query) => query.operation === operation && query.path === uncertainFile));
+      assert.deepEqual(f.status.stopped, [789]);
+      assert.equal(lock.recoveryReports.length, 1);
+      assert.equal(f.files.get(f.recordFile), old);
+      assert.equal(f.calls.includes("create"), false);
+      assert.equal(f.held(), false);
+    });
+  }
+}
+
+for (const cleanup of ["reject", "leftovers", "failed-step"]) {
+  test(`spawnWriter 放行失败与停止 ${cleanup} 聚合时保留首个错误码`, async () => {
+    const f = await fixture();
+    const lock = await f.acquire();
+    await lock.recoverPreviousWriter();
+    const primary = f.setFault("gate-release", "EHOSTKIT_RPC_QUEUE_FULL");
+    const report = f.status.spawnReport;
+    let secondary;
+    if (cleanup === "reject") secondary = f.setFault("spawn-stop", "EPERM");
+    else if (cleanup === "leftovers") report.leftovers.push(identity);
+    else report.steps.push({ step: "SIGKILL pi", ok: false, detail: "EPERM", at: "now" });
+    await assert.rejects(lock.spawnWriter({ argv: ["cli.js", "--mode", "rpc", "--session", f.file] }), (e) => {
+      assert.ok(e instanceof AggregateError);
+      assert.equal(e.code, primary.code);
+      assert.equal(e.errors[0], primary);
+      if (secondary) assert.equal(e.errors[1], secondary);
+      else assert.equal(e.errors[1].cause, report);
+      return true;
+    });
+    f.failures.clear();
+    await lock.release({ writerSwitchedAway: true });
+  });
+}
+
+for (const stage of ["record-cleanup", "abandon", "acquire", "probe", "multiple-writers"]) {
+  test(`锁的 ${stage} 聚合错误保留首个错误码`, async () => {
+    const f = await fixture();
+    const primary = fault("EACCES", stage);
+    const cleanup = fault("EIO", "cleanup");
+    let operation;
+    if (stage === "acquire" || stage === "probe") {
+      f.failures.set("read", Object.defineProperty(new Error(), "message", { get() { throw primary; } }));
+      f.failures.set("fdClose", cleanup);
+      operation = stage === "acquire" ? f.acquire() : f.mod.probeSessionWriterLock(f.file);
+    } else if (stage === "multiple-writers") {
+      f.files.set(f.recordFile, JSON.stringify({ version: 1, sessionFile: f.file, host, state: "starting", updatedAt: "old" }));
+      f.status.rows = [{ pid: 456, startTime: "a" }, { pid: 789, startTime: "b" }];
+      for (const row of f.status.rows) f.status.args.set(row.pid, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
+      f.status.identities.push("alive", "alive");
+      f.status.stopErrors.push(primary, cleanup);
+      operation = (await f.acquire()).recoverPreviousWriter();
+    } else {
+      const lock = await f.acquire();
+      f.failures.set("write", primary);
+      f.failures.set(stage === "record-cleanup" ? "unlink" : "fdClose", cleanup);
+      operation = lock.recoverPreviousWriter();
+    }
+    await assert.rejects(operation, (e) => {
+      assert.ok(e instanceof AggregateError);
+      assert.equal(e.code, primary.code);
+      assert.deepEqual(e.errors, [primary, cleanup]);
+      return true;
+    });
+  });
+}
+
+for (const detail of ["not running or identity changed", "EPERM", "query failed: not running or identity changed"]) {
+  test(`spawnWriter 停止步骤 SIGKILL pi/${detail} 区分跳过与真正失败`, async () => {
+    const f = await fixture();
+    const lock = await f.acquire();
+    await lock.recoverPreviousWriter();
+    const primary = f.setFault("gate-release", "EHOSTKIT_RPC_QUEUE_FULL");
+    const report = f.status.spawnReport;
+    report.steps.push({ step: "SIGKILL pi", ok: false, detail, at: "now" });
+    await assert.rejects(lock.spawnWriter({ argv: ["cli.js", "--mode", "rpc", "--session", f.file] }), (e) => {
+      if (detail === "not running or identity changed") assert.equal(e, primary);
+      else {
+        assert.ok(e instanceof AggregateError);
+        assert.equal(e.code, primary.code);
+        assert.equal(e.errors[1].cause, report);
+      }
+      return true;
+    });
+    f.failures.clear();
+    await lock.release();
   });
 }
