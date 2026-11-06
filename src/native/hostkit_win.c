@@ -501,19 +501,78 @@ static napi_value handle_close(napi_env env, napi_callback_info info) {
   return js_undefined(env);
 }
 
+static PSID current_user_sid(DWORD *err);
+
+// Creation applies the user-only DACL and explicit owner atomically. Existing
+// objects ignore this descriptor, so verify their owner on the opened handle.
+static HANDLE user_mutex(const wchar_t *name, DWORD *err) {
+  PSID sid = current_user_sid(err);
+  if (!sid) {
+    if (*err == ERROR_SUCCESS) *err = ERROR_NOT_ENOUGH_MEMORY;
+    return NULL;
+  }
+  EXPLICIT_ACCESSW ea;
+  ZeroMemory(&ea, sizeof(ea));
+  ea.grfAccessPermissions = MUTEX_ALL_ACCESS;
+  ea.grfAccessMode = SET_ACCESS;
+  ea.grfInheritance = NO_INHERITANCE;
+  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  ea.Trustee.ptstrName = (LPWSTR)sid;
+  PACL acl = NULL;
+  HANDLE h = NULL;
+  PSECURITY_DESCRIPTOR actual_sd = NULL;
+  PSID owner = NULL;
+  SECURITY_DESCRIPTOR sd;
+  SECURITY_ATTRIBUTES sa;
+  *err = SetEntriesInAclW(1, &ea, NULL, &acl);
+  if (*err != ERROR_SUCCESS) goto cleanup;
+  if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+      !SetSecurityDescriptorOwner(&sd, sid, FALSE) ||
+      !SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE) ||
+      !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+    *err = GetLastError();
+    goto cleanup;
+  }
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = &sd;
+  sa.bInheritHandle = FALSE;
+  h = CreateMutexW(&sa, FALSE, name);
+  if (!h) {
+    *err = GetLastError();
+    goto cleanup;
+  }
+  *err = GetSecurityInfo(h, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &owner,
+                         NULL, NULL, NULL, &actual_sd);
+  if (*err == ERROR_SUCCESS && (!owner || !IsValidSid(owner) || !EqualSid(owner, sid))) {
+    *err = ERROR_ACCESS_DENIED;
+  }
+
+cleanup:
+  if (actual_sd) LocalFree(actual_sd);
+  if (acl) LocalFree(acl);
+  free(sid);
+  if (*err != ERROR_SUCCESS && h) {
+    CloseHandle(h);
+    h = NULL;
+  }
+  return h;
+}
+
 // mutexAcquire(name) -> handle, or -1 when another thread or process owns it.
-// An abandoned mutex (owner died) counts as acquired. Ownership is per thread:
-// release on the same thread.
+// A foreign security owner is refused before waiting. An abandoned mutex counts
+// as acquired. Mutex ownership is per thread: release on the same thread.
 static napi_value mutex_acquire(napi_env env, napi_callback_info info) {
   napi_value argv[1];
   if (!get_args(env, info, 1, argv)) return NULL;
   wchar_t *name = get_wstring(env, argv[0]);
   if (!name) return NULL;
-  HANDLE h = CreateMutexW(NULL, FALSE, name);
-  DWORD err = GetLastError();
+  DWORD err = ERROR_SUCCESS;
+  HANDLE h = user_mutex(name, &err);
   free(name);
-  if (!h) return throw_win(env, "CreateMutex", err);
+  if (!h) return throw_win(env, "CreateMutex/owner verification", err);
   DWORD wait = WaitForSingleObject(h, 0);
+  err = GetLastError();
   if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) return make_handle(env, h);
   CloseHandle(h);
   if (wait == WAIT_TIMEOUT) {
@@ -521,7 +580,7 @@ static napi_value mutex_acquire(napi_env env, napi_callback_info info) {
     napi_create_int32(env, -1, &v);
     return v;
   }
-  return throw_win(env, "WaitForSingleObject", GetLastError());
+  return throw_win(env, "WaitForSingleObject", err);
 }
 
 static napi_value mutex_release(napi_env env, napi_callback_info info) {

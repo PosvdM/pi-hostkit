@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import fs, { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -105,6 +106,64 @@ describe("instance lock", () => {
 });
 
 describe("session writer lock", () => {
+  test("release refuses an unknown writer state and preserves the record", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    execFileSync(process.execPath, ["--experimental-test-module-mocks", path.join(here, "fixtures", "release-query-fault.mjs")], {
+      timeout: 30_000,
+      env: { ...process.env, HOME: f.root, USERPROFILE: f.root, HOSTKIT_TEST_ROOT: f.root },
+      stdio: "pipe",
+    });
+  });
+
+  for (const switched of [false, true]) {
+    test(`failed released record keeps ownership and state, then retries (switch=${switched})`, async () => {
+      const f = await piFixture();
+      cleanups.push(f.cleanup);
+      const file = f.sessionPath(`release-fault-${switched}`);
+      const lock = await acquireSessionWriterLock(file, host());
+      await lock.recoverPreviousWriter();
+      if (switched) await lock.update({ writer: currentProcessIdentity("switch"), state: "running" });
+      const recordFile = recordPath(lock.sessionFile);
+      const before = readFileSync(recordFile, "utf8");
+      const original = fs.renameSync;
+      fs.renameSync = () => { throw Object.assign(new Error("injected record write failure"), { code: "EIO" }); };
+      syncBuiltinESMExports();
+      try {
+        await assert.rejects(lock.release({ writerSwitchedAway: switched }), { code: "EIO" });
+        assert.equal(readFileSync(recordFile, "utf8"), before);
+        assert.equal((await probeSessionWriterLock(file)).held, true);
+      } finally {
+        fs.renameSync = original;
+        syncBuiltinESMExports();
+      }
+      await lock.update({ state: "stopping" });
+      await lock.release({ writerSwitchedAway: switched });
+      const probe = await probeSessionWriterLock(file);
+      assert.equal(probe.held, false);
+      assert.equal(probe.record.state, "released");
+    });
+  }
+
+  test("Windows mutex name includes Global namespace, current SID, purpose and digest", { skip: !isWin }, async () => {
+    const { nativeFn } = await import("../dist/native.js");
+    const { realPathOrPending } = await import("../dist/paths.js");
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const dir = realPathOrPending(f.cwd);
+    const key = `instance\n${comparisonKey(dir)}\ndaemon`;
+    const digest = createHash("sha256").update(key).digest("hex");
+    const name = `Global\\pi-hostkit-v1-${nativeFn("userSid")()}-instance-${digest}`;
+    assert.match(name, /^Global\\pi-hostkit-v1-S-1-[0-9-]+-instance-[0-9a-f]{64}$/);
+    const raw = startHost({ action: "raw-mutex", name });
+    assert.equal((await raw.first).held, true);
+    try {
+      assert.equal(await acquireInstanceLock("daemon", dir), null);
+    } finally {
+      await raw.kill();
+    }
+  });
+
   test("acquire, record, busy result and release", async () => {
     const f = await piFixture();
     cleanups.push(f.cleanup);
@@ -126,7 +185,9 @@ describe("session writer lock", () => {
     assert.equal(busy.heldBy.state, "running");
     assert.equal((await probeSessionWriterLock(sessionFile)).held, true);
 
-    await lock.release();
+    await assert.rejects(lock.release(), { code: "EHOSTKIT_LOCK_STATE" });
+    assert.equal((await probeSessionWriterLock(sessionFile)).held, true);
+    await lock.release({ writerSwitchedAway: true });
     const probe = await probeSessionWriterLock(sessionFile);
     assert.equal(probe.held, false);
     assert.equal(probe.record.state, "released");

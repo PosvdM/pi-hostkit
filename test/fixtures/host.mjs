@@ -14,6 +14,10 @@ const print = (value) => process.stdout.write(`${JSON.stringify(value)}\n`);
 if (args.action === "spawn") {
   const proc = await spawnManaged(args);
   print({ identity: proc.identity });
+} else if (args.action === "raw-mutex") {
+  const { nativeFn } = await import("../../dist/native.js");
+  const handle = nativeFn("mutexAcquire")(args.name);
+  print({ held: handle !== -1 });
 } else if (args.action === "instance-lock") {
   const lock = await acquireInstanceLock(args.name, args.dir);
   print({ held: lock !== null });
