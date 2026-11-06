@@ -48,7 +48,7 @@ function transport(opts) {
 }
 
 describe("StdioRpcTransport", () => {
-  test("assigns ids and matches responses by id, out of order", async () => {
+  test("assigns wire ids and matches responses by id, out of order", async () => {
     const t = transport();
     const a = t.rpc.send({ type: "get_state" });
     const b = t.rpc.send({ type: "get_messages" });
@@ -91,16 +91,24 @@ describe("StdioRpcTransport", () => {
     assert.deepEqual(diagnostics, ["late_response", "unmatched_response"]);
   });
 
-  test("a timed-out id cannot be reused before its late response arrives", async () => {
+  test("a late response never reaches a newer command, even with the same caller id", async () => {
     const t = transport();
+    const diagnostics = [];
+    t.rpc.onDiagnostic((d) => diagnostics.push(d.kind));
     await assert.rejects(t.rpc.send({ type: "abort", id: "x" }, { timeoutMs: 10 }), RpcTimeoutError);
-    await assert.rejects(t.rpc.send({ type: "get_state", id: "x" }), /cannot be reused/);
-    t.emit({ type: "response", id: "x", command: "abort", success: true });
+    // More than the remembered number of timeouts, so the first wire id is forgotten.
+    for (let i = 0; i < 1030; i++) await assert.rejects(t.rpc.send({ type: "noop", id: "x" }, { timeoutMs: 0 }), RpcTimeoutError);
+    const next = t.rpc.send({ type: "get_state", id: "x" });
     await t.tick();
-    const p = t.rpc.send({ type: "get_state", id: "x" });
-    await t.tick();
-    t.emit({ type: "response", id: "x", command: "get_state", success: true });
-    assert.equal((await p).command, "get_state");
+    const wire = t.written.map((w) => w.id);
+    assert.equal(new Set(wire).size, wire.length, "wire ids are unique");
+    // The first command's late response arrives first.
+    t.emit({ type: "response", id: wire[0], command: "abort", success: true });
+    t.emit({ type: "response", id: wire.at(-1), command: "get_state", success: true });
+    const res = await next;
+    assert.equal(res.command, "get_state");
+    assert.equal(res.id, "x", "the caller's id is put back on the response");
+    assert.deepEqual(diagnostics, ["unmatched_response"]);
   });
 
   test("invalid JSON fails the transport and rejects pending commands", async () => {

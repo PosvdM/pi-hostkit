@@ -45,7 +45,10 @@ export type RpcDiagnostic =
   | { kind: "unmatched_response"; response: RpcResponse };
 
 export interface RpcTransport {
-  /** Sends a command and resolves with the response of the same `id`. */
+  /**
+   * Sends a command and resolves with its response. The transport puts its own
+   * unique id on the wire; when `cmd.id` is given, the response carries it.
+   */
   send(cmd: RpcCommand, opts?: { timeoutMs?: number }): Promise<RpcResponse>;
   onEvent(listener: (ev: RpcEvent) => void): () => void;
   onUiRequest(listener: (req: ExtensionUiRequest) => void): () => void;
@@ -166,6 +169,8 @@ interface Pending {
   reject(err: Error): void;
   timer?: NodeJS.Timeout;
   command: string;
+  /** `cmd.id` given by the caller; the response carries it instead of the wire id. */
+  callerId?: string;
 }
 
 /** JSONL transport over a pi process's stdin and stdout. */
@@ -225,18 +230,19 @@ export class StdioRpcTransport implements RpcTransport {
   send(cmd: RpcCommand, opts: { timeoutMs?: number } = {}): Promise<RpcResponse> {
     if (this.failure) return Promise.reject(this.failure);
     if (this.blockedReason) return Promise.reject(new RpcClosedError(this.blockedReason));
-    const id = cmd.id ?? `hk-${++this.nextId}`;
-    if (this.pending.has(id)) return Promise.reject(new Error(`RPC id ${id} is already pending`));
-    // A timed-out id may still get its late response; reusing it would hand
-    // that response to the new command.
-    if (this.timedOut.has(id)) return Promise.reject(new Error(`RPC id ${id} timed out earlier and cannot be reused`));
+    // The id on the wire is always generated here and never repeats, so a late
+    // response to a timed-out command can never be matched to a newer one,
+    // even when the caller reuses its own id. The caller's id is put back on
+    // the response.
+    const id = `hk-${++this.nextId}`;
     return new Promise<RpcResponse>((resolve, reject) => {
-      const entry: Pending = { resolve, reject, command: cmd.type };
+      const entry: Pending = { resolve, reject, command: cmd.type, ...(cmd.id !== undefined ? { callerId: cmd.id } : {}) };
       if (opts.timeoutMs !== undefined) {
         entry.timer = setTimeout(() => {
           this.pending.delete(id);
           this.timedOut.add(id);
-          // Bound the set; the oldest ids are forgotten (their late responses become unmatched).
+          // Bound the set; a forgotten id's late response is reported as unmatched.
+          // Wire ids are never reused, so forgetting one cannot misroute a response.
           if (this.timedOut.size > MAX_TIMED_OUT_IDS) this.timedOut.delete(this.timedOut.values().next().value!);
           reject(new RpcTimeoutError(cmd.type, opts.timeoutMs!));
         }, opts.timeoutMs);
@@ -280,7 +286,7 @@ export class StdioRpcTransport implements RpcTransport {
     this.pending.delete(id);
     if (entry.timer) clearTimeout(entry.timer);
     if (error) entry.reject(error);
-    else entry.resolve(res!);
+    else entry.resolve(entry.callerId !== undefined ? { ...res!, id: entry.callerId } : res!);
   }
 
   private handleLine(line: string): void {

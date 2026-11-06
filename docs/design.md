@@ -111,7 +111,8 @@ export class JsonlSplitter { /* 按 LF 切分字节流，供测试和其他传�
 - **单条记录上限**：默认 64 MiB（`DEFAULT_MAX_RECORD_BYTES`，含图片的消息可能很大）。
 - **协议错误**：记录超过上限、不是合法 JSON、不是带字符串 `type` 的对象，或 stdout 结束时留有不以 LF 结尾的半条记录，都是协议错误（`RpcProtocolError`，`EHOSTKIT_RPC_PROTOCOL`）。传输层随即失效：通过 `onError` 报告，未完成的命令以该错误拒绝，之后的 `send` 也被拒绝。使用方应终止该次运行。
 - **关闭**：stdout 结束时 `closed` resolve，未完成的命令以 `RpcClosedError`（`EHOSTKIT_RPC_CLOSED`）拒绝。
-- **超时**：`send` 默认不设超时。设置 `timeoutMs` 时，到期后以 `RpcTimeoutError`（`EHOSTKIT_RPC_TIMEOUT`）拒绝；之后到达的响应作为 `late_response` 诊断报告。`abort` 必须设超时，见“进程树终止”。
+- **id**：写到 pi 的 `id` 一律由传输层生成（`hk-<序号>`），同一个传输对象内不重复；调用方在 `cmd.id` 里给的 id 不发给 pi，只在返回的响应里替换回去。所以调用方重复使用自己的 id 也不会让响应错配。
+- **超时**：`send` 默认不设超时。设置 `timeoutMs` 时，到期后以 `RpcTimeoutError`（`EHOSTKIT_RPC_TIMEOUT`）拒绝；之后到达的响应作为 `late_response` 诊断报告。传输层只记住最近 1024 个超时的 id，更早的迟到响应报告为 `unmatched_response`；wire id 不重复，所以迟到响应不会交给新的命令。`abort` 必须设超时，见“进程树终止”。
 - **监听器异常**：监听器抛出的异常不算协议错误，传输层继续工作；异常在微任务中重新抛出，由进程的未捕获异常处理。
 - 不用 pi 自带的 `RpcClient`：它的公开声明里没有回应扩展 UI 请求的接口（依据：`dist/modes/rpc/rpc-client.d.ts`）。
 
@@ -272,7 +273,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
   2. pi 或某个记录仍存活且当前就在 pi 的进程组里时，经由它向 pi 的进程组发 SIGKILL。
   3. 复查记录中的进程都已不在，仍存活的写进 `leftovers`。
 - 每次发信号前都重新检查身份（PID 和创建时间），进程组只经由一个身份一致、当前就在该组里的成员去发。该成员存在期间组号不会被复用。
-- Linux 用 pidfd 发信号：先 `pidfd_open`，再核对身份，再 `pidfd_send_signal`。pidfd 固定指向打开时的进程，核对之后 PID 即使被复用，信号也不会发给新进程。发给进程组时使用 `PIDFD_SIGNAL_PROCESS_GROUP`（Linux 6.9 起）；更早的内核退回 `kill(-pgid)`。没有 pidfd 的内核（5.3 之前）退回检查后 `kill`。macOS 没有 pidfd，检查后 `kill`（见“剩余风险”）。
+- Linux 用 pidfd 发信号：先 `pidfd_open`，再核对身份，再 `pidfd_send_signal`。pidfd 固定指向打开时的进程，核对之后 PID 即使被复用，信号也不会发给新进程。发给进程组时，先核对成员身份，再经由组长（PID 等于组号、且当前在该组的进程）的 pidfd 以 `PIDFD_SIGNAL_PROCESS_GROUP`（Linux 6.9 起）发送：这个标志按 pidfd 所指进程的 PID 寻址进程组，所以只能用组长的 pidfd。组长已退出或内核更早时退回 `kill(-pgid)`。没有 pidfd 的内核（5.3 之前）退回检查后 `kill`。macOS 没有 pidfd，检查后 `kill`（见“剩余风险”）。
 
 ### 停止遗留进程
 
@@ -528,7 +529,7 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。
 - **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法、非 pi 目录被拒、经 `npm root -g` 找到全局安装。
 - **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
-- **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超时的 id 在迟到响应前不能复用、非法 JSON、stdout 结束、监听器异常。
+- **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超过 1024 次超时后迟到响应也不会交给复用了调用方 id 的新命令、非法 JSON、stdout 结束、监听器异常。
 
 CI 还为 linux x64/arm64、darwin arm64/x64、win32 x64/arm64 构建预编译模块，并在非交叉编译的平台上加载一次。
 

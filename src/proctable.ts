@@ -159,12 +159,19 @@ function errnoCode(error: unknown): string | undefined {
 }
 
 /**
- * POSIX: sends `signal` to the process `id` (or, with `group`, to its current
- * process group, which must equal `group`) only if its identity still
- * matches. Linux uses a pidfd opened before the identity check, so the signal
- * cannot reach a process that reused the PID afterwards. macOS has no pidfd:
- * a PID reused between the check and kill() remains a documented residual
- * risk. Returns false when the process is gone or no longer matches.
+ * POSIX: sends `signal` to the process `id`, or with `group` to the process
+ * group `group`, only if `id` still matches its identity (and, with `group`,
+ * is currently in that group). Returns false when it is gone or no longer
+ * matches.
+ *
+ * Linux opens a pidfd before the identity check, so a single-process signal
+ * cannot reach a process that reused the PID afterwards. A process group is
+ * signalled through a pidfd of its leader (`PIDFD_SIGNAL_PROCESS_GROUP`
+ * addresses the group whose id is the pidfd's PID, Linux 6.9+); when the
+ * leader has exited or the kernel is older, `kill(-group)` is used. The group
+ * id cannot be reused while the verified member is in the group. macOS has no
+ * pidfd: a PID reused between the check and kill() remains a documented
+ * residual risk.
  */
 export function signalProcess(id: { pid: number; startTime: string }, signal: NodeJS.Signals, group?: number): boolean {
   if (pidfdUsable) {
@@ -180,20 +187,10 @@ export function signalProcess(id: { pid: number; startTime: string }, signal: No
     try {
       const row = processInfo(id.pid);
       if (!matches(row, id)) return false;
-      if (group !== undefined && row!.pgid !== group) return false;
       const signo = constants.signals[signal];
       if (group === undefined) return nativeFn("pidfdSignal")(fd, signo, false);
-      if (pidfdGroupUsable) {
-        try {
-          return nativeFn("pidfdSignal")(fd, signo, true);
-        } catch (error) {
-          if (errnoCode(error) !== "EINVAL") throw error;
-          pidfdGroupUsable = false; // kernels before 6.9
-        }
-      }
-      // The group exists while this verified member is in it, so its id cannot
-      // be reused until every member has exited.
-      return killQuietly(-group, signal);
+      if (row!.pgid !== group) return false;
+      return signalGroupLinux(group, signal);
     } finally {
       nativeFn("fdClose")(fd);
     }
@@ -202,6 +199,30 @@ export function signalProcess(id: { pid: number; startTime: string }, signal: No
   if (!matches(row, id)) return false;
   if (group !== undefined && row!.pgid !== group) return false;
   return killQuietly(group !== undefined ? -group : id.pid, signal);
+}
+
+/** Linux: signal a process group through its leader's pidfd when possible. */
+function signalGroupLinux(group: number, signal: NodeJS.Signals): boolean {
+  if (pidfdGroupUsable) {
+    const leaderFd = nativeFn("pidfdOpen")(group);
+    if (leaderFd >= 0) {
+      try {
+        // The PID equals the group id and the process is in that group: it is
+        // the leader of this group, pinned by the pidfd.
+        if (processInfo(group)?.pgid === group) {
+          try {
+            return nativeFn("pidfdSignal")(leaderFd, constants.signals[signal], true) || killQuietly(-group, signal);
+          } catch (error) {
+            if (errnoCode(error) !== "EINVAL") throw error;
+            pidfdGroupUsable = false; // kernels before 6.9
+          }
+        }
+      } finally {
+        nativeFn("fdClose")(leaderFd);
+      }
+    }
+  }
+  return killQuietly(-group, signal);
 }
 
 function killQuietly(target: number, signal: NodeJS.Signals): boolean {
