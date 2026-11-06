@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { describe, test } from "node:test";
 import { JsonlSplitter, RpcProtocolError, RpcTimeoutError, StdioRpcTransport } from "../dist/index.js";
 
@@ -45,6 +45,36 @@ function transport(opts) {
   const rpc = new StdioRpcTransport(stdin, stdout, opts);
   const emit = (obj) => stdout.write(`${typeof obj === "string" ? obj : JSON.stringify(obj)}\n`);
   return { rpc, stdin, stdout, written, emit, tick: () => new Promise((r) => setImmediate(r)) };
+}
+
+class ControlledWritable extends Writable {
+  calls = [];
+  callbacks = [];
+
+  constructor() {
+    super({ highWaterMark: 1 });
+  }
+
+  write(...args) {
+    this.calls.push(String(args[0]));
+    return super.write(...args);
+  }
+
+  _write(_chunk, _encoding, callback) {
+    this.callbacks.push(callback);
+  }
+
+  complete(error) {
+    assert.ok(this.callbacks.length, "a write is in flight");
+    this.callbacks.shift()(error);
+  }
+}
+
+function backpressuredTransport(opts) {
+  const stdin = new ControlledWritable();
+  const stdout = new PassThrough();
+  const rpc = new StdioRpcTransport(stdin, stdout, opts);
+  return { stdin, stdout, rpc, tick: () => new Promise((resolve) => setImmediate(resolve)) };
 }
 
 describe("StdioRpcTransport", () => {
@@ -120,6 +150,8 @@ describe("StdioRpcTransport", () => {
     await assert.rejects(p, RpcProtocolError);
     assert.equal(errors.length, 1);
     await assert.rejects(t.rpc.send({ type: "get_state" }), RpcProtocolError);
+    t.rpc.closeInput();
+    assert.equal(t.stdin.writableEnded, true, "shutdown still closes stdin after a protocol failure");
   });
 
   test("stdout end rejects pending commands", async () => {
@@ -128,6 +160,191 @@ describe("StdioRpcTransport", () => {
     t.stdout.end();
     await assert.rejects(p, { code: "EHOSTKIT_RPC_CLOSED" });
     await t.rpc.closed;
+  });
+
+  test("gate, RPC and UI share an ordered queue until drain; closeInput flushes it", async () => {
+    const t = backpressuredTransport();
+    t.rpc.block("held at gate");
+    t.rpc.writeRaw("gate-release\n");
+    t.rpc.block(undefined);
+    const first = t.rpc.send({ type: "get_state" });
+    t.rpc.respondUi({ id: "u1", confirmed: true });
+    const last = t.rpc.send({ type: "get_messages" });
+    t.rpc.closeInput();
+    t.rpc.closeInput();
+    await assert.rejects(t.rpc.send({ type: "after_close" }), { code: "EHOSTKIT_RPC_CLOSED" });
+    assert.throws(() => t.rpc.respondUi({ id: "after_close" }), { code: "EHOSTKIT_RPC_CLOSED" });
+    assert.deepEqual(t.stdin.calls, ["gate-release\n"]);
+    assert.equal(t.stdin.writableEnded, false);
+
+    for (let i = 0; i < 3; i++) {
+      t.stdin.complete();
+      await t.tick();
+      assert.equal(t.stdin.calls.length, i + 2, "only one write is passed to the stream per drain");
+    }
+    assert.deepEqual(t.stdin.calls.slice(1).map((line) => JSON.parse(line).type), [
+      "get_state", "extension_ui_response", "get_messages",
+    ]);
+    assert.equal(t.stdin.writableEnded, true);
+    assert.equal(t.stdin.listenerCount("drain"), 0);
+    t.stdin.complete();
+    await t.tick();
+    assert.equal(t.stdin.writableFinished, true);
+    for (const line of [t.stdin.calls[1], t.stdin.calls[3]]) {
+      const cmd = JSON.parse(line);
+      t.stdout.write(`${JSON.stringify({ type: "response", id: cmd.id, command: cmd.type, success: true })}\n`);
+    }
+    assert.equal((await first).success, true);
+    assert.equal((await last).success, true);
+    t.stdout.end();
+    await t.rpc.closed;
+  });
+
+  test("the queue limit counts in-flight UTF-8 bytes and LF; overflow is recoverable", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    const cleared = ctx.mock.method(globalThis, "clearTimeout");
+    const t = backpressuredTransport({ maxQueuedBytes: 128 });
+    const errors = [];
+    t.rpc.onError((error) => errors.push(error));
+    t.rpc.writeRaw(`${"é".repeat(63)}\n`); // 127 bytes remain in flight.
+    await assert.rejects(t.rpc.send({ type: "get_state" }, { timeoutMs: 60_000 }), {
+      code: "EHOSTKIT_RPC_QUEUE_FULL",
+    });
+    assert.equal(cleared.mock.callCount(), 1, "a rejected admission clears its RPC timer");
+    assert.throws(() => t.rpc.respondUi({ id: "u1" }), { code: "EHOSTKIT_RPC_QUEUE_FULL" });
+    assert.throws(() => t.rpc.writeRaw("é"), { code: "EHOSTKIT_RPC_QUEUE_FULL" });
+    t.rpc.writeRaw("\n"); // Exactly 128 bytes are admitted.
+    assert.throws(() => t.rpc.writeRaw("\n"), { code: "EHOSTKIT_RPC_QUEUE_FULL" });
+    assert.equal(t.stdin.calls.length, 1);
+    t.stdin.complete();
+    await t.tick();
+    assert.equal(t.stdin.calls.length, 2);
+    t.stdin.complete();
+    await t.tick();
+    const pending = t.rpc.send({ type: "get_state" });
+    const cmd = JSON.parse(t.stdin.calls.at(-1));
+    t.stdout.write(`${JSON.stringify({ type: "response", id: cmd.id, command: cmd.type, success: true })}\n`);
+    assert.equal((await pending).success, true);
+    assert.deepEqual(errors, [], "overflow does not poison the transport");
+    t.stdin.complete();
+    await t.tick();
+    t.rpc.closeInput();
+  });
+
+  test("rejects invalid queue limits and bounds the default queue", async () => {
+    for (const maxQueuedBytes of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => backpressuredTransport({ maxQueuedBytes }), /maxQueuedBytes/);
+    }
+    const t = backpressuredTransport();
+    assert.throws(() => t.rpc.writeRaw("x".repeat(64 * 1024 * 1024 + 1)), {
+      code: "EHOSTKIT_RPC_QUEUE_FULL",
+    });
+    assert.equal(t.stdin.calls.length, 0);
+    t.rpc.closeInput();
+  });
+
+  test("serializes commands before pending registration or timers and leaves the transport usable", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    const timers = ctx.mock.method(globalThis, "setTimeout");
+    const t = transport();
+    const cyclic = {};
+    cyclic.self = cyclic;
+    const getterError = new Error("getter failed");
+    const jsonError = new Error("toJSON failed");
+    const cases = [
+      [{ type: "cycle", data: cyclic }, TypeError],
+      [{ type: "bigint", data: 1n }, TypeError],
+      [{ type: "getter", get data() { throw getterError; } }, getterError],
+      [{ type: "to_json", toJSON() { throw jsonError; } }, jsonError],
+      [{ type: "undefined", toJSON() {} }, TypeError],
+    ];
+    const diagnostics = [];
+    t.rpc.onDiagnostic((diagnostic) => diagnostics.push(diagnostic.kind));
+    for (let i = 0; i < cases.length; i++) {
+      const [cmd, error] = cases[i];
+      let result;
+      assert.doesNotThrow(() => { result = t.rpc.send(cmd, { timeoutMs: 60_000 }); });
+      await assert.rejects(result, error);
+      t.emit({ type: "response", id: `hk-${i + 1}`, command: cmd.type, success: true });
+    }
+    assert.equal(timers.mock.callCount(), 0, "failed serialization never creates timers");
+    assert.deepEqual(diagnostics, cases.map(() => "unmatched_response"), "failed commands are not pending");
+    assert.deepEqual(t.written, []);
+    assert.throws(() => t.rpc.respondUi({ id: "u1", data: cyclic }), TypeError);
+    assert.throws(() => t.rpc.respondUi({ id: "u1", data: 1n }), TypeError);
+    const pending = t.rpc.send({ type: "get_state" });
+    t.emit({ type: "response", id: t.written.at(-1).id, command: "get_state", success: true });
+    assert.equal((await pending).success, true);
+    t.rpc.respondUi({ id: "u1", confirmed: true });
+    assert.equal(t.written.at(-1).type, "extension_ui_response");
+    t.rpc.closeInput();
+  });
+
+  test("a failed write rejects queued RPCs, clears timers, and removes drain listeners", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    const cleared = ctx.mock.method(globalThis, "clearTimeout");
+    const t = backpressuredTransport();
+    const failure = new Error("write failed");
+    const errors = [];
+    t.rpc.onError((error) => errors.push(error));
+    const first = t.rpc.send({ type: "first" }, { timeoutMs: 60_000 });
+    const second = t.rpc.send({ type: "second" }, { timeoutMs: 60_000 });
+    t.rpc.respondUi({ id: "u1" });
+    const rejected = Promise.all([assert.rejects(first, failure), assert.rejects(second, failure)]);
+    t.stdin.complete(failure);
+    await rejected;
+    await t.tick();
+    assert.equal(cleared.mock.callCount(), 2);
+    assert.equal(t.stdin.calls.length, 1);
+    assert.equal(t.stdin.listenerCount("drain"), 0);
+    assert.deepEqual(errors, [failure]);
+    await assert.rejects(t.rpc.send({ type: "later" }), failure);
+    assert.throws(() => t.rpc.writeRaw("gate-release\n"), failure);
+    assert.throws(() => t.rpc.respondUi({ id: "later" }), failure);
+  });
+
+  test("failure during closeInput discards unsent records and finishes stdin", async () => {
+    const t = backpressuredTransport();
+    const first = t.rpc.send({ type: "first" });
+    const second = t.rpc.send({ type: "second" });
+    t.rpc.closeInput();
+    const rejected = Promise.all([
+      assert.rejects(first, RpcProtocolError),
+      assert.rejects(second, RpcProtocolError),
+    ]);
+    t.stdout.write("invalid JSON\n");
+    await rejected;
+    assert.equal(t.stdin.writableEnded, true);
+    assert.equal(t.stdin.calls.length, 1);
+    assert.equal(t.stdin.listenerCount("drain"), 0);
+    t.stdin.complete();
+    await t.tick();
+    assert.equal(t.stdin.writableFinished, true);
+  });
+
+  test("a synchronous write failure settles the command and clears its timer", async (ctx) => {
+    ctx.mock.timers.enable({ apis: ["setTimeout"] });
+    const cleared = ctx.mock.method(globalThis, "clearTimeout");
+    const t = backpressuredTransport();
+    const failure = new Error("synchronous write failure");
+    ctx.mock.method(t.stdin, "write", () => { throw failure; });
+    await assert.rejects(t.rpc.send({ type: "get_state" }, { timeoutMs: 60_000 }), failure);
+    assert.equal(cleared.mock.callCount(), 1);
+    assert.equal(t.stdin.listenerCount("drain"), 0);
+  });
+
+  test("premature stdin close rejects in-flight and queued commands", async () => {
+    const t = backpressuredTransport();
+    const first = t.rpc.send({ type: "first" });
+    const second = t.rpc.send({ type: "second" });
+    const rejected = Promise.all([
+      assert.rejects(first, { code: "EHOSTKIT_RPC_CLOSED" }),
+      assert.rejects(second, { code: "EHOSTKIT_RPC_CLOSED" }),
+    ]);
+    t.stdin.destroy();
+    await rejected;
+    assert.equal(t.stdin.calls.length, 1);
+    assert.equal(t.stdin.listenerCount("drain"), 0);
   });
 
   test("a throwing listener does not break the transport", async () => {

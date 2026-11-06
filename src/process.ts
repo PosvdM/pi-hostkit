@@ -7,6 +7,7 @@ import { GATE_RELEASE_LINE } from "./gate-protocol.js";
 import { nativeFn } from "./native.js";
 import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
+import { SnapshotRecords, stopSnapshot } from "./snapshots.js";
 
 export interface ProcessIdentity {
   pid: number;
@@ -33,7 +34,7 @@ export interface StopReport {
   steps: { step: string; at: string; ok: boolean; detail?: string }[];
   /** What the final kill is guaranteed to reach. `snapshot_visible` covers only processes a snapshot saw. */
   coverage: StopCoverage;
-  /** Processes within the coverage still alive after the final check; normally empty. */
+  /** Processes within coverage still alive or whose exit cannot be confirmed. */
   leftovers: { pid: number; startTime: string; exe?: string }[];
 }
 
@@ -60,6 +61,8 @@ export interface SpawnSpec {
   containment?: Containment;
   /** Maximum bytes of one RPC record; default 64 MiB. */
   maxRecordBytes?: number;
+  /** Maximum queued RPC input bytes, including in-flight writes; default 64 MiB. */
+  maxQueuedBytes?: number;
   /** Snapshot interval while a tool runs (snapshot coverage only); default 5000. */
   snapshotIntervalMs?: number;
 }
@@ -286,68 +289,6 @@ function scopeUnit(runId: string): string {
 
 // ---------- snapshot coverage ----------
 
-class SnapshotRecords {
-  readonly records = new Map<string, ProcessRow>();
-
-  constructor(private readonly root: ProcessIdentity) {}
-
-  remember(row: ProcessRow): void {
-    this.records.set(`${row.pid}:${row.startTime}`, row);
-  }
-
-  /**
-   * Records every live descendant of pi and the members of pi's process group
-   * (pgid = pi's pid). Only while pi itself is alive with the recorded
-   * identity: after pi has exited its PID, and so the group id, may belong to
-   * an unrelated process, and nothing new is added.
-   */
-  capture(): void {
-    const table = listProcesses();
-    if (!table.some((row) => matches(row, this.root))) return;
-    const tree = verifiedDescendants(table, this.root);
-    // pi must still be the same process after the table was read; then its
-    // pid is still its process group id and the group members are its own.
-    if (!matches(processInfo(this.root.pid), this.root)) return;
-    for (const row of tree) this.remember(row);
-    for (const row of table) {
-      if (row.pgid === this.root.pid && row.pid !== this.root.pid) this.remember(row);
-    }
-  }
-
-  alive(): ProcessRow[] {
-    return [...this.records.values()].filter((row) => matches(processInfo(row.pid), row));
-  }
-
-  /**
-   * SIGKILL the current process group of every recorded process that still
-   * matches its identity (except pi's own group), then each such process. A
-   * group is signalled only through a verified member, while that member is
-   * in it.
-   */
-  killDescendants(): number[] {
-    const groups = new Set<number>();
-    for (const row of this.records.values()) {
-      const current = processInfo(row.pid);
-      if (!matches(current, row)) continue;
-      const pgid = current!.pgid;
-      if (pgid !== undefined && pgid !== this.root.pid && pgid > 1 && !groups.has(pgid)) {
-        if (signalProcess(row, "SIGKILL", pgid)) groups.add(pgid);
-      }
-      signalProcess(row, "SIGKILL");
-    }
-    return [...groups];
-  }
-
-  /** SIGKILL pi's process group through pi or a recorded member that is verified to be in it. */
-  killRootGroup(): boolean {
-    const members = [this.root as { pid: number; startTime: string }, ...this.records.values()];
-    for (const member of members) {
-      if (signalProcess(member, "SIGKILL", this.root.pid)) return true;
-    }
-    return false;
-  }
-}
-
 // ---------- stop reports ----------
 
 class Steps {
@@ -448,10 +389,10 @@ class Managed implements ManagedProcess {
 
   release(): void {
     if (this.released) return;
-    this.released = true;
     if (this.exitInfo) return;
     this.rpc.writeRaw(`${GATE_RELEASE_LINE}\n`);
     this.rpc.block(undefined);
+    this.released = true;
   }
 
   onStderr(listener: (chunk: string) => void): () => void {
@@ -531,9 +472,13 @@ class Managed implements ManagedProcess {
       } else {
         // pi's RPC mode terminates the command trees it tracks on SIGTERM.
         // pi is this host's unreaped child here, so its PID cannot be reused.
-        const sent = signalProcess(this.identity, "SIGTERM");
-        const exited = sent && (await this.waitExit(opts.termGraceMs));
-        steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${opts.termGraceMs} ms` : "not delivered");
+        try {
+          const sent = signalProcess(this.identity, "SIGTERM");
+          const exited = sent && (await this.waitExit(opts.termGraceMs));
+          steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${opts.termGraceMs} ms` : "not delivered");
+        } catch (error) {
+          steps.add("SIGTERM", false, (error as Error).message);
+        }
       }
     }
 
@@ -555,21 +500,24 @@ class Managed implements ManagedProcess {
       leftovers = await killScope(dir, steps);
     } else {
       this.capture();
-      const groups = this.snapshots.killDescendants();
-      steps.add("SIGKILL descendants", true, groups.length ? `process groups ${groups.join(",")}` : "none");
-      const rootGroup = this.snapshots.killRootGroup();
-      steps.add("SIGKILL pi group", true, rootGroup ? "sent" : "no live member");
-      await poll(() => this.snapshots.alive().length === 0, SETTLE_CHECK_MS);
-      leftovers = rowsToLeftovers(this.snapshots.alive());
+      const report = await stopSnapshot(this.snapshots, (empty) => poll(empty, SETTLE_CHECK_MS));
+      steps.steps.push(...report.steps);
+      leftovers = report.leftovers;
     }
 
     if (!(await this.waitExit(SETTLE_CHECK_MS))) {
       // Not reaped yet; the final check covers the pi process itself.
-      if (matches(processInfo(this.identity.pid), this.identity)) {
+      let gone = false;
+      try {
+        gone = !matches(processInfo(this.identity.pid), this.identity);
+      } catch (error) {
+        steps.add("query pi", false, (error as Error).message);
+      }
+      if (!gone && !leftovers.some((row) => row.pid === this.identity.pid && row.startTime === this.identity.startTime)) {
         leftovers.push({ pid: this.identity.pid, startTime: this.identity.startTime });
       }
     }
-    steps.add("verify", leftovers.length === 0, leftovers.length ? `${leftovers.length} still alive` : undefined);
+    steps.add("verify", leftovers.length === 0, leftovers.length ? `${leftovers.length} alive or unknown` : undefined);
     return { steps: steps.steps, coverage: this.coverage, leftovers };
   }
 }
@@ -647,7 +595,7 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
     abandon(error as Error);
   }
 
-  const rpc = new StdioRpcTransport(child.stdin!, child.stdout!, { maxRecordBytes: spec.maxRecordBytes });
+  const rpc = new StdioRpcTransport(child.stdin!, child.stdout!, { maxRecordBytes: spec.maxRecordBytes, maxQueuedBytes: spec.maxQueuedBytes });
   rpc.block("pi is held at the start gate; call release() first");
   const managed = new Managed(child, identity!, mode, rpc, spec.snapshotIntervalMs ?? 5_000);
   if (!spec.startHeld) managed.release();
@@ -667,7 +615,14 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
   const o = resolveStopOptions(opts);
   const steps = new Steps();
   steps.add("abort", false, "no RPC connection to a recorded process");
-  const alive = () => matches(processInfo(id.pid), id);
+  const alive = () => {
+    try {
+      return matches(processInfo(id.pid), id);
+    } catch (error) {
+      steps.add("query pi", false, (error as Error).message);
+      return true;
+    }
+  };
   steps.add("identity", true, alive() ? "alive" : "gone");
 
   if (process.platform === "win32") {
@@ -686,11 +641,22 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
 
   const cgroup = isOwnScope(id.cgroup) && existsSync(id.cgroup!) ? id.cgroup : undefined;
   const records = new SnapshotRecords(id);
-  if (!cgroup) records.capture();
+  const capture = () => {
+    try {
+      records.capture();
+    } catch (error) {
+      steps.add("snapshot", false, (error as Error).message);
+    }
+  };
+  if (!cgroup) capture();
   if (alive()) {
-    const sent = signalProcess(id, "SIGTERM");
-    const exited = sent && (await poll(() => !alive(), o.termGraceMs));
-    steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${o.termGraceMs} ms` : "not delivered");
+    try {
+      const sent = signalProcess(id, "SIGTERM");
+      const exited = sent && (await poll(() => !alive(), o.termGraceMs));
+      steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${o.termGraceMs} ms` : "not delivered");
+    } catch (error) {
+      steps.add("SIGTERM", false, (error as Error).message);
+    }
   }
 
   if (cgroup) {
@@ -699,13 +665,10 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
     return { steps: steps.steps, coverage: "cgroup", leftovers };
   }
 
-  records.capture();
-  const groups = records.killDescendants();
-  steps.add("SIGKILL descendants", true, groups.length ? `process groups ${groups.join(",")}` : "none");
-  steps.add("SIGKILL pi group", true, records.killRootGroup() ? "sent" : "no live member");
-  const watch = () => [...records.alive(), ...(alive() ? [id] : [])];
-  await poll(() => watch().length === 0, SETTLE_CHECK_MS);
-  const leftovers = watch();
+  capture();
+  const report = await stopSnapshot(records, (empty) => poll(empty, SETTLE_CHECK_MS));
+  steps.steps.push(...report.steps);
+  const leftovers = report.leftovers;
   steps.add("verify", leftovers.length === 0);
   return { steps: steps.steps, coverage: "snapshot_visible", leftovers: rowsToLeftovers(leftovers) };
 }
