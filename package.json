@@ -1,0 +1,55 @@
+{
+  "name": "pi-hostkit",
+  "version": "0.1.0",
+  "private": true,
+  "description": "托管 pi 子进程时与操作系统相关的能力：定位 pi、RPC 传输、进程树终止、锁、密钥权限、路径规范化",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PosvdM/pi-hostkit.git"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "default": "./dist/paths.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "binding.gyp",
+    "src/native",
+    "prebuilds"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "gypfile": true,
+  "scripts": {
+    "install": "node-gyp-build",
+    "prepare": "npm run build",
+    "build": "tsc -p tsconfig.json",
+    "build:native": "node-gyp rebuild",
+    "prebuildify": "prebuildify --napi --strip",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
+  },
+  "dependencies": {
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "node-gyp": "^13.1.0",
+    "prebuildify": "^6.0.1",
+    "typescript": "^7.0.2"
+  }
+}
