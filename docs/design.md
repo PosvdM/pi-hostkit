@@ -72,8 +72,11 @@ export interface PiInstall {
 查找顺序：
 
 1. 配置项 `piPath`（pane 与 agora 各自的配置文件里同名）：可以是包目录，也可以是包内的文件（通常是 `cli.js`）；指向文件时向上最多查 6 层找到包目录。
-2. 全局 npm 根目录：执行 `npm root -g`，取 `<root>/@earendil-works/pi-coding-agent`。Windows 上 `npm` 是 `.cmd` 脚本，经 `%SystemRoot%\System32\cmd.exe /d /s /c "npm root -g"` 调用，参数固定，不拼接任何外部输入。结果缓存到进程退出（失败时不缓存）。
-3. 都找不到时抛出 `EHOSTKIT_PI_NOT_FOUND`，提示安装 pi 或设置 `piPath`。
+2. 官方安装目录：依次尝试 `PI_MANAGED_INSTALL_ROOT`、`PI_CODING_AGENT_DIR/install`、`~/.pi/agent/install`，去重后检查。`PI_CODING_AGENT_DIR` 支持 `~` 展开。根目录的 `managed-install.json` 必须满足 `kind = "pi-managed-install"`、`schemaVersion = 1`、`layout = "releases-v1"`；读 `current-version`，再取 `releases/<版本>/node_modules/@earendil-works/pi-coding-agent`，包版本必须与该版本相同。不按最大版本挑选，也不缓存激活版本。版本文件只允许单个合法版本目录名，拒绝路径穿越。安装缺失或损坏时继续后续候选；找到结构完整但不受支持的版本时返回 `supported: false`，不跳过它去选 npm 版本。
+3. 全局 npm 根目录：执行 `npm root -g`，取 `<root>/@earendil-works/pi-coding-agent`。Windows 上 `npm` 是 `.cmd` 脚本，经 `%SystemRoot%\System32\cmd.exe /d /s /c "npm root -g"` 调用，参数固定，不拼接任何外部输入。结果缓存到进程退出（失败时不缓存）。
+4. 都找不到时抛出 `EHOSTKIT_PI_NOT_FOUND`，提示安装 pi 或设置 `piPath`。
+
+官方 Windows `install.ps1` 和 macOS/Linux `install.sh` 使用相同的 `releases-v1` 布局，默认在 agent 目录下的 `install` 中。目录和环境变量的依据为 pi 1.5.0 的 `dist/config.js`、`dist/package-manager-cli.js`、安装生成的 `pi-launcher.js`，并与 README 链接的官方安装脚本交叉核对。显式 `piPath` 无效时直接报错，不回退。
 
 - 包目录的 `package.json` 的 `name` 必须是 `@earendil-works/pi-coding-agent`，`bin.pi` 指向的文件必须存在。
 - 只有 `x.y.z` 形式且在 `>=1.5.0 <1.6.0` 内的版本算支持；带预发布后缀（如 `1.5.1-beta.1`）的版本不算。`supported` 为 false 时，使用方拒绝启动受管会话，提示改用支持的 pi 版本。
@@ -100,17 +103,18 @@ export type RpcDiagnostic =
   | { kind: "unmatched_response"; response: RpcResponse }; // 没有对应命令的响应
 
 export class StdioRpcTransport implements RpcTransport {
-  constructor(stdin: Writable, stdout: Readable, opts?: { maxRecordBytes?: number });
+  constructor(stdin: Writable, stdout: Readable, opts?: { maxRecordBytes?: number; maxQueuedBytes?: number });
 }
 export class JsonlSplitter { /* 按 LF 切分字节流，供测试和其他传输复用 */ }
 ```
 
 - **只按 LF 切分**：stdout 按字节流读，遇到 `\n` 切出一条记录，去掉末尾一个可选的 `\r`，再按 UTF-8 解码（LF 不会出现在多字节 UTF-8 序列中间）。不用 Node 的 `readline`：它还会在 `U+2028`、`U+2029` 处切分，而这两个字符可以合法出现在 JSON 字符串里。
-- **写入**：每条命令写 `JSON.stringify(cmd) + "\n"`，按调用顺序写入。没有 `id` 的命令由传输层分配 `hk-<序号>`；同一 `id` 已在等待响应时拒绝发送。
+- **写入**：门闩放行行、普通 RPC 和 UI 回应共用一个 FIFO。每条 RPC 先序列化为 JSON 加 LF，再登记等待响应的条目和计时器；序列化失败不留下 pending 或计时器。`write()` 返回 false 后等待 `drain`，再写下一条。
+- **发送缓冲上限**：`maxQueuedBytes` 默认 64 MiB，必须是正安全整数；按 UTF-8 字节数计入 LF、内部队列和已交给流但写回调尚未完成的数据。超过上限时，该次 `send` 以 `EHOSTKIT_RPC_QUEUE_FULL` 拒绝，`respondUi` 同步抛出同码错误，不让传输失效。超时不撤回已排队的数据，但队列总字节数受上限约束；调用方应限制单条消息和并发发送量。序列化本身仍需临时内存，上限不约束调用方持有的消息或序列化期间的内存。
 - **分发**：`type` 为 `response` 的记录按 `id` 交给等待中的 `send`；`extension_ui_request` 交给 `onUiRequest`；其余交给 `onEvent`。
 - **单条记录上限**：默认 64 MiB（`DEFAULT_MAX_RECORD_BYTES`，含图片的消息可能很大）。
 - **协议错误**：记录超过上限、不是合法 JSON、不是带字符串 `type` 的对象，或 stdout 结束时留有不以 LF 结尾的半条记录，都是协议错误（`RpcProtocolError`，`EHOSTKIT_RPC_PROTOCOL`）。传输层随即失效：通过 `onError` 报告，未完成的命令以该错误拒绝，之后的 `send` 也被拒绝。使用方应终止该次运行。
-- **关闭**：stdout 结束时 `closed` resolve，未完成的命令以 `RpcClosedError`（`EHOSTKIT_RPC_CLOSED`）拒绝。
+- **关闭**：`closeInput` 拒绝后续入队，按顺序把已排队的数据交给流后关闭 stdin。stdin 提前关闭或写入错误使传输失效，并清理队列、pending、计时器和 `drain` 监听器。stdout 结束时 `closed` resolve，未完成的命令以 `RpcClosedError`（`EHOSTKIT_RPC_CLOSED`）拒绝。
 - **id**：写到 pi 的 `id` 一律由传输层生成（`hk-<序号>`），同一个传输对象内不重复；调用方在 `cmd.id` 里给的 id 不发给 pi，只在返回的响应里替换回去。所以调用方重复使用自己的 id 也不会让响应错配。
 - **超时**：`send` 默认不设超时。设置 `timeoutMs` 时，到期后以 `RpcTimeoutError`（`EHOSTKIT_RPC_TIMEOUT`）拒绝；之后到达的响应作为 `late_response` 诊断报告。传输层只记住最近 1024 个超时的 id，更早的迟到响应报告为 `unmatched_response`；wire id 不重复，所以迟到响应不会交给新的命令。`abort` 必须设超时，见“进程树终止”。
 - **监听器异常**：监听器抛出的异常不算协议错误，传输层继续工作；异常在微任务中重新抛出，由进程的未捕获异常处理。
@@ -130,6 +134,7 @@ export interface SpawnSpec {
   startHeld?: boolean;          // 停在启动门闩直到 release()，默认 false
   containment?: "auto" | "snapshot"; // Linux：auto 在可用时使用 cgroup v2，snapshot 强制快照模式
   maxRecordBytes?: number;      // RPC 单条记录上限，默认 64 MiB
+  maxQueuedBytes?: number;      // RPC 发送缓冲上限，默认 64 MiB
   snapshotIntervalMs?: number;  // 快照模式下工具执行期间的快照间隔，默认 5000
 }
 
@@ -218,7 +223,7 @@ export type StopCoverage = "job_object" | "cgroup" | "snapshot_visible";
 export interface StopReport {
   steps: { step: string; at: string; ok: boolean; detail?: string }[];
   coverage: StopCoverage;       // 最终终止能覆盖的范围；snapshot_visible 只覆盖快照见过的进程
-  leftovers: { pid: number; startTime: string; exe?: string }[]; // 覆盖范围内复查后仍存活的进程，正常为空
+  leftovers: { pid: number; startTime: string; exe?: string }[]; // 覆盖范围内仍存活或无法确认退出的进程
 }
 ```
 
@@ -272,7 +277,8 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 - 最终终止（`step` 为 `SIGKILL descendants` 和 `SIGKILL pi group`）：
   1. 对每个仍存活（身份一致）的记录：若它当前所在的进程组不是 pi 的进程组，经由这个记录向该进程组发 SIGKILL；再向它本身发 SIGKILL。
   2. pi 或某个记录仍存活且当前就在 pi 的进程组里时，经由它向 pi 的进程组发 SIGKILL。
-  3. 复查记录中的进程都已不在，仍存活的写进 `leftovers`。
+  3. 复查记录中的进程都已不在，仍存活或查询失败、无法确认退出的写进 `leftovers`。
+- 每个目标的进程查询、进程组信号和单进程信号分别处理错误；某个后代报 `EPERM` 等错误时，继续处理其他后代，最后仍尝试 pi 的进程组。错误写入 `steps` 的 `snapshot cleanup` 项；无法确认退出不能当作已退出。
 - 每次发信号前都重新检查身份（PID 和创建时间），进程组只经由一个身份一致、当前就在该组里的成员去发。该成员存在期间组号不会被复用。
 - Linux 用 pidfd 发信号：先 `pidfd_open`，再核对身份，再 `pidfd_send_signal`。pidfd 固定指向打开时的进程，核对之后 PID 即使被复用，信号也不会发给新进程。发给进程组时，先核对成员身份，再打开组长（PID 等于组号、且当前在该组的进程）的 pidfd，然后重新核对该成员仍是同一进程且仍在这个组，最后以 `PIDFD_SIGNAL_PROCESS_GROUP`（Linux 6.9 起）经由组长的 pidfd 发送：这个标志按 pidfd 所指进程的 PID 寻址进程组，所以只能用组长的 pidfd。组长已退出或内核更早时，重新核对成员后退回 `kill(-pgid)`。没有 pidfd 的内核（5.3 之前）退回检查后 `kill`。macOS 没有 pidfd，检查后 `kill`（见“剩余风险”）。
 
@@ -325,6 +331,7 @@ export interface SessionWriterLock extends HeldLock {
   readonly sessionFile: string;                       // 规范化后的会话文件路径
   readonly previous?: SessionLockRecord;              // 取得锁时读到的上一份记录
   readonly recoveryReports: readonly StopReport[];    // recoverPreviousWriter 停止遗留写者的报告
+  release(opts?: { writerSwitchedAway?: boolean }): Promise<void>;
   recoverPreviousWriter(opts?: RecoverOptions): Promise<"none" | "stopped" | "failed">;
   update(patch: Partial<Pick<SessionLockRecord, "writer" | "state">>): Promise<void>;
   spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess>;
@@ -348,6 +355,7 @@ export interface SessionLockRecord {
 | Windows | 命名 mutex，名称见下文。持有进程退出后 mutex 变为 abandoned，下一个获取者得到所有权（`WAIT_ABANDONED` 视为取得锁）。mutex 的所有权属于线程，线程退出时就会变为 abandoned，所以只能在主线程上获取和释放；在 Worker 线程调用时抛出 `EHOSTKIT_THREAD`。 |
 | macOS、Linux | 打开（必要时以 `0600` 创建）锁文件，`flock(LOCK_EX \| LOCK_NB)`，文件描述符由宿主进程持有（`O_CLOEXEC`，不传给子进程）。锁文件永不删除：删除会让两个进程分别锁住新旧两个文件。 |
 
+- Windows 的名称为 `Global\pi-hostkit-v1-<当前用户 SID>-<purpose>-<sha256>`。`Global\` 让同一个用户的不同登录会话互斥；SID 将不同系统用户隔离，避免它们互相占用名称。创建时原子设置仅当前用户完全控制的受保护 DACL，并显式指定当前用户为所有者；打开后在同一句柄上核对所有者。所有者不是当前用户或无法查询时拒绝（fail closed），不会视为取得锁。现存对象的 DACL 不被重设。
 - 获取都不等待：已被占用时立即返回。
 - 同一进程内重复获取同一把锁视为已被占用，与 `flock` 在不同打开文件描述之间互斥的语义一致；Windows 的 mutex 本身允许同一线程重复获取，由 pi-hostkit 在进程内拒绝。这项检查只在同一份 pi-hostkit 模块内有效：一个进程加载了两份 pi-hostkit 时，Windows 上两份可以重复取得同一把锁。宿主进程只应加载一份。
 
@@ -356,7 +364,7 @@ export interface SessionLockRecord {
 - 用于 agora daemon 和 pane 服务端，`scopeDir` 为各自的数据目录或其子目录。
 - `name` 限 `[A-Za-z0-9._-]{1,64}`，否则抛出 `EINVAL`。`scopeDir` 不存在时创建，并检查在本地磁盘上。
 - POSIX 锁文件：`<scopeDir 的真实路径>/<name>.lock`。
-- Windows mutex：`Local\pi-hostkit-v1-instance-<sha256("instance\n" + comparisonKey(scopeDir 的真实路径) + "\n" + name)>`。
+- Windows mutex：`Global\pi-hostkit-v1-<当前用户 SID>-instance-<sha256("instance\n" + comparisonKey(scopeDir 的真实路径) + "\n" + name)>`。
 - 拿到锁后，使用方才写自己的发现信息文件（如 agora 的 `run/daemon.json`）。发现信息只用于找到对方，不作为互斥依据。
 
 ### 会话写锁
@@ -367,7 +375,7 @@ export interface SessionLockRecord {
 - 会话文件也必须在本地磁盘上，`acquireSessionWriterLock` 检查它（不存在时检查最深的已存在祖先），否则抛出 `EHOSTKIT_REMOTE_FS`。锁只在一台机器内互斥；网络文件系统上的会话可能被另一台机器上的宿主用它自己的锁目录同时打开。
 - 会话 key：`k = sha256(comparisonKey(会话文件的真实路径))` 的十六进制。会话文件不存在时，取最深的已存在祖先的真实路径，再接上其余部分（`realPathOrPending`，见“路径规范化”）。
 - POSIX 锁文件：`<锁目录>/session-<k>.lock`。
-- Windows mutex：`Local\pi-hostkit-v1-session-<sha256("session\n" + k)>`。
+- Windows mutex：`Global\pi-hostkit-v1-<当前用户 SID>-session-<sha256("session\n" + k)>`。
 - 共享记录：`<锁目录>/session-<k>.json`（三个平台都有；Windows 上锁本身是 mutex，目录里只有记录）。
 - 持锁方是宿主进程（daemon 或 pane 服务端），不是 pi。
 - `probeSessionWriterLock` 尝试获取后立即释放，用于显示“由谁托管”，不保留锁。
@@ -378,8 +386,9 @@ export interface SessionLockRecord {
 
 - 只有持锁方写记录。写法为写同目录的临时文件（`0600`，排他创建）后改名替换；Windows 上目标文件正被其他进程短暂打开时，改名最多重试 20 次、每次间隔 25 毫秒。
 - 内容为 `SessionLockRecord` 的 JSON。以下任一情况视为记录损坏：无法读取、不是合法 JSON、`version` 不是 1、`state` 不是四个取值之一、`sessionFile` 的 key 与这把锁不符、`host.app` 不是 `pi-pane` 或 `pi-agora`、`host.identity` 或 `writer` 不是完整的进程身份（正整数 `pid`、非空 `startTime`、字符串 `runId` 和 `instanceId`）、`updatedAt` 不是字符串。
-- 持锁方依次写入：`recoverPreviousWriter` 成功后 `starting`（不带 `writer`）；pi 拉起后、加载前写入 `writer` 并改为 `running`（`spawnWriter` 自动完成）；停止时 `stopping`；确认 pi 及其进程树已退出后调用 `release()`，写 `released` 并释放锁。
-- `release()` 只有在本宿主写过记录（`recoverPreviousWriter` 成功）时才写 `released`；`recoverPreviousWriter` 返回 `failed` 后记录保持原样。
+- 持锁方依次写入：`recoverPreviousWriter` 成功后 `starting`（不带 `writer`）；pi 拉起后、加载前写入 `writer` 并改为 `running`（`spawnWriter` 自动完成）；停止时 `stopping`；确认 pi 已退出后调用 `release()`，写 `released` 并释放锁。会话写锁只约束 pi 对会话文件的写入，pi 已退出但后代仍在时允许释放；使用方根据 `StopReport` 报告后代残留。`snapshot_visible` 加上空的 `leftovers` 也不能证明整棵进程树一个都没剩。
+- `release()` 由 hostkit 核对记录里的 `writer`：无写者或 `isSameProcess` 确认已退出时才允许释放；写者仍在或核对失败时抛出 `EHOSTKIT_LOCK_STATE`，锁与记录不变。`release({ writerSwitchedAway: true })` 由调用方确认写者已切走，跳过退出核对，用于下节定义的进程内切换。
+- 本宿主恢复成功后，两种释放都先写 `released`，写成功后才释放内核锁并改内存状态；写失败时锁、记录与内存状态不变，可以重试。不提供写失败后强制释放的路径。尚未恢复的锁释放时不改旧记录；恢复返回 `failed` 或抛错时自动释放，记录保持原样。
 - 宿主崩溃时不会写 `released`，记录停在最后一个状态，供下一个持锁方恢复。
 
 #### 取得锁的时机
@@ -400,7 +409,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 - 带叶子的 `fork` 和 `clone`：分支上已有对话时，pi 在 `session_shutdown` 之前就写出新文件（依据：`dist/core/session-manager.js` 的 `createBranchedSession`、`dist/core/agent-session-runtime.js` 的 `fork`），宿主只能在写入之后取锁。新文件名带新生成的会话 id，其他宿主不会预先持有它的锁，所以实际不会冲突。
 - 取锁失败时（理论上只有路径冲突），新会话已经无法取消。宿主停止向该进程发送任何输入，终止该进程（按“进程树终止”），把会话标为中断并告诉使用方。不论切换由宿主的 RPC 还是扩展命令发起，处理都一样。
 
-切换成功后，旧文件的锁在新会话的 `session_start` 之后释放（记录写为 `released`），不必等 pi 退出：`session_start` 之前 pi 已对旧实例发出 `session_shutdown` 并拆除旧运行时，不会再写旧文件。切换失败时（没有等到新会话的 `session_start`，且 RPC `get_state` 的 `sessionFile` 仍是旧文件），宿主释放已取得的目标锁。agora 的协作会话禁止会话替换：daemon 不发这几种 RPC，agora 扩展注册 `session_before_switch` 和 `session_before_fork`，一律返回 `{ cancel: true }`。pi 只要有一个处理器返回取消，就不再执行后面的处理器并取消替换（依据：`dist/core/extensions/runner.js:813–825`），所以 implement 档位按白名单加载的其他扩展也无法发起替换。
+切换成功后，旧文件的锁在新会话的 `session_start` 之后用 `release({ writerSwitchedAway: true })` 释放（记录写为 `released`），不必等 pi 退出：`session_start` 之前 pi 已对旧实例发出 `session_shutdown` 并拆除旧运行时，不会再写旧文件。切换失败时（没有等到新会话的 `session_start`，且 RPC `get_state` 的 `sessionFile` 仍是旧文件），宿主释放已取得的目标锁。agora 的协作会话禁止会话替换：daemon 不发这几种 RPC，agora 扩展注册 `session_before_switch` 和 `session_before_fork`，一律返回 `{ cancel: true }`。pi 只要有一个处理器返回取消，就不再执行后面的处理器并取消替换（依据：`dist/core/extensions/runner.js:813–825`），所以 implement 档位按白名单加载的其他扩展也无法发起替换。
 
 宿主与桥接扩展还要遵守：
 
@@ -446,7 +455,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 #### 外部写者与协议版本
 
 - 终端里直接运行的 pi 不参与这个协议，pi-hostkit 无法发现它。如何处理这种外部写者由使用方决定（pi-pane 见其 `docs/architecture.md`）。
-- 协议版本体现在名称中（`v1`）。改变锁文件或 mutex 的名称和位置、会话 key 的算法、共享记录的格式或语义，都属于不兼容修改，pane 和 agora 必须同时升级。
+- 协议版本体现在名称中（`v1`）。pane 和 agora 尚未接入，所以这里的 Windows Global/SID 名称和释放语义仍使用 `v1`。改变锁文件或 mutex 的名称和位置、会话 key 的算法、共享记录的格式或语义，都属于不兼容修改，pane 和 agora 必须同时升级。
 
 ## 密钥目录权限
 
@@ -495,10 +504,14 @@ export function isAncestorOf(dir: string, target: string): boolean;  // dir 是 
 3. **真实路径**（`realPathOrPending`）：`fs.realpathSync.native` 解析符号链接和 Windows junction。目标不存在时（如 `write` 新文件），对最深的已存在祖先取真实路径，再拼上其余部分。悬空的符号链接被跟随到它指向的位置，即写入实际创建文件的位置；超过 40 层链接时抛出 `ELOOP`。比较路径前两方都必须是真实路径（macOS 上同一个临时目录可能表现为 `/private/var` 或 `/var`）。
 4. **比较键**（`comparisonKey`）：
    - Windows：分隔符统一为 `\`，去掉 `\\?\` 前缀（`\\?\UNC\` 转为 `\\`），折叠大小写（与 pi 的 `getPathComparisonKey` 一致，忽略 NTFS 按目录开启的大小写敏感）。
-   - macOS：转为 NFC 并折叠大小写（默认 APFS 卷不区分大小写，对 Unicode 规范化不敏感）。
+   - macOS：先证实路径所在卷不区分大小写，再转为 NFC 并折叠大小写。大小写敏感或无法探测时抛出 `EHOSTKIT_CASE_SENSITIVE_FS`，不进行包含判断或生成锁 key。默认 APFS 上的比较行为不变。
    - Linux：不变。
 
 `isWithin` 和 `isAncestorOf` 比较两个真实路径的比较键，按路径分隔符判断，`/a/bc` 不在 `/a/b` 之下。
+
+macOS 的探测只使用 JavaScript 的 `stat`、`readdir`、`lstat`：定位最近的已存在祖先及其真实目录，在同一设备上寻找带 ASCII 字母且没有另一种真实拼写的目录项，改变一个字母的大小写后对比 `dev` 和 `ino`。同一 inode 证明大小写别名相同；别名不存在或不同则视为敏感。目录项不能来自其他挂载设备；向上寻找时不跨设备，文件级挂载也不借用父目录的结论。权限错误、零 inode、只有数字或两种真实拼写等导致无法证明时拒绝，不写探测文件、不缓存设备结论。`canonicalPath` 和 `comparisonKey` 都执行检查，所以允许的根目录、目标文件和会话锁 key 都受约束；路径两边分别检查。这个入口不加载原生模块。
+
+pi 1.5.0 的 `dist/utils/paths.js#getPathComparisonKey` 只在 Windows 折叠大小写，在 macOS 保留拼写；工具路径解析和读文件变体仍按 pi 的实际规则执行。hostkit 的 macOS NFC/大小写比较用于锁和访问范围校验，是额外的平台约束；因此明确拒绝大小写敏感卷，而不声称 pi 本身不支持这种卷。
 
 pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-hostkit 自行实现同样的规则。`test/paths.test.mjs` 直接导入 pi 1.5.0 的内部模块逐项比对；升级支持的 pi 版本时先跑这组测试。
 
@@ -515,7 +528,7 @@ pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-h
 | 读取命令行 | `NtQueryInformationProcess` + `CommandLineToArgvW` | `KERN_PROCARGS2` | `/proc/<pid>/cmdline` |
 | 密钥权限 | 受保护 DACL | `0700/0600`，无扩展 ACL | `0700/0600` |
 | 本地磁盘检查 | 驱动器类型、UNC | `MNT_LOCAL` | `statfs` 魔数 |
-| 路径比较 | 折叠大小写、统一分隔符 | 折叠大小写、NFC | 原样 |
+| 路径比较 | 折叠大小写、统一分隔符 | 证实卷不区分大小写后折叠大小写、NFC，否则拒绝 | 原样 |
 
 ## 验证状态
 
@@ -533,14 +546,18 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **Linux cgroup**：CI 开启用户 systemd 实例并要求 cgroup 可用；另一轮以 `containment: "snapshot"` 覆盖快照模式。
 - **密钥权限**：`ensurePrivateDir` 创建与收紧、`writePrivateFile` 排他且私有、父目录不私密时拒绝写入、Windows 上带私密 DACL 创建文件、`checkPrivate` 报告过宽的权限；macOS 上扩展 ACL 被报告并被 `ensurePrivateDir` 清除。
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。
-- **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法、非 pi 目录被拒、经 `npm root -g` 找到全局安装。
+- **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法和显式失败不回退；临时 HOME 的官方安装布局、环境变量优先级、激活版本切换、损坏 marker/路径穿越/版本不符/CLI 缺失后的 npm 回退；自动定位安装。测试通过隔离副本注入 npm 根目录，不依赖 CI 机器有官方安装。
 - **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
+- **故障注入**：释放记录改名失败后锁与记录保持原样、可重试（含会话切换）；活写者和查询失败拒绝普通释放、显式切走可释放；单个后代 `EPERM` 或查询失败时其他后代与 pi 进程组继续清理，失败进入报告；RPC gate/命令/UI 有序背压、UTF-8/LF 字节限额、超限恢复、序列化抛错无 pending/计时器残留、写回调或同步写失败清理。Windows 验证 Global/SID 名称、创建的 owner/DACL、真实异主对象即使 DACL 允许 FullControl 也拒绝；CI 要求该异主测试执行，本机未提权可明确跳过。
+- **macOS 卷检测**：隔离测试副本注入探测函数及文件系统调用，覆盖敏感、不明、权限错误、挂载边界、文件级挂载、大小写硬链接、符号链接目标；确认 `pi-hostkit/paths` 禁用 native 加载仍可工作。测试接口不进入生产源码或公开类型化 API；快照依赖注入只在不导出的内部模块，进程查询模拟只在显式启用 Node 测试模块 mock 的子进程中使用。没有生产环境变量测试开关。
 - **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超过 1024 次超时后迟到响应也不会交给复用了调用方 id 的新命令、非法 JSON、stdout 结束、监听器异常。
 
 CI 还为 linux x64/arm64、darwin arm64/x64、win32 x64/arm64 构建预编译模块，并在非交叉编译的平台上加载一次。
 
 ### 尚未验证
 
+- 同一 Windows 用户在两个真实登录会话中同时争用 Global mutex；CI 验证的是跨进程互斥、名称和安全属性。
+- 真正的 macOS 大小写敏感 APFS 挂载；默认卷跑集成测试，敏感/不明卷通过隔离注入验证 fail closed。
 - 真实的 PID 复用和机器重启后的身份判断（测了伪造创建时间的记录，以及记录的 PID 属于另一个进程组组长的情况）。
 - 身份检查与发信号之间的竞态（见“剩余风险”），以及 Linux pidfd 的进程组信号在 6.9 之前的内核上的退回路径。
 - Windows 进程表快照之后 PID 被复用的故障注入；cgroup 子树（scope 下另建子 cgroup）中的残留；进程表查询失败（权限、I/O 错误）的故障注入。

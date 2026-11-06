@@ -15,7 +15,7 @@ pi-hostkit 封装托管 [pi](https://www.npmjs.com/package/@earendil-works/pi-co
 
 | 模块 | 主要接口 | 内容 |
 | --- | --- | --- |
-| 定位 pi | `locatePi` | 按配置的 `piPath` 或全局 npm 目录找到 pi，检查版本 |
+| 定位 pi | `locatePi` | 按 `piPath`、官方安装目录、全局 npm 目录的顺序找到 pi，检查版本 |
 | RPC 传输 | `StdioRpcTransport` | pi RPC 的 JSONL 传输：只按 LF 分帧、按 `id` 关联响应、超时、扩展 UI 请求 |
 | 受管进程 | `spawnManaged`、`stopByIdentity`、`isSameProcess` | 经启动门闩拉起 pi、记录进程身份（PID + 创建时间）、停止 pi 及其后代进程 |
 | 锁 | `acquireInstanceLock`、`acquireSessionWriterLock` | 单实例锁；跨 pi-pane 和 pi-agora 的会话写锁及遗留写者的恢复 |
@@ -65,6 +65,7 @@ import {
   acquireSessionWriterLock,
   currentProcessIdentity,
   isSessionWriterLock,
+  isSameProcess,
   locatePi,
 } from "pi-hostkit";
 
@@ -98,8 +99,18 @@ const state = await proc.rpc.send({ type: "get_state" }, { timeoutMs: 10_000 });
 // 关闭会话
 await lock.update({ state: "stopping" });
 const report = await proc.stop(); // abort → 关闭 stdin → 终止进程树 → 复查
-await lock.release();
+if (report.leftovers.some((p) => p.pid === proc.identity.pid && p.startTime === proc.identity.startTime)
+    || (await isSameProcess(proc.identity)) !== "gone") {
+  console.error("pi 未确认退出，保留会话写锁", report);
+  return;
+}
+if (report.leftovers.length) console.error("pi 已退出，但仍有后代存活或状态不明", report);
+await lock.release(); // 再次核对 pi 已退出；核对或写记录失败时保留锁，可重试
 ```
+
+进程内切换会话时，先取得目标会话的锁；确认新会话的 `session_start` 后，用 `await oldLock.release({ writerSwitchedAway: true })` 释放旧文件的锁。该选项由调用方确认 pi 已切走，具体时机和切换失败的处理见[会话写锁协议](docs/design.md#取得锁的时机)。
+
+`release()` 只要求写会话文件的 pi 已退出；残留后代由调用方根据 `StopReport` 报告。`snapshot_visible` 即使 `leftovers` 为空，也不能证明整棵进程树没有残留。
 
 完整接口和各平台行为见 [docs/design.md](docs/design.md)。
 

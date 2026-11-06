@@ -16,6 +16,7 @@
 | `src/locate.ts` | `locatePi`、支持的 pi 版本区间（`SUPPORTED_PI_RANGE`） |
 | `src/rpc.ts` | `JsonlSplitter`（按 LF 分帧）和 `StdioRpcTransport`（命令与响应关联、事件分发、错误类） |
 | `src/process.ts` | `spawnManaged`、`ManagedProcess.stop`、`stopByIdentity`、`isSameProcess`；Linux cgroup scope 的检测与终止；快照模式的记录与终止 |
+| `src/snapshots.ts` | 快照记录及逐目标停止、错误收集、退出复查；不作为包入口导出，测试通过内部依赖注入模拟权限和查询错误 |
 | `src/gate.ts` | 启动门闩，编译为独立入口 `dist/gate.js`，由 `spawnManaged` 作为子进程的脚本运行 |
 | `src/gate-protocol.ts` | 门闩放行行和拒绝退出码，宿主和 gate 共用 |
 | `src/proctable.ts` | 进程表与进程身份：Linux 读 `/proc`，macOS 和 Windows 调用原生模块；后代查找、身份比较、读取命令行 |
@@ -62,6 +63,10 @@ npm test
 | 文件 | 内容 |
 | --- | --- |
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
+| `test/locate.test.mjs` | 临时 HOME 的官方安装布局、环境变量优先级、激活切换、npm 回退；只在隔离模块副本中替换 npm 查询 |
+| `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
+| `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、继续清理与 `StopReport` |
+| `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
 | `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
 | `test/gate.test.mjs` | 启动门闩本身：用 `test/fixtures/marker-entry.mjs` 代替 pi 的入口，检查拒绝放行时入口没有加载、放行后入口拿到的参数和下一行输入 |
 | `test/paths.test.mjs` | 路径规则；与 pi 1.5.0 内部模块 `dist/utils/paths.js`、`dist/core/tools/path-utils.js` 的差分比对 |
@@ -73,13 +78,13 @@ npm test
 | `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |
 | `test/fixtures/fake-provider.ts` | 按脚本回复的本地 provider，pi 以 `-e` 加载；测试不联网，也不需要模型服务的密钥 |
 
-`test/locks.test.mjs` 把 `HOME`（Windows 上 `USERPROFILE`）指向临时目录，不碰真实的 `~/.pi/hostkit/locks`。
+`test/locks.test.mjs` 把 `HOME`（Windows 上 `USERPROFILE`）指向临时目录，不碰真实的 `~/.pi/hostkit/locks`。释放记录失败通过测试进程临时替换内置 fs 调用注入，并在 `finally` 恢复；写者查询错误在 `test/fixtures/release-query-fault.mjs` 的独立子进程中用 `--experimental-test-module-mocks` 注入，不改变生产 API。Windows 异主 mutex 测试需要可指定其他 owner 的提权令牌，本机未提权时明确跳过；CI 要求真正执行。
 
 环境变量：
 
 | 变量 | 作用 |
 | --- | --- |
-| `PI_PACKAGE` | pi 的包目录。设置后不使用全局安装，并跳过“经 `npm root -g` 查找”的用例 |
+| `PI_PACKAGE` | pi 的包目录。设置后测试使用该安装，并跳过自动定位 smoke 用例；隔离 HOME 的定位测试仍执行 |
 | `HOSTKIT_TEST_CONTAINMENT` | `auto`（默认）或 `snapshot`，传给 `spawnManaged` 的 `containment`；在 Linux 上用 `snapshot` 测试快照模式 |
 | `HOSTKIT_TEST_REQUIRE_CGROUP` | 设为 `1` 时，Linux 上 cgroup v2 user scope 不可用则测试失败；用于防止 CI 静默退回快照模式 |
 | `KEEP_FIXTURES` | 设置后保留测试的临时目录，便于排查 |
@@ -113,7 +118,7 @@ npm test
 
 - **接口与行为**：修改公开接口、默认值或平台行为时，同步更新 [design.md](design.md)，并在 pi-pane、pi-agora 中检查引用它的文档。
 - **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 和 `test/piargs.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。
-- **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；需要不兼容修改时改用新的协议版本名。
+- **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；接入方使用后需要不兼容修改时改用新的协议版本名；接入前的 Global/SID 名称与释放语义使用 `v1`，见 design.md。
 - **启动门闩**：`src/gate.ts` 只依赖 `src/gate-protocol.ts` 和 Node 内置模块，不加载原生模块，在 pi 加载之前不做多余的事。修改放行行或退出码时，宿主和 gate 必须来自同一版本的 pi-hostkit。
 - **原生函数**：增加或修改原生函数时，同时修改对应的 C 文件和 `src/native.ts` 的 `NativeBinding`。只在部分平台存在的函数声明为可选，经 `nativeFn` 调用（不存在时抛出 `ENOTSUP`）。
 - **`pi-hostkit/paths`**：`src/paths.ts` 不导入 `src/native.ts` 或其他会加载原生模块的文件，因为这个入口在 pi 进程里的扩展中使用。
