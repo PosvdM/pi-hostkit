@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { readFile, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { resolveToolPath } from "./paths.js";
 
 export const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 /** Supported pi versions: `>=1.5.0 <1.6.0`. */
@@ -56,10 +57,14 @@ async function installAt(dir: string): Promise<PiInstall> {
   const relative = typeof bin === "string" ? bin : (bin as Record<string, string> | undefined)?.pi;
   if (!relative) throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `${packageDir}/package.json has no bin.pi`);
   const cliEntry = path.join(packageDir, relative);
+  let cliInfo;
   try {
-    await stat(cliEntry);
+    cliInfo = await stat(cliEntry);
   } catch {
     throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `pi entry ${cliEntry} does not exist`);
+  }
+  if (!cliInfo.isFile()) {
+    throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `pi entry ${cliEntry} is not a file`);
   }
   const version = String(pkg.version ?? "");
   return { packageDir, cliEntry, version, supported: isSupportedPiVersion(version) };
@@ -91,9 +96,8 @@ function managedInstallRoots(): string[] {
   if (configuredRoot) roots.push(path.resolve(configuredRoot));
   const configuredAgent = process.env.PI_CODING_AGENT_DIR;
   if (configuredAgent) {
-    const agent = configuredAgent === "~" ? homedir()
-      : configuredAgent.startsWith("~/") || (process.platform === "win32" && configuredAgent.startsWith("~\\"))
-        ? path.join(homedir(), configuredAgent.slice(2)) : configuredAgent;
+    // The base uses pi normalizePath defaults: preserve Unicode spaces and a leading @.
+    const agent = resolveToolPath(".", configuredAgent);
     roots.push(path.resolve(agent, "install"));
   }
   roots.push(path.join(homedir(), ".pi", "agent", "install"));

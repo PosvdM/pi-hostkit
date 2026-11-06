@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 const run = promisify(execFile);
 const packageParts = ["@earendil-works", "pi-coding-agent"];
@@ -24,7 +25,9 @@ async function packageAt(dir, version = "1.5.0", { cli = true } = {}) {
   await writeFile(path.join(dir, "package.json"), JSON.stringify({
     name: packageParts.join("/"), version, bin: { pi: "dist/bundle/cli.js" },
   }));
-  if (cli) await writeFile(path.join(dir, "dist", "bundle", "cli.js"), "// fixture\n");
+  const entry = path.join(dir, "dist", "bundle", "cli.js");
+  if (cli === "directory") await mkdir(entry);
+  else if (cli) await writeFile(entry, "// fixture\n");
   return dir;
 }
 
@@ -41,6 +44,7 @@ async function locateIn(home, env = {}, actions = [{}]) {
     import { readFile, writeFile } from "node:fs/promises";
     import path from "node:path";
     let source = await readFile(new URL(${JSON.stringify(locateUrl)}), "utf8");
+    source = source.replaceAll('"./paths.js"', ${JSON.stringify(JSON.stringify(new URL("../dist/paths.js", import.meta.url).href))});
     source += '\\nlet testNpmCalls = 0; npmRootGlobal = async () => { testNpmCalls++; if (!process.env.HOSTKIT_TEST_NPM_ROOT) throw Object.assign(new Error("npm unavailable"), { code: "EHOSTKIT_PI_NOT_FOUND" }); return process.env.HOSTKIT_TEST_NPM_ROOT; }; export function npmCalls() { return testNpmCalls; }';
     const mod = await import("data:text/javascript;base64," + Buffer.from(source).toString("base64"));
     const results = [];
@@ -63,10 +67,16 @@ async function locateIn(home, env = {}, actions = [{}]) {
       ...env,
       HOSTKIT_TEST_ACTIONS: JSON.stringify(actions),
     },
+    cwd: home,
     timeout: 10_000,
   });
   return JSON.parse(stdout);
 }
+
+test("README test instructions include official script, npm, and PI_PACKAGE installs", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+  assert.match(readme, /^npm test[^\r\n]*官方脚本[^\r\n]*全局 npm[^\r\n]*PI_PACKAGE/m);
+});
 
 test("explicit piPath wins over managed installs and invalid explicit paths never fall back", async (t) => {
   const f = await fixture(t);
@@ -78,6 +88,21 @@ test("explicit piPath wins over managed installs and invalid explicit paths neve
   assert.equal(result.results[0].install.packageDir, explicit);
   assert.deepEqual(result.results[0], result.results[1]);
   assert.deepEqual(result.results[2], { error: "EHOSTKIT_PI_NOT_FOUND" });
+});
+
+test("explicit piPath rejects a package whose bin.pi is a directory without falling back", async (t) => {
+  const f = await fixture(t);
+  await managedAt(f.defaultRoot, "1.5.1");
+  const explicit = await packageAt(path.join(f.root, "directory-entry"), "1.5.0", { cli: "directory" });
+  const result = await locateIn(f.home, {}, [
+    { piPath: explicit },
+    { piPath: path.join(explicit, "dist", "bundle", "cli.js") },
+  ]);
+  assert.equal(result.npmCalls, 0);
+  assert.deepEqual(result.results, [
+    { error: "EHOSTKIT_PI_NOT_FOUND" },
+    { error: "EHOSTKIT_PI_NOT_FOUND" },
+  ]);
 });
 
 test("default official layout is found without npm and only current-version selects the release", async (t) => {
@@ -104,6 +129,63 @@ test("managed root env, agent env, and default HOME layout are tried in order", 
   assert.deepEqual(result.results.map((r) => r.install.packageDir), [configured, byAgent, byHome]);
 });
 
+test("agent env accepts file URLs with escaped path characters", async (t) => {
+  const f = await fixture(t);
+  const agent = path.join(f.home, "agent #percent% space\u00A0");
+  const expected = await managedAt(path.join(agent, "install"));
+  await managedAt(f.defaultRoot, "1.5.1");
+  const result = await locateIn(f.home, { PI_CODING_AGENT_DIR: pathToFileURL(agent).href });
+  assert.equal(result.npmCalls, 0);
+  assert.equal(result.results[0].install.packageDir, expected);
+});
+
+test("agent env preserves a leading @, Unicode spaces, and ASCII whitespace", async (t) => {
+  const f = await fixture(t);
+  const names = ["@agent\u00A0\u2003\u202F\u3000", " agent"];
+  const expected = [];
+  for (const name of names) expected.push(await managedAt(path.join(f.home, name, "install")));
+  await managedAt(f.defaultRoot, "1.5.1");
+  const result = await locateIn(f.home, {}, names.map((name) => ({ env: { PI_CODING_AGENT_DIR: name } })));
+  assert.equal(result.npmCalls, 0);
+  assert.deepEqual(result.results.map((r) => r.install.packageDir), expected);
+});
+
+test("agent env expands a bare tilde and tilde path separators", async (t) => {
+  const f = await fixture(t);
+  const atHome = await managedAt(path.join(f.home, "install"));
+  const inHome = await managedAt(path.join(f.home, "custom-agent", "install"), "1.5.1");
+  const values = ["~", "~/custom-agent"];
+  if (process.platform === "win32") values.push("~\\custom-agent");
+  const result = await locateIn(f.home, {}, values.map((value) => ({ env: { PI_CODING_AGENT_DIR: value } })));
+  assert.equal(result.npmCalls, 0);
+  assert.deepEqual(result.results.map((r) => r.install.packageDir), [atHome, ...values.slice(1).map(() => inHome)]);
+});
+
+test("Windows agent env accepts Git Bash, WSL, and Cygwin drive paths", { skip: process.platform !== "win32" }, async (t) => {
+  const f = await fixture(t);
+  const agent = path.join(f.home, "shell-agent");
+  const expected = await managedAt(path.join(agent, "install"));
+  await managedAt(f.defaultRoot, "1.5.1");
+  const native = agent.replaceAll("\\", "/");
+  assert.match(native, /^[A-Za-z]:\//, "the fixture must be on a drive-letter path");
+  const drive = native[0].toLowerCase();
+  const suffix = native.slice(2);
+  const values = [`/${drive}${suffix}`, `/mnt/${drive}${suffix}`, `/cygdrive/${drive}${suffix}`];
+  const result = await locateIn(f.home, {}, values.map((value) => ({ env: { PI_CODING_AGENT_DIR: value } })));
+  assert.equal(result.npmCalls, 0);
+  assert.deepEqual(result.results.map((r) => r.install.packageDir), values.map(() => expected));
+});
+
+test("a managed bin.pi directory falls back to the next official candidate before npm", async (t) => {
+  const f = await fixture(t);
+  const broken = path.join(f.root, "broken-managed");
+  await managedAt(broken, "1.5.0", { cli: "directory" });
+  const expected = await managedAt(f.defaultRoot, "1.5.1");
+  const result = await locateIn(f.home, { PI_MANAGED_INSTALL_ROOT: broken });
+  assert.equal(result.npmCalls, 0);
+  assert.equal(result.results[0].install.packageDir, expected);
+});
+
 test("managed activation is reread and an unsupported active release is not hidden by npm", async (t) => {
   const f = await fixture(t);
   const first = await managedAt(f.defaultRoot, "1.5.0");
@@ -124,6 +206,7 @@ test("invalid or incomplete managed installs fall back to the npm root", async (
     "missing release": { currentVersion: "1.5.8" },
     "version mismatch": { packageVersion: "1.5.2" },
     "missing CLI": { cli: false },
+    "directory CLI": { cli: "directory" },
   })) {
     await t.test(name, async (t) => {
       const f = await fixture(t);

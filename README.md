@@ -119,7 +119,7 @@ await lock.release(); // 再次核对 pi 已退出；核对或写记录失败时
 ```sh
 npm install      # 依赖、原生模块、dist/
 npm run build    # 只重新编译 TypeScript
-npm test         # 需要全局安装 pi 1.5.0，或用 PI_PACKAGE 指向 pi 的包目录
+npm test         # 需要通过官方脚本或全局 npm 安装 pi 1.5.0，或用 PI_PACKAGE 指向 pi 的包目录
 ```
 
 源码结构、原生模块的构建、测试的环境变量和 CI 见 [docs/development.md](docs/development.md)。
