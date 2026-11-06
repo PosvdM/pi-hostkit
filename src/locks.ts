@@ -478,7 +478,12 @@ class WriterLock implements SessionWriterLock {
       void proc.exited.then(() => {
         if (this.writer === proc) this.writerExited = true;
       });
-      proc.release();
+      try {
+        proc.release();
+      } catch (error) {
+        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        throw error;
+      }
       return proc;
     });
   }

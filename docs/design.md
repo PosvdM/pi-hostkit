@@ -110,7 +110,7 @@ export class JsonlSplitter { /* 按 LF 切分字节流，供测试和其他传�
 
 - **只按 LF 切分**：stdout 按字节流读，遇到 `\n` 切出一条记录，去掉末尾一个可选的 `\r`，再按 UTF-8 解码（LF 不会出现在多字节 UTF-8 序列中间）。不用 Node 的 `readline`：它还会在 `U+2028`、`U+2029` 处切分，而这两个字符可以合法出现在 JSON 字符串里。
 - **写入**：门闩放行行、普通 RPC 和 UI 回应共用一个 FIFO。每条 RPC 先序列化为 JSON 加 LF，再登记等待响应的条目和计时器；序列化失败不留下 pending 或计时器。`write()` 返回 false 后等待 `drain`，再写下一条。
-- **发送缓冲上限**：`maxQueuedBytes` 默认 64 MiB，必须是正安全整数；按 UTF-8 字节数计入 LF、内部队列和已交给流但写回调尚未完成的数据。超过上限时，该次 `send` 以 `EHOSTKIT_RPC_QUEUE_FULL` 拒绝，`respondUi` 同步抛出同码错误，不让传输失效。超时不撤回已排队的数据，但队列总字节数受上限约束；调用方应限制单条消息和并发发送量。序列化本身仍需临时内存，上限不约束调用方持有的消息或序列化期间的内存。
+- **发送缓冲上限**：`maxQueuedBytes` 默认 64 MiB，必须是正安全整数；`SpawnSpec` 的值还必须容纳完整的门闩放行行，否则在拉起子进程前以 `EINVAL` 拒绝；按 UTF-8 字节数计入 LF、内部队列和已交给流但写回调尚未完成的数据。超过上限时，该次 `send` 以 `EHOSTKIT_RPC_QUEUE_FULL` 拒绝，`respondUi` 同步抛出同码错误，不让传输失效。超时不撤回已排队的数据，但队列总字节数受上限约束；调用方应限制单条消息和并发发送量。序列化本身仍需临时内存，上限不约束调用方持有的消息或序列化期间的内存。
 - **分发**：`type` 为 `response` 的记录按 `id` 交给等待中的 `send`；`extension_ui_request` 交给 `onUiRequest`；其余交给 `onEvent`。
 - **单条记录上限**：默认 64 MiB（`DEFAULT_MAX_RECORD_BYTES`，含图片的消息可能很大）。
 - **协议错误**：记录超过上限、不是合法 JSON、不是带字符串 `type` 的对象，或 stdout 结束时留有不以 LF 结尾的半条记录，都是协议错误（`RpcProtocolError`，`EHOSTKIT_RPC_PROTOCOL`）。传输层随即失效：通过 `onError` 报告，未完成的命令以该错误拒绝，之后的 `send` 也被拒绝。使用方应终止该次运行。
@@ -540,7 +540,7 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **pi 参数规则**：`parsePiArgs` 与 pi 1.5.0 的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models`、`--tools` 写法错误、`@file` 等情况；依赖 pi 环境的路径（相对、`~`、Windows 无盘符）判为无法判断，`spawnWriter` 拒绝它们。
 - **跨宿主恢复**：宿主进程用 `spawnWriter` 拉起 pi 后被强杀，另一个宿主取锁并停止遗留写者（用例以 pi-pane 为前者、pi-agora 为后者；`app` 字段只是标签，两个方向走同一代码路径）。Windows 上 pi 随 Job 终止，结果为 `none` 或 `stopped`（Job 结束可能略晚于 mutex 被释放）。
 - **fail closed**：宿主在 pi 停在 gate 时被杀，gate 自行退出，下一个持锁方得到 `failed`，`assumeNoWriter` 后为 `none`；仍停在 gate 的未记录进程按命令行找到并停止；打开 `<会话>.bak` 的 gate、`--session <会话>` 出现在 `--` 之后（只是消息）的 gate、`--session` 为相对路径的 gate 都不被停止，结果为 `failed`；不按协议放行的未记录 pi 无法排除时返回 `failed`；记录不是合法 JSON 或内容不完整时返回 `failed` 且记录不变。
-- **启动门闩**：用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
+- **启动门闩**：小于放行行的发送限额在 spawn 前被拒；从不读取 stdin 的真实子进程验证发送队列限额与停止。用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
 - **进程树终止**：`bash` 工具及脱离 pi 进程组（POSIX 用 `setsid`）的后台进程都被清理，除 `leftovers` 为空外还在测试进程里独立确认该后台进程已不存在（三个平台）；pi 先被 SIGKILL、后代仍在时，`stop` 仍清理后代（三种覆盖方式）；`abort` 超时仍完成停止；`stop` 重复调用返回同一结果；`StopOptions` 显式 `undefined` 用默认值、`NaN` 和 `Infinity` 被拒；`coverage` 与平台和模式相符。
 - **进程身份**：创建时间不符的身份判为 `gone`；`stopByIdentity` 不对创建时间不符的身份发信号，并能停止被强杀宿主留下的 pi（macOS、Linux；Windows 上验证 pi 随 Job 终止）；记录的 PID 已成为另一个进程组的组长时，该组不会收到信号（macOS、Linux）；读进程表期间父进程的 PID 换了进程时，经由它找到的行被丢掉（用构造的进程表测试）；不是 pi-hostkit 创建的 cgroup 路径不会被整体终止（Linux）。
 - **Linux cgroup**：CI 开启用户 systemd 实例并要求 cgroup 可用；另一轮以 `containment: "snapshot"` 覆盖快照模式。

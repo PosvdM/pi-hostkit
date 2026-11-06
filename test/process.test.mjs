@@ -43,6 +43,36 @@ function escapingCommand(pidFile) {
 }
 
 describe("spawnManaged", () => {
+  test("rejects a queue limit that cannot fit the gate line before spawning", async () => {
+    const f = await fixture();
+    for (const maxQueuedBytes of [0, 1, -1, 1.5, Infinity, NaN]) {
+      await assert.rejects(spawnManaged({ argv: await piArgv(), ...spec(f), maxQueuedBytes }), { code: "EINVAL" });
+    }
+  });
+
+  test("a child that never reads stdin cannot grow the RPC queue beyond its byte limit", async () => {
+    const f = await fixture();
+    const limit = 16 * 1024;
+    const proc = await spawnManaged({
+      argv: [path.join(here, "fixtures", "nonreading-entry.mjs")],
+      ...spec(f), maxQueuedBytes: limit,
+    });
+    const pending = [];
+    try {
+      await waitForEvent(proc.rpc, (event) => event.type === "nonreading_ready");
+      for (let i = 0; i < 64; i++) {
+        pending.push(proc.rpc.send({ type: "prompt", message: "x".repeat(4_096) }).catch((error) => error));
+      }
+      assert.ok(proc.rpc.queuedBytes <= limit);
+    } finally {
+      const report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+      assert.deepEqual(report.leftovers, []);
+    }
+    const results = await Promise.all(pending);
+    assert.ok(results.some((result) => result.code === "EHOSTKIT_RPC_QUEUE_FULL"));
+    assert.equal(await isSameProcess(proc.identity), "gone");
+  });
+
   test("starts pi and answers get_state", async () => {
     const f = await fixture();
     const proc = await spawnManaged({ argv: await piArgv(), ...spec(f) });

@@ -61,7 +61,7 @@ export interface SpawnSpec {
   containment?: Containment;
   /** Maximum bytes of one RPC record; default 64 MiB. */
   maxRecordBytes?: number;
-  /** Maximum queued RPC input bytes, including in-flight writes; default 64 MiB. */
+  /** Maximum queued RPC input bytes; default 64 MiB, at least one gate release line. */
   maxQueuedBytes?: number;
   /** Snapshot interval while a tool runs (snapshot coverage only); default 5000. */
   snapshotIntervalMs?: number;
@@ -530,6 +530,10 @@ class Managed implements ManagedProcess {
  */
 export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
   if (!spec.argv.length) throw hostkitError("EINVAL", "argv must start with the pi cli entry");
+  if (spec.maxQueuedBytes !== undefined &&
+      (!Number.isSafeInteger(spec.maxQueuedBytes) || spec.maxQueuedBytes < Buffer.byteLength(`${GATE_RELEASE_LINE}\n`))) {
+    throw hostkitError("EINVAL", "maxQueuedBytes must be a safe integer large enough for the gate release line");
+  }
   const containment = spec.containment ?? "auto";
   const systemdRun = containment === "auto" ? await linuxCgroupSupport() : null;
   const unit = systemdRun ? scopeUnit(spec.runId) : undefined;
@@ -598,7 +602,14 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
   const rpc = new StdioRpcTransport(child.stdin!, child.stdout!, { maxRecordBytes: spec.maxRecordBytes, maxQueuedBytes: spec.maxQueuedBytes });
   rpc.block("pi is held at the start gate; call release() first");
   const managed = new Managed(child, identity!, mode, rpc, spec.snapshotIntervalMs ?? 5_000);
-  if (!spec.startHeld) managed.release();
+  if (!spec.startHeld) {
+    try {
+      managed.release();
+    } catch (error) {
+      await managed.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+      throw error;
+    }
+  }
   return managed;
 }
 
