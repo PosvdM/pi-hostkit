@@ -151,6 +151,37 @@ export function descendants(table: ProcessRow[], root: { pid: number; startTime:
   return result;
 }
 
+/**
+ * `descendants`, keeping only rows whose whole chain of parents up to `root`
+ * still has the same identity after the table was read. Linux reads `/proc`
+ * one process at a time, so a parent could exit and its PID be reused by an
+ * unrelated process while the table is being read; that process's children
+ * would then look like descendants. Re-reading every parent afterwards drops
+ * them (a parent that is still the same process was alive the whole time).
+ * Children of a parent that exited during the read are dropped as well.
+ */
+export function verifiedDescendants(table: ProcessRow[], root: { pid: number; startTime: string }): ProcessRow[] {
+  const found = descendants(table, root);
+  const byPid = new Map(found.map((row) => [row.pid, row]));
+  const verdict = new Map<number, boolean>();
+  const stillSame = (pid: number): boolean => {
+    let ok = verdict.get(pid);
+    if (ok === undefined) {
+      const recorded = pid === root.pid ? root : byPid.get(pid);
+      ok = !!recorded && matches(processInfo(pid), recorded);
+      verdict.set(pid, ok);
+    }
+    return ok;
+  };
+  return found.filter((row) => {
+    for (let parent = row.ppid; ; ) {
+      if (!stillSame(parent)) return false;
+      if (parent === root.pid) return true;
+      parent = byPid.get(parent)!.ppid;
+    }
+  });
+}
+
 let pidfdUsable = process.platform === "linux";
 let pidfdGroupUsable = process.platform === "linux";
 

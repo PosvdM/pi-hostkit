@@ -33,7 +33,7 @@ pi-hostkit 封装托管 pi 子进程时与操作系统相关的能力。pi-agora
 Node 没有内置命名 mutex、`flock`、Job Object、进程创建时间查询、Windows ACL 和文件系统类型查询，这些能力由 pi-hostkit 自带的 N-API 模块提供（`src/native/hostkit_posix.c` 用于 macOS 和 Linux，`src/native/hostkit_win.c` 用于 Windows）。
 
 - **选型理由**：锁的文件描述符或 mutex 句柄直接由宿主进程持有。宿主存活则锁在，宿主崩溃或被强杀则内核自动释放，符合会话写锁的语义。若由单独的辅助程序持锁，辅助程序单独崩溃时锁被释放，宿主和它的 pi 却仍在写，就会出现两个写者。
-- **加载**：用 `node-gyp-build` 加载，优先使用 `prebuilds/<平台>-<架构>/` 中的预编译模块，没有时使用 node-gyp 从源码编译的 `build/Release/`。模块在第一次用到原生功能时才加载。
+- **加载**：用 `node-gyp-build` 加载：有 `build/Release/`（node-gyp 从源码编译的产物）时用它，否则用 `prebuilds/<平台>-<架构>/` 中的预编译模块。安装时只在没有可用的预编译模块时才从源码编译。模块在第一次用到原生功能时才加载。
 - **不需要原生模块的入口**：子路径 `pi-hostkit/paths` 只包含路径规则，不加载原生模块，供在 pi 进程里运行的扩展使用。
 - Linux 的进程表从 `/proc` 读取，由 JavaScript 实现，不经原生模块。
 
@@ -257,7 +257,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 
 - 检测：第一次需要时检测一次并缓存结果。条件是 `/sys/fs/cgroup/cgroup.controllers` 存在，并且 `systemd-run --user --scope` 能实际运行一个命令并进入 `.scope`。这需要当前用户的 systemd 实例（用户已登录，或开启了 lingering），并且宿主进程的环境能连到这个实例（通常靠 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`）。
 - 启动：`systemd-run --user --scope --quiet --collect --unit=pi-hostkit-<runId>-<8 位十六进制随机数> -- node gate.js …`。`runId` 中 `[A-Za-z0-9_.-]` 以外的字符换成 `_`，最长 64 个字符。systemd-run 把自己移入 scope 后 exec node，PID 不变。宿主环境中的 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 会传给 systemd-run（`spec.env` 中同名变量优先），因此 pi 也能看到这两个变量。宿主等待进程进入 `<unit>.scope` 后，把 scope 目录记入 `ProcessIdentity.cgroup`。
-- 最终终止：向 scope 的 `cgroup.kill` 写 `1`（`step` 为 `kill cgroup`），它作用于整棵子树；内核早于 5.14 没有 `cgroup.kill` 时，逐个向 scope 及其子 cgroup 中的进程发 SIGKILL，每次发信号前确认该进程仍在这个 scope 里且身份一致。
+- 最终终止：向 scope 的 `cgroup.kill` 写 `1`（`step` 为 `kill cgroup`），它作用于整棵子树。写入报 `ENOENT` 时，只有 scope 目录确实已不存在才算已清空；目录还在说明内核没有 `cgroup.kill`，按下面的旧内核方式处理。内核早于 5.14 没有 `cgroup.kill` 时，逐个向 scope 及其子 cgroup 中的进程发 SIGKILL，每次发信号前确认该进程仍在这个 scope 里且身份一致。
 - 复查：读 `cgroup.events` 的 `populated`，它反映整棵子树；为 0 或 scope 目录已被回收即为清空。`cgroup.events` 读不到或无法解析时不算清空。没有清空时，`leftovers` 列出子树中仍存活的进程；进程表里找不到对应进程时，以 `pid: 0`、`exe: "cgroup <目录>"` 的一项表示 scope 未清空。
 - `containment: "snapshot"` 时不使用 scope，按快照模式处理。检测不通过（没有 cgroup v2、没有 `systemd-run` 或没有用户 systemd 实例）时同样退回快照模式。
 
@@ -266,6 +266,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 用于 macOS，以及没有 cgroup v2 或指定 `containment: "snapshot"` 的 Linux。进程表在 Linux 上读 `/proc`，在 macOS 上用原生模块调用 `sysctl(KERN_PROC_ALL)`。
 
 - 记录内容：pi 的全部后代，以及与 pi 同一进程组（pgid 等于 pi 的 pid）的成员，按 PID 和创建时间记录。沿父子关系查找后代时，创建时间早于父进程的记录被跳过，以免把父 PID 被复用的进程误认为后代；Linux 上不同 boot_id 的记录也被跳过。
+- 读完进程表后重新核对用来归属后代的每个父进程（以及 pi 本身）是否还是同一个进程，不是的就丢掉经由它找到的行。Linux 逐个读 `/proc`，读的过程中父进程可能退出、PID 被无关进程复用，它的子进程就会被误认为后代。
 - 只在 pi 本身仍以记录的身份存活时添加记录。pi 退出后它的 PID（也就是进程组号）可能被无关进程复用，这时按 PID 或进程组号新找到的进程都不可信，只使用之前已经核对过的记录。
 - 快照时机：收到 `tool_execution_start` 事件时立即快照，之后在有工具执行期间每 `snapshotIntervalMs`（默认 5000）一次，最后一个 `tool_execution_end` 后停止定时快照；`stop` 开始时、发 SIGTERM 前、最终 SIGKILL 前各再快照一次。pi 先退出、后代被系统收养后，仍能按记录找到它们。
 - 最终终止（`step` 为 `SIGKILL descendants` 和 `SIGKILL pi group`）：
@@ -414,9 +415,8 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 2. 没有记录，或 `state = "released"` → `none`，没有遗留写者。
 3. 有 `writer` → 用 `isSameProcess` 判断。已退出，且（Linux）它记录的 scope 里也没有进程 → `none`。否则调用 `stopByIdentity` 停止整棵进程树（pi 已退出时也会清空它自己的 scope），然后检查：`StopReport.leftovers` 为空、`writer` 已退出、scope 已清空 → `stopped`；否则 `failed`。
 4. 状态不是 `released` 且没有 `writer`（上一个宿主在拉起 pi 和写入记录之间退出）→ 在进程表里查找候选进程。候选必须同时满足：
-   - 命令行的第一或第二个参数是 pi-hostkit 的 gate（绝对路径、文件名 `gate.js`，同一目录下有 `gate-protocol.js`）；
-   - gate 之后的参数带 `--mode rpc`（或 `--mode=rpc`）；
-   - `--session` 的值（`--session <路径>` 或 `--session=<路径>`）是绝对路径，规范化后与该会话文件相同。
+   - 命令行的第一或第二个参数是 pi-hostkit 的 gate（绝对路径、文件名 `gate.js`，同一目录下有 `gate-protocol.js`），其后是 pi 的入口和 pi 参数；
+   - 按 pi 自己的参数规则（见下文“pi 参数规则”），pi 会以 RPC 模式把 `--session` 给出的路径作为会话文件打开，且这个路径规范化后与该会话文件相同。
 
    Windows 用 `NtQueryInformationProcess` 读出命令行，再用 `CommandLineToArgvW` 拆成参数；macOS 和 Linux 直接读参数。`--session` 的值是相对路径时，无法得知那个进程的工作目录，视为“无法判断”。找到的候选按第 3 步停止。**没找到，或有无法判断的进程，都不能排除遗留写者**，返回 `failed`。
 
@@ -424,14 +424,18 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 
 - `none` 或 `stopped`：把记录改写为本宿主的 `starting`（不带 `writer`）。之后才能调用 `update` 和 `spawnWriter`；在此之前调用它们抛出 `EHOSTKIT_LOCK_STATE`。`recoverPreviousWriter` 每把锁只能调用一次。
 - `failed`：锁被自动释放，记录保持原样，不拉起新写者。使用方告诉用户“上一个写者状态不明”，用户人工确认没有遗留的 pi 进程后，使用方重新取锁并以 `assumeNoWriter: true` 调用，此时第 1 步和第 4 步中无法判断的部分按 `none` 处理（agora 中这是用户级操作）。找到的候选仍会被停止，停止失败仍是 `failed`。
-- 恢复过程中抛出错误（例如进程表无法读取）时，锁同样被释放、记录保持原样，错误抛给调用方。
+- 恢复过程中抛出错误（例如进程表无法读取，或写入 `starting` 记录失败）时，锁同样被释放，错误抛给调用方。
 - 停止遗留写者产生的 `StopReport` 保存在 `recoveryReports` 里。
 
-同一把锁上的 `recoverPreviousWriter`、`update`、`spawnWriter`、`release` 按调用顺序逐个执行，后一个等前一个完成。所以在恢复进行中调用 `release()`，释放会排在恢复之后，恢复不会在锁已释放后再写记录；`release()` 之后其他操作抛出 `EHOSTKIT_LOCK_STATE`。`update` 不接受 `state: "released"`（用 `release()`），`writer` 必须是完整的进程身份。
+同一把锁上的 `recoverPreviousWriter`、`update`、`spawnWriter`、`release` 按调用顺序逐个执行，后一个等前一个完成。所以在恢复进行中调用 `release()`，释放会排在恢复之后，恢复不会在锁已释放后再写记录；`release()` 之后其他操作抛出 `EHOSTKIT_LOCK_STATE`。`update` 不接受 `state: "released"`（用 `release()`），`writer` 必须是完整的进程身份；值为 `undefined` 的字段保持不变。
 
 恢复成功后，用 `spawnWriter` 拉起新写者。它按协议顺序执行：以 `startHeld` 启动（停在 gate）→ `update({ writer, state: "running" })` → `release()`。所以 pi 加载、打开会话文件之前，它的身份已经在记录里。写记录失败时停止该进程并抛出错误。
 
-- `spec.argv` 必须恰好包含一个 `--session`，值是绝对路径且规范化后就是这把锁的会话文件，否则抛出 `EINVAL`。
+- 按 pi 自己的参数规则，`spec.argv`（`[cliEntry, ...pi 参数]`，相对路径按 `spec.cwd` 解析）必须让 pi 以 RPC 模式打开这把锁的会话文件，并且不带 `--continue`、`--resume`、`--session-id`、`--print` 等会另选会话的选项，否则抛出 `EINVAL`。
+
+#### pi 参数规则
+
+判断“pi 实际打开哪个会话文件”时，不能只在参数里找字符串：`--` 之后的参数都是消息，`--session=…` 和 `--mode=rpc` 在 pi 1.5.0 里只是未知选项，很多选项会吃掉下一个参数。`src/piargs.ts` 照搬 pi 1.5.0 `parseArgs`（`dist/cli/args.js`）的规则，再按 `createSessionManager`（`dist/main.js`）判断：只有 RPC 模式、没有解析错误、没有 `--no-session`、`--help`、`--version`、`--export`、`--list-models`、`--fork`，并且 `--session` 的值像路径（含 `/` 或 `\`，或以 `.jsonl` 结尾；否则 pi 把它当会话 id）时，pi 才以这个路径为会话文件。路径按 pi 的 `resolvePath` 相对工作目录解析。`test/piargs.test.mjs` 把这套规则与 pi 的 `parseArgs` 逐项比对。
 - 同一把锁一次只能有一个经 `spawnWriter` 拉起、仍在运行的写者；前一个退出之前再次调用抛出 `EHOSTKIT_LOCK_STATE`。
 
 第 4 步只在宿主在“拉起 pi”和“写入 `writer`”之间退出时出现。配合启动门闩，这个窗口里的 pi 还停在 gate，宿主退出后 gate 读到 stdin 结束而自行退出，不会加载 pi。下一个持锁方查找时，gate 进程通常已经退出，结果是 `failed`，需要用户确认后以 `assumeNoWriter` 继续；仍停在 gate 的进程按命令行能找到并停止。pi 加载后会设置 `process.title`，在 macOS 和 Linux 上这会覆盖进程的命令行，所以第 4 步实际只能找到仍停在 gate 的进程；不按协议放行、又没有记录的 pi 找不到，结果仍是 `failed`（fail closed）。只认 pi-hostkit 的 gate 并精确比较 `--session`，是为了不停止无关的进程：例如恢复 `a.jsonl` 时，打开 `a.jsonl.bak` 的进程，或参数里碰巧带有这个路径的其他程序。
@@ -458,7 +462,7 @@ export function checkPrivate(path: string): Promise<{ ok: boolean; problem?: str
 | Linux | 目录 `0700`、文件 `0600`。POSIX ACL 不需要另外检查：组权限位为 0 时 ACL 的 mask 为 0，命名用户和组的条目不生效。 |
 
 - `ensurePrivateDir`：创建目录（含缺失的上级目录）。已存在时：POSIX 上属主必须是当前用户，权限宽于 `0700` 时收紧为 `0700`，macOS 上清除扩展 ACL；Windows 上重新设置 DACL。路径是符号链接或不是目录时抛出。最后用 `checkPrivate` 复查，不满足时抛出 `EHOSTKIT_NOT_PRIVATE`。
-- `writePrivateFile`：父目录必须已经私密（`checkPrivate` 通过），否则抛出 `EHOSTKIT_NOT_PRIVATE`。这样其他用户根本进不了这个目录，也就无法在“文件已创建、自身权限尚未设好”的一刻打开它；在 Windows 上，事后收紧权限撤销不了别人已经拿到的句柄。然后排他创建（文件已存在时以 `EEXIST` 失败），Windows 上设置 DACL、macOS 上清除扩展 ACL，再写入数据；写入后 `fsync`。失败时删除该文件。最后用 `checkPrivate` 复查。
+- `writePrivateFile`：父目录必须已经私密（`checkPrivate` 通过），否则抛出 `EHOSTKIT_NOT_PRIVATE`。文件排他创建（已存在时以 `EEXIST` 失败）：Windows 上由原生 `createPrivateFile` 以带受保护 DACL（只有当前用户）的安全描述符调用 `CreateFileW(CREATE_NEW)`，权限在创建的同一步生效，没有别人能打开它的间隙（只靠私密的父目录不够：拥有“绕过遍历检查”特权的用户可以不经父目录的检查直接打开文件，而事后收紧权限撤销不了别人已经拿到的句柄）；POSIX 上以 `0600` 创建，macOS 上再清除扩展 ACL（父目录没有可继承的 ACL）。然后写入数据并 `fsync`。失败时删除该文件。最后用 `checkPrivate` 复查。
 - `checkPrivate` 的条件：
   - POSIX：不是符号链接；属主是当前用户；目录权限不宽于 `0700`、文件不宽于 `0600`；macOS 上没有扩展 ACL。
   - Windows：不是符号链接；DACL 存在且受保护；allow 项只有当前用户 SID；属主是当前用户、Administrators（`S-1-5-32-544`）或 SYSTEM（`S-1-5-18`）。后两者本来就能读所有文件，以管理员身份创建的文件属主是 Administrators。
@@ -518,14 +522,15 @@ pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-h
 
 CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模式各一次）、macos-latest、windows-latest 上用 pi 1.5.0 运行全部测试。测试用本地假 provider（`test/fixtures/fake-provider.ts`）驱动真实的 pi 进程，不联网。覆盖：
 
-- **锁**：单实例锁在同一进程内重复获取被拒、持有进程被强杀后由操作系统释放；会话写锁的获取、记录、占用结果和释放；`recoverPreviousWriter` 之前 `update` 被拒；恢复与释放并发时按调用顺序执行、释放后不能再拉起写者；`spawnWriter` 校验 `--session` 并限制同时一个写者。
+- **锁**：单实例锁在同一进程内重复获取被拒、持有进程被强杀后由操作系统释放；会话写锁的获取、记录、占用结果和释放；`recoverPreviousWriter` 之前 `update` 被拒；恢复与释放并发时按调用顺序执行、释放后不能再拉起写者；`spawnWriter` 按 pi 的参数规则校验（`--` 之后的 `--session`、`--session=…`、带 `--continue` 都被拒）并限制同时一个写者。
+- **pi 参数规则**：`parsePiArgs` 与 pi 1.5.0 的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models` 等情况。
 - **跨宿主恢复**：宿主进程用 `spawnWriter` 拉起 pi 后被强杀，另一个宿主取锁并停止遗留写者（用例以 pi-pane 为前者、pi-agora 为后者；`app` 字段只是标签，两个方向走同一代码路径）。Windows 上 pi 随 Job 终止，结果为 `none` 或 `stopped`（Job 结束可能略晚于 mutex 被释放）。
-- **fail closed**：宿主在 pi 停在 gate 时被杀，gate 自行退出，下一个持锁方得到 `failed`，`assumeNoWriter` 后为 `none`；仍停在 gate 的未记录进程按命令行找到并停止；打开 `<会话>.bak` 的 gate 和 `--session` 为相对路径的 gate 不被停止，结果为 `failed`；不按协议放行的未记录 pi 无法排除时返回 `failed`；记录不是合法 JSON 或内容不完整时返回 `failed` 且记录不变。
+- **fail closed**：宿主在 pi 停在 gate 时被杀，gate 自行退出，下一个持锁方得到 `failed`，`assumeNoWriter` 后为 `none`；仍停在 gate 的未记录进程按命令行找到并停止；打开 `<会话>.bak` 的 gate、`--session <会话>` 出现在 `--` 之后（只是消息）的 gate、`--session` 为相对路径的 gate 都不被停止，结果为 `failed`；不按协议放行的未记录 pi 无法排除时返回 `failed`；记录不是合法 JSON 或内容不完整时返回 `failed` 且记录不变。
 - **启动门闩**：用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
 - **进程树终止**：`bash` 工具及脱离 pi 进程组（POSIX 用 `setsid`）的后台进程都被清理，除 `leftovers` 为空外还在测试进程里独立确认该后台进程已不存在（三个平台）；pi 先被 SIGKILL、后代仍在时，`stop` 仍清理后代（三种覆盖方式）；`abort` 超时仍完成停止；`stop` 重复调用返回同一结果；`StopOptions` 显式 `undefined` 用默认值、`NaN` 和 `Infinity` 被拒；`coverage` 与平台和模式相符。
-- **进程身份**：创建时间不符的身份判为 `gone`；`stopByIdentity` 不对创建时间不符的身份发信号，并能停止被强杀宿主留下的 pi（macOS、Linux；Windows 上验证 pi 随 Job 终止）；记录的 PID 已成为另一个进程组的组长时，该组不会收到信号（macOS、Linux）；不是 pi-hostkit 创建的 cgroup 路径不会被整体终止（Linux）。
+- **进程身份**：创建时间不符的身份判为 `gone`；`stopByIdentity` 不对创建时间不符的身份发信号，并能停止被强杀宿主留下的 pi（macOS、Linux；Windows 上验证 pi 随 Job 终止）；记录的 PID 已成为另一个进程组的组长时，该组不会收到信号（macOS、Linux）；读进程表期间父进程的 PID 换了进程时，经由它找到的行被丢掉（用构造的进程表测试）；不是 pi-hostkit 创建的 cgroup 路径不会被整体终止（Linux）。
 - **Linux cgroup**：CI 开启用户 systemd 实例并要求 cgroup 可用；另一轮以 `containment: "snapshot"` 覆盖快照模式。
-- **密钥权限**：`ensurePrivateDir` 创建与收紧、`writePrivateFile` 排他且私有、父目录不私密时拒绝写入、`checkPrivate` 报告过宽的权限；macOS 上扩展 ACL 被报告并被 `ensurePrivateDir` 清除。
+- **密钥权限**：`ensurePrivateDir` 创建与收紧、`writePrivateFile` 排他且私有、父目录不私密时拒绝写入、Windows 上带私密 DACL 创建文件、`checkPrivate` 报告过宽的权限；macOS 上扩展 ACL 被报告并被 `ensurePrivateDir` 清除。
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。
 - **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法、非 pi 目录被拒、经 `npm root -g` 找到全局安装。
 - **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。

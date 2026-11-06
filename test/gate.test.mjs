@@ -23,6 +23,7 @@ async function runGate(input, { end = true } = {}) {
     env: { ...process.env, MARKER_FILE: marker },
     stdio: ["pipe", "ignore", "inherit"],
   });
+  child.stdin.on("error", () => {}); // EPIPE when the gate has already exited
   const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
   if (input) child.stdin.write(input);
   if (end) child.stdin.end();
@@ -43,8 +44,9 @@ describe("start gate", () => {
     assert.equal(marker, null);
   });
 
-  test("an oversized line without LF: exit 75, entry not loaded", async () => {
-    const { code, marker } = await runGate("x".repeat(10_000));
+  test("an oversized line without LF is refused while stdin stays open", { timeout: 10_000 }, async () => {
+    // stdin is not closed: the gate must give up on the length limit itself, not on EOF.
+    const { code, marker } = await runGate("x".repeat(10_000), { end: false });
     assert.equal(code, GATE_REFUSED_EXIT_CODE);
     assert.equal(marker, null);
   });

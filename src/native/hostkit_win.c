@@ -40,6 +40,8 @@ static napi_value throw_win(napi_env env, const char *op, DWORD err) {
     case ERROR_FILE_NOT_FOUND:
     case ERROR_PATH_NOT_FOUND: code = "ENOENT"; break;
     case ERROR_INVALID_PARAMETER: code = "EINVAL"; break;
+    case ERROR_FILE_EXISTS:
+    case ERROR_ALREADY_EXISTS: code = "EEXIST"; break;
     default: snprintf(code_buf, sizeof(code_buf), "EWIN%lu", (unsigned long)err);
   }
   napi_value code_v, msg_v, error, errno_v;
@@ -653,6 +655,60 @@ static napi_value set_private_acl(napi_env env, napi_callback_info info) {
   return js_undefined(env);
 }
 
+// createPrivateFile(path): creates a new empty file (fails with EEXIST when it
+// exists) whose protected DACL grants only the current user full control. The
+// descriptor is applied by CreateFileW itself, so no other user can open the
+// file between its creation and setting its permissions.
+static napi_value create_private_file(napi_env env, napi_callback_info info) {
+  napi_value argv[1];
+  if (!get_args(env, info, 1, argv)) return NULL;
+  wchar_t *path = get_wstring(env, argv[0]);
+  if (!path) return NULL;
+  DWORD err = 0;
+  PSID sid = current_user_sid(&err);
+  if (!sid) {
+    free(path);
+    return throw_win(env, "GetTokenInformation", err);
+  }
+  EXPLICIT_ACCESSW ea;
+  ZeroMemory(&ea, sizeof(ea));
+  ea.grfAccessPermissions = GENERIC_ALL;
+  ea.grfAccessMode = SET_ACCESS;
+  ea.grfInheritance = NO_INHERITANCE;
+  ea.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  ea.Trustee.TrusteeType = TRUSTEE_IS_USER;
+  ea.Trustee.ptstrName = (LPWSTR)sid;
+  PACL acl = NULL;
+  err = SetEntriesInAclW(1, &ea, NULL, &acl);
+  if (err != ERROR_SUCCESS) {
+    free(sid);
+    free(path);
+    return throw_win(env, "SetEntriesInAcl", err);
+  }
+  SECURITY_DESCRIPTOR sd;
+  if (!InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ||
+      !SetSecurityDescriptorDacl(&sd, TRUE, acl, FALSE) ||
+      !SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED)) {
+    err = GetLastError();
+    LocalFree(acl);
+    free(sid);
+    free(path);
+    return throw_win(env, "InitializeSecurityDescriptor", err);
+  }
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = &sd;
+  sa.bInheritHandle = FALSE;
+  HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+  err = GetLastError();
+  LocalFree(acl);
+  free(sid);
+  free(path);
+  if (h == INVALID_HANDLE_VALUE) return throw_win(env, "CreateFile", err);
+  CloseHandle(h);
+  return js_undefined(env);
+}
+
 // readAcl(path) -> { owner, protected, aces: [{ sid, type, mask }] }
 static napi_value read_acl(napi_env env, napi_callback_info info) {
   napi_value argv[1];
@@ -728,6 +784,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"userSid", NULL, user_sid, NULL, NULL, NULL, napi_default, NULL},
     {"setPrivateAcl", NULL, set_private_acl, NULL, NULL, NULL, napi_default, NULL},
     {"readAcl", NULL, read_acl, NULL, NULL, NULL, napi_default, NULL},
+    {"createPrivateFile", NULL, create_private_file, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
   return exports;

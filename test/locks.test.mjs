@@ -324,6 +324,10 @@ describe("session writer lock", () => {
     const base = { cwd: f.cwd, env: f.env, containment, runId: "w", instanceId: "i" };
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv() }), { code: "EINVAL" });
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", f.sessionPath("other")]) }), { code: "EINVAL" });
+    // pi would continue another session: --session after -- is a message.
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--continue", "--", "--session", sessionFile]) }), { code: "EINVAL" });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv([`--session=${sessionFile}`]) }), { code: "EINVAL" });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile, "--continue"]) }), { code: "EINVAL" });
     const writer = await lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) });
     await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) }), { code: "EHOSTKIT_LOCK_STATE" });
     await writer.stop(FAST_STOP);
@@ -346,17 +350,32 @@ describe("session writer lock", () => {
       await new Promise((resolve) => gate.once("spawn", resolve));
       return gate;
     };
+    const startGateArgs = async (extra) => {
+      const gate = spawn(process.execPath, [path.join(here, "..", "dist", "gate.js"), ...(await piArgv(extra))], {
+        cwd: f.cwd,
+        env: f.env,
+        stdio: ["pipe", "ignore", "ignore"],
+        detached: !isWin,
+      });
+      children.add(gate);
+      await new Promise((resolve) => gate.once("spawn", resolve));
+      return gate;
+    };
     const other = await startGate(`${sessionFile}.bak`);
+    // Not a writer of this file by pi's rules: the --session after -- is a message.
+    const afterDashes = await startGateArgs(["--continue", "--", "--session", sessionFile]);
     const lock = await acquireWhenFree(sessionFile, "pi-pane");
     assert.equal(await lock.recoverPreviousWriter(FAST_STOP), "failed");
     assert.equal(lock.recoveryReports.length, 0);
     assert.equal(other.exitCode, null, "a gate for a.jsonl.bak must not be stopped");
+    assert.equal(afterDashes.exitCode, null, "a gate whose --session is only a message must not be stopped");
 
     const relative = await startGate(path.basename(sessionFile));
     const again = await acquireWhenFree(sessionFile, "pi-pane");
     assert.equal(await again.recoverPreviousWriter(FAST_STOP), "failed");
     assert.equal(relative.exitCode, null);
     other.kill("SIGKILL");
+    afterDashes.kill("SIGKILL");
     relative.kill("SIGKILL");
   });
 

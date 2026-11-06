@@ -99,18 +99,30 @@ export async function ensurePrivateDir(dir: string): Promise<void> {
 }
 
 /**
- * Creates `file` exclusively (fails when it exists) so that only the current
- * user can read or write it, then writes `data`. The parent directory must
- * already be private (see `ensurePrivateDir`): other users then cannot reach
- * the file at all, including in the moment between creating it and setting
- * its own permissions.
+ * Creates `file` exclusively (fails with EEXIST when it exists) so that only
+ * the current user can read or write it, then writes `data`. The parent
+ * directory must already be private (see `ensurePrivateDir`). On Windows the
+ * file is created with its private DACL in one call (`CreateFileW` with a
+ * security descriptor), so there is no moment in which another user could open
+ * it. On POSIX the file is created with mode 0600 and, on macOS, without
+ * inheritable ACL entries because the parent has none.
  */
 export async function writePrivateFile(file: string, data: Uint8Array): Promise<void> {
   const parent = await checkPrivate(path.dirname(path.resolve(file)));
   if (!parent.ok) throw privateError(file, `parent directory is not private: ${parent.problem}`);
-  const handle = await open(file, "wx", 0o600);
+  let handle;
+  if (process.platform === "win32") {
+    nativeFn("createPrivateFile")(file);
+    try {
+      handle = await open(file, "r+");
+    } catch (error) {
+      await unlink(file).catch(() => {});
+      throw error;
+    }
+  } else {
+    handle = await open(file, "wx", 0o600);
+  }
   try {
-    if (process.platform === "win32") nativeFn("setPrivateAcl")(file, false);
     if (process.platform === "darwin" && nativeFn("aclEntryCount")(file)) nativeFn("aclClear")(file);
     await handle.writeFile(data);
     await handle.sync();

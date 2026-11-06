@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { GATE_RELEASE_LINE } from "./gate-protocol.js";
 import { nativeFn } from "./native.js";
-import { descendants, listProcesses, matches, processInfo, signalProcess, type ProcessRow } from "./proctable.js";
+import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
 
 export interface ProcessIdentity {
@@ -255,8 +255,9 @@ function cgroupKill(dir: string): string {
     return "cgroup.kill";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (isMissing(error)) return "scope already removed";
-    if (code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") throw error;
+    // ENOENT means either the scope is gone or the kernel has no cgroup.kill.
+    if (isMissing(error) && !existsSync(dir)) return "scope already removed";
+    if (!isMissing(error) && code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") throw error;
   }
   // Kernels before 5.14 have no cgroup.kill: SIGKILL each member of the
   // subtree. Membership and identity are checked right before each signal.
@@ -303,7 +304,11 @@ class SnapshotRecords {
   capture(): void {
     const table = listProcesses();
     if (!table.some((row) => matches(row, this.root))) return;
-    for (const row of descendants(table, this.root)) this.remember(row);
+    const tree = verifiedDescendants(table, this.root);
+    // pi must still be the same process after the table was read; then its
+    // pid is still its process group id and the group members are its own.
+    if (!matches(processInfo(this.root.pid), this.root)) return;
+    for (const row of tree) this.remember(row);
     for (const row of table) {
       if (row.pgid === this.root.pid && row.pid !== this.root.pid) this.remember(row);
     }
@@ -667,7 +672,7 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
 
   if (process.platform === "win32") {
     const table = listProcesses();
-    const tree = alive() ? descendants(table, id) : [];
+    const tree = alive() ? verifiedDescendants(table, id) : [];
     const killed = alive() && nativeFn("terminateProcess")(id.pid, id.startTime);
     steps.add("TerminateProcess pi", killed, killed ? undefined : "not running");
     for (const row of tree) nativeFn("terminateProcess")(row.pid, row.startTime);

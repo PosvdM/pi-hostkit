@@ -52,6 +52,7 @@ export interface NativeBinding {
   userSid?(): string;
   setPrivateAcl?(path: string, isDirectory: boolean): void;
   readAcl?(path: string): NativeAcl;
+  createPrivateFile?(path: string): void;
 }
 
 let binding: NativeBinding | undefined;

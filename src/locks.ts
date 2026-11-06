@@ -7,6 +7,7 @@ import { isMainThread } from "node:worker_threads";
 import { assertLocalFilesystem } from "./localfs.js";
 import { nativeFn } from "./native.js";
 import { comparisonKey, realPathOrPending } from "./paths.js";
+import { hasOnlyExplicitSession, rpcSessionFile } from "./piargs.js";
 import {
   isSameProcess,
   scopePopulated,
@@ -77,8 +78,10 @@ export interface SessionWriterLock extends HeldLock {
    * Spawns the writer in the order the protocol requires: held at the start
    * gate, identity recorded as `writer` with state `running`, then released.
    * pi cannot open the session file before its identity is in the record.
-   * `spec.argv` must contain exactly one absolute `--session` naming this
-   * lock's file. Only one writer spawned through the lock may run at a time.
+   * `spec.argv` must make pi, by its own argument rules, run in RPC mode with
+   * `--session` naming this lock's file and no other session option
+   * (`--continue`, `--resume`, `--session-id`, `--fork`, `--no-session`, …).
+   * Only one writer spawned through the lock may run at a time.
    */
   spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess>;
 }
@@ -247,20 +250,6 @@ function writeRecord(file: string, record: SessionLockRecord): void {
   }
 }
 
-function hasRpcMode(args: string[]): boolean {
-  return args.some((arg, i) => arg === "--mode=rpc" || (arg === "--mode" && args[i + 1] === "rpc"));
-}
-
-/** Values of `--session` (`--session <v>` or `--session=<v>`). */
-function sessionArgs(args: string[]): string[] {
-  const values: string[] = [];
-  args.forEach((arg, i) => {
-    if (arg === "--session" && i + 1 < args.length) values.push(args[i + 1]!);
-    else if (arg.startsWith("--session=")) values.push(arg.slice("--session=".length));
-  });
-  return values;
-}
-
 /** Index of a pi-hostkit gate script in `args` (a `gate.js` next to `gate-protocol.js`), or -1. */
 function gateIndex(args: string[]): number {
   return args.findIndex(
@@ -272,19 +261,24 @@ function gateIndex(args: string[]): number {
   );
 }
 
+function sameFile(file: string, key: string): boolean {
+  return comparisonKey(realPathOrPending(file)) === key;
+}
+
 type Candidates = { found: ProcessIdentity[]; uncertain: boolean };
 
 /**
  * pi-hostkit gate processes (held, or a loaded pi whose command line is still
- * readable) in RPC mode whose `--session` names this session file. Used when
+ * readable) that pi would run as the RPC writer of this session file. Used when
  * the previous host died between spawning pi and recording `writer`.
  *
- * Only gate processes are considered, and `--session` must resolve to the same
- * canonical path; a relative value cannot be resolved without the process's
- * working directory and makes the search uncertain. A loaded pi sets
- * `process.title`, which overwrites its command line on macOS and Linux, so it
- * is usually not found there. Not finding one is therefore never taken as
- * proof that no writer exists.
+ * The command line is `<node> <gate.js> <cli.js> <pi arguments…>`; the pi
+ * arguments are interpreted with pi's own rules (`parsePiArgs`), so a
+ * `--session` after `--`, or one that pi ignores, does not count. A relative
+ * `--session` cannot be resolved without the process's working directory and
+ * makes the search uncertain. A loaded pi sets `process.title`, which
+ * overwrites its command line on macOS and Linux, so it is usually not found
+ * there. Not finding one is therefore never taken as proof that no writer exists.
  */
 function findWritersByCommandLine(canonical: string): Candidates {
   const key = comparisonKey(canonical);
@@ -296,46 +290,42 @@ function findWritersByCommandLine(canonical: string): Candidates {
     if (!args) continue;
     const gate = gateIndex(args);
     if (gate < 0) continue;
-    const rest = args.slice(gate + 1);
-    if (!hasRpcMode(rest)) continue;
-    for (const value of sessionArgs(rest)) {
-      if (!path.isAbsolute(value)) {
-        uncertain = true;
-        continue;
-      }
-      let same = false;
-      try {
-        same = comparisonKey(realPathOrPending(value)) === key;
-      } catch {
-        uncertain = true;
-      }
-      if (same) {
+    const target = rpcSessionFile(args.slice(gate + 2), undefined);
+    if (target.relative) {
+      uncertain = true;
+      continue;
+    }
+    if (!target.file) continue;
+    try {
+      if (sameFile(target.file, key)) {
         found.push({ pid: row.pid, startTime: row.startTime, runId: "unknown", instanceId: "unknown" });
-        break;
       }
+    } catch {
+      uncertain = true;
     }
   }
   return { found, uncertain };
 }
 
-/** `--session` values in a spawn argv must name exactly this lock's file. */
-function assertSessionArg(argv: string[], canonical: string): void {
-  const values = sessionArgs(argv);
-  const key = comparisonKey(canonical);
-  const ok =
-    values.length === 1 &&
-    path.isAbsolute(values[0]!) &&
-    (() => {
-      try {
-        return comparisonKey(realPathOrPending(values[0]!)) === key;
-      } catch {
-        return false;
-      }
-    })();
+/**
+ * pi started with `argv` (`[cliEntry, ...pi arguments]`) in `cwd` must open
+ * exactly this lock's file as its RPC session, by pi's own argument rules, and
+ * nothing may make it pick another session.
+ */
+function assertSessionArg(argv: string[], cwd: string, canonical: string): void {
+  const piArgs = argv.slice(1);
+  const target = rpcSessionFile(piArgs, cwd);
+  let ok = false;
+  try {
+    ok = !!target.file && hasOnlyExplicitSession(piArgs) && sameFile(target.file, comparisonKey(canonical));
+  } catch {
+    ok = false;
+  }
   if (!ok) {
-    throw Object.assign(new Error(`spawnWriter argv must contain exactly one absolute --session for ${canonical}`), {
-      code: "EINVAL",
-    });
+    throw Object.assign(
+      new Error(`spawnWriter argv must start pi in RPC mode with --session ${canonical} and no other session option`),
+      { code: "EINVAL" },
+    );
   }
 }
 
@@ -392,14 +382,20 @@ class WriterLock implements SessionWriterLock {
         this.abandon();
         return result;
       }
-      this.current = {
+      const record: SessionLockRecord = {
         version: 1,
         sessionFile: this.paths.canonical,
         host: this.host,
         state: "starting",
         updatedAt: new Date().toISOString(),
       };
-      writeRecord(this.paths.record, this.current);
+      try {
+        writeRecord(this.paths.record, record);
+      } catch (error) {
+        this.abandon();
+        throw error;
+      }
+      this.current = record;
       this.state = "recovered";
       return result;
     });
@@ -451,8 +447,12 @@ class WriterLock implements SessionWriterLock {
     if (patch.writer !== undefined && !isIdentity(patch.writer)) {
       throw Object.assign(new Error("invalid writer identity"), { code: "EINVAL" });
     }
-    this.current = { ...this.current!, ...patch, updatedAt: new Date().toISOString() };
-    writeRecord(this.paths.record, this.current);
+    // Fields given as undefined are left unchanged, so the record stays complete.
+    const next: SessionLockRecord = { ...this.current!, updatedAt: new Date().toISOString() };
+    if (patch.state !== undefined) next.state = patch.state;
+    if (patch.writer !== undefined) next.writer = patch.writer;
+    writeRecord(this.paths.record, next);
+    this.current = next;
   }
 
   spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess> {
@@ -461,7 +461,7 @@ class WriterLock implements SessionWriterLock {
       if (!this.writerExited) {
         throw Object.assign(new Error("a writer spawned through this lock is still running"), { code: "EHOSTKIT_LOCK_STATE" });
       }
-      assertSessionArg(spec.argv, this.paths.canonical);
+      assertSessionArg(spec.argv, spec.cwd, this.paths.canonical);
       const proc = await spawnManaged({ ...spec, startHeld: true });
       try {
         this.writeUpdate({ writer: proc.identity, state: "running" });

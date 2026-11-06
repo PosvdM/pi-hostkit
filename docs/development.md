@@ -25,8 +25,9 @@
 | `src/paths.ts` | 路径规则、真实路径、比较键；也作为子路径 `pi-hostkit/paths` 导出 |
 | `src/native.ts` | 第一次使用时用 `node-gyp-build` 加载原生模块；`NativeBinding` 接口列出原生模块的全部函数 |
 | `src/native/hostkit_posix.c` | macOS 和 Linux 的原生模块：`flock` 锁（`flockAcquire`、`fdClose`）、`fsInfo`；仅 macOS：进程表（`processInfo`、`listProcesses`，用 `sysctl(KERN_PROC)`）、命令行（`processArgs`）、扩展 ACL（`aclEntryCount`、`aclClear`）；仅 Linux：pidfd（`pidfdOpen`、`pidfdSignal`） |
-| `src/native/hostkit_win.c` | Windows 的原生模块：进程表与身份（`NtQuerySystemInformation`）、命令行（拆成参数）、按身份终止进程、Job Object、命名 mutex、`fsInfo`、当前用户 SID、DACL 的设置与读取 |
-| `binding.gyp` | 按平台选择 C 源文件；Windows 链接 `advapi32.lib`；`NAPI_VERSION=8` |
+| `src/native/hostkit_win.c` | Windows 的原生模块：进程表与身份（`NtQuerySystemInformation`）、命令行（拆成参数）、按身份终止进程、Job Object、命名 mutex、`fsInfo`、当前用户 SID、DACL 的设置与读取、带私密 DACL 创建文件（`createPrivateFile`） |
+| `src/piargs.ts` | 按 pi 1.5.0 `parseArgs` 的规则解析 pi 参数，判断 pi 实际以 RPC 模式打开哪个会话文件（`spawnWriter` 校验和恢复时的候选判断） |
+| `binding.gyp` | 按平台选择 C 源文件；Windows 链接 `advapi32.lib`（ACL、令牌）和 `shell32.lib`（`CommandLineToArgvW`）；`NAPI_VERSION=8` |
 | `test/` | 测试，见“测试” |
 
 构建产物都不提交（见 `.gitignore`）：
@@ -61,6 +62,7 @@ npm test
 | 文件 | 内容 |
 | --- | --- |
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
+| `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
 | `test/gate.test.mjs` | 启动门闩本身：用 `test/fixtures/marker-entry.mjs` 代替 pi 的入口，检查拒绝放行时入口没有加载、放行后入口拿到的参数和下一行输入 |
 | `test/paths.test.mjs` | 路径规则；与 pi 1.5.0 内部模块 `dist/utils/paths.js`、`dist/core/tools/path-utils.js` 的差分比对 |
 | `test/process.test.mjs` | `spawnManaged`、启动门闩、进程树终止、进程身份、`stopByIdentity`、Linux cgroup |
@@ -110,9 +112,11 @@ npm test
 ## 修改约定
 
 - **接口与行为**：修改公开接口、默认值或平台行为时，同步更新 [design.md](design.md)，并在 pi-pane、pi-agora 中检查引用它的文档。
-- **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。
+- **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 和 `test/piargs.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。
 - **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；需要不兼容修改时改用新的协议版本名。
 - **启动门闩**：`src/gate.ts` 只依赖 `src/gate-protocol.ts` 和 Node 内置模块，不加载原生模块，在 pi 加载之前不做多余的事。修改放行行或退出码时，宿主和 gate 必须来自同一版本的 pi-hostkit。
 - **原生函数**：增加或修改原生函数时，同时修改对应的 C 文件和 `src/native.ts` 的 `NativeBinding`。只在部分平台存在的函数声明为可选，经 `nativeFn` 调用（不存在时抛出 `ENOTSUP`）。
 - **`pi-hostkit/paths`**：`src/paths.ts` 不导入 `src/native.ts` 或其他会加载原生模块的文件，因为这个入口在 pi 进程里的扩展中使用。
-- **发信号和终止进程**：一律先核对进程身份（POSIX 用 `process.ts` 的 `signalIdentity`，Windows 用按创建时间核对的 `terminateProcess`），不直接对 PID 调用 `process.kill`。例外是没有 `cgroup.kill` 的内核上逐个终止 scope 成员：发信号前核对该进程仍在这个 scope 里。
+- **发信号和终止进程**：一律经过核对进程身份的函数（POSIX 用 `src/proctable.ts` 的 `signalProcess`，Linux 上经 pidfd；Windows 用按创建时间核对的 `terminateProcess`），不直接对 PID 调用 `process.kill`。没有 `cgroup.kill` 的内核上逐个终止 scope 成员时，同样经 `signalProcess`，并在发信号前核对该进程仍在这个 scope 里。
+- **进程表遍历**：按父子关系找后代用 `verifiedDescendants`，它在读完进程表后重新核对每个父进程，丢掉经由已换了进程的 PID 找到的行。
+- **pi 参数规则**：`src/piargs.ts` 照搬 pi 1.5.0 的 `parseArgs`，`test/piargs.test.mjs` 与 pi 的实现做差分比对。升级支持的 pi 版本时先跑这组测试，pi 增减选项时同步修改。

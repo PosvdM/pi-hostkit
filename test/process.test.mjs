@@ -191,6 +191,35 @@ test("an old identity whose PID now leads an unrelated process group is not sign
   }
 });
 
+test("descendants found through a parent whose PID changed identity during the read are dropped", async () => {
+  const { descendants, verifiedDescendants, listProcesses } = await import("../dist/proctable.js");
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1e6)"], { stdio: "ignore" });
+  await new Promise((resolve) => child.once("spawn", resolve));
+  try {
+    const me = currentProcessIdentity("test");
+    const table = await until(() => {
+      const t = listProcesses();
+      return t.some((r) => r.pid === child.pid) ? t : null;
+    }, 5_000);
+    // As if the child had exited and its PID been reused while the table was
+    // read: the row's start time is not the live process's, and a "grandchild"
+    // was read under that PID.
+    const stale = table.map((r) => (r.pid === child.pid ? { ...r, startTime: `${r.startTime}0` } : r));
+    const grandchild = { pid: 2 ** 30, ppid: child.pid, pgid: 2 ** 30, startTime: stale.find((r) => r.pid === child.pid).startTime, zombie: false };
+    stale.push(grandchild);
+    assert.ok(descendants(stale, me).some((r) => r.pid === grandchild.pid), "the plain walk is fooled");
+    const verified = verifiedDescendants(stale, me);
+    // The grandchild was attributed through a parent that is no longer the same
+    // process: dropped. (The stale row itself never matches a live identity, so
+    // it is never signalled.)
+    assert.ok(!verified.some((r) => r.pid === grandchild.pid));
+    // The real table keeps the live child.
+    assert.ok(verifiedDescendants(table, me).some((r) => r.pid === child.pid));
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
 test("a recorded cgroup path that is not a pi-hostkit scope is never killed", { skip: process.platform !== "linux" }, async () => {
   const me = currentProcessIdentity("test");
   const report = await stopByIdentity({ ...me, startTime: "0:0", cgroup: "/sys/fs/cgroup/user.slice" }, FAST_STOP);

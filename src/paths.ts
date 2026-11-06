@@ -49,6 +49,18 @@ export function resolveToolPath(input: string, cwd: string): string {
   return path.isAbsolute(normalized) ? path.resolve(normalized) : path.resolve(base, normalized);
 }
 
+/**
+ * pi's `resolvePath(sessionArg, cwd)` for a `--session` value (no Unicode
+ * space or `@` handling, unlike tool paths). Returns undefined for a relative
+ * value when `cwd` is unknown.
+ */
+export function resolveSessionArgPath(input: string, cwd: string | undefined): string | undefined {
+  const normalized = normalizeInput(input, {});
+  if (path.isAbsolute(normalized)) return path.resolve(normalized);
+  if (cwd === undefined) return undefined;
+  return path.resolve(normalizeInput(cwd, {}), normalized);
+}
+
 function exists(filePath: string): boolean {
   try {
     accessSync(filePath, constants.F_OK);
