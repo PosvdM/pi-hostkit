@@ -17,6 +17,7 @@
 | `src/rpc.ts` | `JsonlSplitter`（按 LF 分帧）和 `StdioRpcTransport`（命令与响应关联、事件分发、错误类） |
 | `src/process.ts` | `spawnManaged`、`ManagedProcess.stop`、`stopByIdentity`、`isSameProcess`；Linux cgroup scope 的检测与终止；快照模式的记录与终止 |
 | `src/snapshots.ts` | 快照记录及逐目标停止、错误收集、退出复查；父身份查询失败只丢弃相关分支，快照错误写入报告；不作为包入口导出 |
+| `src/fs-probe.ts` | 内部严格存在性检查，只有 ENOENT/ENODEV 返回不存在；cgroup 选择、人口检查和 gate 恢复探测共用 |
 | `src/cgroups.ts` | cgroup 整体终止及旧内核逐 PID 退回、pi 身份保底、部分列举与未知残留报告；内部依赖注入用于确定性故障测试；人口检查供恢复路径复用 |
 | `src/gate.ts` | 启动门闩，编译为独立入口 `dist/gate.js`，由 `spawnManaged` 作为子进程的脚本运行 |
 | `src/gate-protocol.ts` | 门闩放行行和拒绝退出码，宿主和 gate 共用 |
@@ -67,6 +68,7 @@ npm test
 | `test/locate.test.mjs` | 临时 HOME 的官方安装布局、环境变量优先级、激活切换、npm 回退；只在隔离模块副本中替换 npm 查询 |
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
 | `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、部分分支保留、最后快照失败与 `StopReport` |
+| `test/existence-faults.test.mjs` | 严格存在性错误分类、记录 scope 查询失败的覆盖保留、gate 协议查询不明不能被其他候选掩盖 |
 | `test/cgroup-faults.test.mjs` | cgroup 旧内核退回、逐 PID 信号与查询错误、部分/最终列举失败、已知身份及未知哨兵、独立 pi 保底 |
 | `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
 | `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
@@ -77,6 +79,7 @@ npm test
 | `test/misc.test.mjs` | 密钥权限、本地磁盘检查、`locatePi` |
 | `test/helpers.mjs` | pi 测试现场（隔离的 HOME、agent 目录、会话目录和环境变量）、pi 参数、等待工具 |
 | `test/fixtures/host.mjs` | 测试用宿主进程：执行一个动作、输出一行 JSON 后等待被杀，用于强杀宿主的用例 |
+| `test/fixtures/scope-selection-fault.mjs`、`test/fixtures/gate-probe-fault.mjs` | 独立测试进程中的存在性与进程表模拟；分别验证 scope 选择及 fail closed 恢复，不发送真实信号 |
 | `test/fixtures/capture-fault.mjs` | POSIX 子进程用 Node 模块 mock 注入快照失败，验证真实 `Managed.stop` 返回报告并缓存成功结果 |
 | `test/fixtures/cgroup-verify-fault.mjs` | Linux 真实 user scope 启动后临时替换内置 fs 调用，验证最终检查失败也返回带未知 scope 的可重复报告 |
 | `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |

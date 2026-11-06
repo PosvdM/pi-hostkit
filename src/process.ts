@@ -9,6 +9,7 @@ import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
 import { SnapshotRecords, stopSnapshot } from "./snapshots.js";
 import { cgroupPopulated, stopCgroup } from "./cgroups.js";
+import { pathExistsStrict } from "./fs-probe.js";
 
 export interface ProcessIdentity {
   pid: number;
@@ -558,7 +559,16 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
     return { steps: steps.steps, coverage: "snapshot_visible", leftovers: rowsToLeftovers(leftovers) };
   }
 
-  const cgroup = isOwnScope(id.cgroup) && existsSync(id.cgroup!) ? id.cgroup : undefined;
+  let cgroup: string | undefined;
+  if (isOwnScope(id.cgroup)) {
+    try {
+      if (pathExistsStrict(id.cgroup!)) cgroup = id.cgroup;
+    } catch (error) {
+      // An unreadable recorded scope must not silently become snapshot coverage.
+      steps.add("check cgroup directory", false, (error as Error).message);
+      cgroup = id.cgroup;
+    }
+  }
   const records = new SnapshotRecords(id);
   const capture = () => {
     try {

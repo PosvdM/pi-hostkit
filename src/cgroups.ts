@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { ProcessIdentity, StopReport } from "./process.js";
 import { matches, processInfo, signalProcess } from "./proctable.js";
+import { pathExistsStrict } from "./fs-probe.js";
 
 /** Internal dependency seam; this module is not a package export. */
 export interface CgroupOps {
@@ -19,15 +20,7 @@ const system: CgroupOps = {
   readFile: (file) => readFileSync(file, "utf8"),
   writeFile: (file, value) => writeFileSync(file, value),
   readDirectories: (dir) => readdirSync(dir, { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name),
-  exists: (dir) => {
-    try {
-      statSync(dir);
-      return true;
-    } catch (error) {
-      if (isMissing(error)) return false;
-      throw error;
-    }
-  },
+  exists: pathExistsStrict,
   processInfo,
   signalProcess,
 };

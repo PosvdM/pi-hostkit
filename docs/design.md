@@ -289,7 +289,7 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 `stopByIdentity` 供宿主停止一个没有 RPC 连接的进程，通常是上一个宿主实例留下的 pi（见“场景”中的“宿主被强杀”和“取得锁之后”）。没有 RPC 连接，所以不发 `abort`、不关闭 stdin，`abortTimeoutMs` 和 `graceMs` 不起作用。
 
 - macOS、Linux：进程身份一致时检查后发 SIGTERM，等待 `termGraceMs`；然后按下面两种情况最终终止。
-  - 记录中有 `cgroup`，路径形如 `/sys/fs/cgroup/…/pi-hostkit-<…>-<8 位十六进制>.scope` 且目录存在：整体终止该 scope（与 `stop` 相同），即使 pi 本身已退出也终止，因为这个 scope 只装着这一次运行的进程。其他形式的 `cgroup` 路径（例如上级 slice）被忽略，按快照处理。`coverage` 为 `cgroup`。
+  - 记录中有 `cgroup`，路径形如 `/sys/fs/cgroup/…/pi-hostkit-<…>-<8 位十六进制>.scope`，目录存在或存在性无法查询：整体终止该 scope（与 `stop` 相同），即使 pi 本身已退出也终止，因为这个 scope 只装着这一次运行的进程。只有查询确认 `ENOENT`/`ENODEV` 时才按不存在退回快照；权限或 I/O 查询错误记录到报告并保留 cgroup 清理，持续无法确认时报告未知 scope。其他形式的 `cgroup` 路径（例如上级 slice）被忽略，按快照处理。`coverage` 为 `cgroup`。
   - 否则在 pi 仍存活时当场快照它的后代和进程组成员，按快照模式的步骤终止。没有运行期间的快照记录，覆盖范围只是此刻能看到的进程；pi 已退出时不按 PID 或进程组号查找任何进程。`coverage` 为 `snapshot_visible`。
 - Windows：宿主退出时 Job 已终止受管进程，所以通常已无事可做。进程仍存活时，对 pi 及此刻快照中的后代逐个 `TerminateProcess`（终止前在打开的句柄上核对创建时间）。`coverage` 为 `snapshot_visible`。
 - 身份不一致的进程不会收到任何信号；`steps` 中 `identity` 一步记录 `alive` 或 `gone`。
@@ -429,7 +429,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
    - 命令行的第一或第二个参数是 pi-hostkit 的 gate（绝对路径、文件名 `gate.js`，同一目录下有 `gate-protocol.js`），其后是 pi 的入口和 pi 参数；
    - 按 pi 自己的参数规则（见下文“pi 参数规则”），pi 会以 RPC 模式把 `--session` 给出的路径作为会话文件打开，且这个路径规范化后与该会话文件相同。
 
-   Windows 用 `NtQueryInformationProcess` 读出命令行，再用 `CommandLineToArgvW` 拆成参数；macOS 和 Linux 直接读参数。`--session` 的值的含义取决于那个进程时（相对路径、`~` 开头、Windows 上没有盘符的 `\…` 或 Git Bash 形式的 `/c/…`），无法得知它的工作目录和环境，视为“无法判断”，不代入宿主自己的目录和环境。找到的候选按第 3 步停止。**没找到，或有无法判断的进程，都不能排除遗留写者**，返回 `failed`。
+   Windows 用 `NtQueryInformationProcess` 读出命令行，再用 `CommandLineToArgvW` 拆成参数；macOS 和 Linux 直接读参数。`--session` 的值的含义取决于那个进程时（相对路径、`~` 开头、Windows 上没有盘符的 `\…` 或 Git Bash 形式的 `/c/…`），无法得知它的工作目录和环境，视为“无法判断”，不代入宿主自己的目录和环境。找到的候选按第 3 步停止。识别 gate 时，旁边 `gate-protocol.js` 的存在性查询失败也属于无法判断，不能因另一个候选已停止而忽略。**没找到，或有无法判断的进程，都不能排除遗留写者**，返回 `failed`。
 
 结果的处理：
 
@@ -550,7 +550,7 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。
 - **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法和显式失败不回退、目录入口拒绝；agent 环境变量的 file URL、Windows shell 路径、波浪号和默认规范化差分边界；临时 HOME 的官方安装布局、环境变量优先级、激活版本切换、损坏 marker/路径穿越/版本不符/CLI 缺失后的 npm 回退；自动定位安装。测试通过隔离副本注入 npm 根目录，不依赖 CI 机器有官方安装。
 - **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
-- **故障注入**：记录路径探测抛错按损坏处理、获取或探测的意外异常后仍可重新取锁；快照最后一次读取失败可见、单父查询失败保留独立分支。释放记录改名失败后锁与记录保持原样、可重试（含会话切换）；活写者和查询失败拒绝普通释放、显式切走可释放；单个后代 `EPERM` 或查询失败时其他后代与 pi 进程组继续清理，失败进入报告；RPC gate/命令/UI 有序背压、UTF-8/LF 字节限额、超限恢复、序列化抛错无 pending/计时器残留、写回调或同步写失败清理。Windows 验证 Global/SID 名称、创建的 owner/DACL、真实异主对象即使 DACL 允许 FullControl 也拒绝；CI 要求该异主测试执行，本机未提权可明确跳过。
+- **故障注入**：记录路径探测抛错按损坏处理、获取或探测的意外异常后仍可重新取锁；严格存在性判断只把 ENOENT/ENODEV 当不存在，recorded scope 查询失败仍保留 cgroup 覆盖和未知 scope，gate 协议文件查询不明不能被其他已恢复候选掩盖；快照最后一次读取失败可见、单父查询失败保留独立分支。释放记录改名失败后锁与记录保持原样、可重试（含会话切换）；活写者和查询失败拒绝普通释放、显式切走可释放；单个后代 `EPERM` 或查询失败时其他后代与 pi 进程组继续清理，失败进入报告；RPC gate/命令/UI 有序背压、UTF-8/LF 字节限额、超限恢复、序列化抛错无 pending/计时器残留、写回调或同步写失败清理。Windows 验证 Global/SID 名称、创建的 owner/DACL、真实异主对象即使 DACL 允许 FullControl 也拒绝；CI 要求该异主测试执行，本机未提权可明确跳过。
 - **macOS 卷检测**：隔离测试副本注入探测函数及文件系统调用，覆盖敏感、不明、权限错误、挂载边界、文件级挂载、大小写硬链接、符号链接目标；确认 `pi-hostkit/paths` 禁用 native 加载仍可工作。测试接口不进入生产源码或公开类型化 API；快照依赖注入只在不导出的内部模块，进程查询模拟只在显式启用 Node 测试模块 mock 的子进程中使用。没有生产环境变量测试开关。
 - **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超过 1024 次超时后迟到响应也不会交给复用了调用方 id 的新命令、非法 JSON、stdout 结束、监听器异常。
 

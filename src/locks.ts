@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -21,6 +21,7 @@ import {
 } from "./process.js";
 import { listProcesses, processCommandLine } from "./proctable.js";
 import { ensurePrivateDir } from "./secrets.js";
+import { pathExistsStrict } from "./fs-probe.js";
 
 export interface HeldLock {
   release(): Promise<void>;
@@ -264,7 +265,7 @@ function gateIndex(args: string[]): number {
       i <= 1 &&
       path.isAbsolute(arg) &&
       path.basename(arg) === "gate.js" &&
-      existsSync(path.join(path.dirname(arg), "gate-protocol.js")),
+      pathExistsStrict(path.join(path.dirname(arg), "gate-protocol.js")),
   );
 }
 
@@ -295,7 +296,13 @@ function findWritersByCommandLine(canonical: string): Candidates {
     if (row.pid === process.pid || row.zombie) continue;
     const args = processCommandLine(row.pid);
     if (!args) continue;
-    const gate = gateIndex(args);
+    let gate: number;
+    try {
+      gate = gateIndex(args);
+    } catch {
+      uncertain = true;
+      continue;
+    }
     if (gate < 0) continue;
     const target = rpcSessionFile(args.slice(gate + 2));
     if (target.uncertain) {
