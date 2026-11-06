@@ -24,8 +24,8 @@
 | `src/localfs.ts` | `filesystemInfo`、`assertLocalFilesystem` |
 | `src/paths.ts` | 路径规则、真实路径、比较键；也作为子路径 `pi-hostkit/paths` 导出 |
 | `src/native.ts` | 第一次使用时用 `node-gyp-build` 加载原生模块；`NativeBinding` 接口列出原生模块的全部函数 |
-| `src/native/hostkit_posix.c` | macOS 和 Linux 的原生模块：`flock` 锁（`flockAcquire`、`fdClose`）、`fsInfo`；仅 macOS：进程表（`processInfo`、`listProcesses`）和命令行（`processArgs`） |
-| `src/native/hostkit_win.c` | Windows 的原生模块：进程表与身份、命令行、按身份终止进程、Job Object、命名 mutex、`fsInfo`、当前用户 SID、DACL 的设置与读取 |
+| `src/native/hostkit_posix.c` | macOS 和 Linux 的原生模块：`flock` 锁（`flockAcquire`、`fdClose`）、`fsInfo`；仅 macOS：进程表（`processInfo`、`listProcesses`，用 `sysctl(KERN_PROC)`）、命令行（`processArgs`）、扩展 ACL（`aclEntryCount`、`aclClear`）；仅 Linux：pidfd（`pidfdOpen`、`pidfdSignal`） |
+| `src/native/hostkit_win.c` | Windows 的原生模块：进程表与身份（`NtQuerySystemInformation`）、命令行（拆成参数）、按身份终止进程、Job Object、命名 mutex、`fsInfo`、当前用户 SID、DACL 的设置与读取 |
 | `binding.gyp` | 按平台选择 C 源文件；Windows 链接 `advapi32.lib`；`NAPI_VERSION=8` |
 | `test/` | 测试，见“测试” |
 
@@ -46,7 +46,7 @@
 | `npm run build:native` | `node-gyp rebuild`，输出到 `build/Release/` |
 | `npm run prebuildify` | `prebuildify --napi --strip`，为当前平台和架构输出到 `prebuilds/` |
 
-- 运行时 `node-gyp-build` 先找 `build/Release/`，再找 `prebuilds/`。修改 C 代码后运行 `npm run build:native`，否则测试加载的是旧的构建产物。
+- 运行时 `node-gyp-build` 先找 `build/Release/`，再找 `prebuilds/`。`npm test` 之前的 `pretest` 脚本会重新构建 `dist/` 和原生模块，所以测试不会用到旧的构建产物；直接用 `node --test` 运行单个文件时，先运行 `npm run build` 和 `npm run build:native`。
 - 交叉编译其他架构：`npx prebuildify --napi --strip --arch x64`（CI 用这种方式在 Apple 芯片的运行器上构建 darwin x64）。
 
 ## 测试
@@ -56,17 +56,19 @@ npm run build
 npm test
 ```
 
-`npm test` 运行 `node --test --test-concurrency=1 "test/**/*.test.mjs"`。测试从 `dist/` 导入，所以修改 TypeScript 后要先构建。测试文件逐个运行（`--test-concurrency=1`），进程类用例会启动真实的 pi 进程。
+`npm test` 先由 `pretest` 运行 `npm run build` 和 `npm run build:native`，再运行 `node --test --test-concurrency=1 "test/**/*.test.mjs"`。测试从 `dist/` 导入。测试文件逐个运行（`--test-concurrency=1`），进程类用例会启动真实的 pi 进程。
 
 | 文件 | 内容 |
 | --- | --- |
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
+| `test/gate.test.mjs` | 启动门闩本身：用 `test/fixtures/marker-entry.mjs` 代替 pi 的入口，检查拒绝放行时入口没有加载、放行后入口拿到的参数和下一行输入 |
 | `test/paths.test.mjs` | 路径规则；与 pi 1.5.0 内部模块 `dist/utils/paths.js`、`dist/core/tools/path-utils.js` 的差分比对 |
 | `test/process.test.mjs` | `spawnManaged`、启动门闩、进程树终止、进程身份、`stopByIdentity`、Linux cgroup |
 | `test/locks.test.mjs` | 单实例锁、会话写锁、跨宿主恢复和 fail closed 的各种情况 |
 | `test/misc.test.mjs` | 密钥权限、本地磁盘检查、`locatePi` |
 | `test/helpers.mjs` | pi 测试现场（隔离的 HOME、agent 目录、会话目录和环境变量）、pi 参数、等待工具 |
 | `test/fixtures/host.mjs` | 测试用宿主进程：执行一个动作、输出一行 JSON 后等待被杀，用于强杀宿主的用例 |
+| `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |
 | `test/fixtures/fake-provider.ts` | 按脚本回复的本地 provider，pi 以 `-e` 加载；测试不联网，也不需要模型服务的密钥 |
 
 `test/locks.test.mjs` 把 `HOME`（Windows 上 `USERPROFILE`）指向临时目录，不碰真实的 `~/.pi/hostkit/locks`。
