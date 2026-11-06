@@ -111,7 +111,7 @@ describe("locatePi", () => {
     await assert.rejects(locatePi({ piPath: path.join(root, "nope") }), { code: "EHOSTKIT_PI_NOT_FOUND" });
   });
 
-  test("finds the global installation through npm root -g", { skip: !!process.env.PI_PACKAGE }, async () => {
+  test("finds an automatic installation", { skip: !!process.env.PI_PACKAGE }, async () => {
     const pi = await locatePi();
     assert.equal(pi.supported, true);
   });

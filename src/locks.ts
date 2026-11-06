@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -21,6 +21,7 @@ import {
 } from "./process.js";
 import { listProcesses, processCommandLine } from "./proctable.js";
 import { ensurePrivateDir } from "./secrets.js";
+import { pathExistsStrict } from "./fs-probe.js";
 
 export interface HeldLock {
   release(): Promise<void>;
@@ -67,6 +68,8 @@ export interface SessionWriterLock extends HeldLock {
   readonly previous?: SessionLockRecord;
   /** Stop reports of previous writers stopped by `recoverPreviousWriter`. */
   readonly recoveryReports: readonly StopReport[];
+  /** Release only after the writer exits, or after the caller confirms a session switch. */
+  release(opts?: { writerSwitchedAway?: boolean }): Promise<void>;
   /**
    * Stops a previous writer that may still run, then writes this host's
    * `starting` record. Must succeed before `update`. On `failed` the lock is
@@ -104,7 +107,7 @@ interface RawLock {
 
 /**
  * POSIX: `flock(LOCK_EX | LOCK_NB)` on `posixFile`, which is never deleted.
- * Windows: named mutex `Local\pi-hostkit-v1-<purpose>-<sha256(key)>`; an
+ * Windows: named mutex `Global\pi-hostkit-v1-<SID>-<purpose>-<sha256(key)>`; an
  * abandoned mutex counts as acquired. A key already held in this process is
  * busy, matching flock semantics across open file descriptions.
  */
@@ -117,7 +120,7 @@ function acquireRaw(purpose: string, key: string, posixFile: string): RawLock | 
   if (heldKeys.has(key)) return null;
   let release: () => void;
   if (process.platform === "win32") {
-    const handle = nativeFn("mutexAcquire")(`Local\\pi-hostkit-${PROTOCOL}-${purpose}-${sha256(key)}`);
+    const handle = nativeFn("mutexAcquire")(`Global\\pi-hostkit-${PROTOCOL}-${nativeFn("userSid")()}-${purpose}-${sha256(key)}`);
     if (handle === -1) return null;
     release = () => nativeFn("mutexRelease")(handle);
   } else {
@@ -224,8 +227,13 @@ function readRecord(file: string, key: string): ReadRecord {
   } catch (error) {
     return { invalid: (error as Error).message };
   }
-  const problem = recordProblem(value, key);
-  return problem ? { invalid: problem } : { record: value };
+  try {
+    const problem = recordProblem(value, key);
+    return problem ? { invalid: problem } : { record: value };
+  } catch (error) {
+    // Stored paths are untrusted; probing them may fail before a key exists.
+    return { invalid: `cannot validate record: ${(error as Error).message}` };
+  }
 }
 
 /** Writes the record atomically (temporary file, then rename). */
@@ -257,7 +265,7 @@ function gateIndex(args: string[]): number {
       i <= 1 &&
       path.isAbsolute(arg) &&
       path.basename(arg) === "gate.js" &&
-      existsSync(path.join(path.dirname(arg), "gate-protocol.js")),
+      pathExistsStrict(path.join(path.dirname(arg), "gate-protocol.js")),
   );
 }
 
@@ -288,7 +296,13 @@ function findWritersByCommandLine(canonical: string): Candidates {
     if (row.pid === process.pid || row.zombie) continue;
     const args = processCommandLine(row.pid);
     if (!args) continue;
-    const gate = gateIndex(args);
+    let gate: number;
+    try {
+      gate = gateIndex(args);
+    } catch {
+      uncertain = true;
+      continue;
+    }
     if (gate < 0) continue;
     const target = rpcSessionFile(args.slice(gate + 2));
     if (target.uncertain) {
@@ -476,23 +490,36 @@ class WriterLock implements SessionWriterLock {
       void proc.exited.then(() => {
         if (this.writer === proc) this.writerExited = true;
       });
-      proc.release();
+      try {
+        proc.release();
+      } catch (error) {
+        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        throw error;
+      }
       return proc;
     });
   }
 
-  /** Writes `released` (when this host wrote a record) and releases the lock. */
-  release(): Promise<void> {
+  /** Commit the released record before changing ownership or in-memory state. */
+  release(opts: { writerSwitchedAway?: boolean } = {}): Promise<void> {
     return this.serial(async () => {
       if (this.state === "released") return;
-      try {
-        if (this.state === "recovered" && this.current) {
-          this.current = { ...this.current, state: "released", updatedAt: new Date().toISOString() };
-          writeRecord(this.paths.record, this.current);
+      const record = this.current ?? (this.previous?.state !== "released" ? this.previous : undefined);
+      if (!opts.writerSwitchedAway && record?.writer) {
+        try {
+          if ((await isSameProcess(record.writer)) !== "gone") {
+            throw new Error("the session writer is still running");
+          }
+        } catch (cause) {
+          throw Object.assign(new Error("release: writer exit cannot be confirmed", { cause }), { code: "EHOSTKIT_LOCK_STATE" });
         }
-      } finally {
-        this.abandon();
       }
+      if (this.state === "recovered" && this.current) {
+        const next: SessionLockRecord = { ...this.current, state: "released", updatedAt: new Date().toISOString() };
+        writeRecord(this.paths.record, next);
+        this.current = next;
+      }
+      this.abandon();
     });
   }
 }
@@ -520,8 +547,13 @@ export async function acquireSessionWriterLock(
   assertLocalFilesystem(paths.canonical);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
   if (!raw) return { heldBy: readRecord(paths.record, paths.key).record };
-  const { record, invalid } = readRecord(paths.record, paths.key);
-  return new WriterLock(raw, paths, host, record, invalid);
+  try {
+    const { record, invalid } = readRecord(paths.record, paths.key);
+    return new WriterLock(raw, paths, host, record, invalid);
+  } catch (error) {
+    raw.release();
+    throw error;
+  }
 }
 
 export function isSessionWriterLock(value: SessionWriterLock | SessionLockBusy): value is SessionWriterLock {
@@ -533,9 +565,11 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
-  const { record } = readRecord(paths.record, paths.key);
-  if (!raw) return { held: true, ...(record ? { record } : {}) };
-  raw.release();
-  return { held: false, ...(record ? { record } : {}) };
+  try {
+    const { record } = readRecord(paths.record, paths.key);
+    return { held: !raw, ...(record ? { record } : {}) };
+  } finally {
+    raw?.release();
+  }
 }
 

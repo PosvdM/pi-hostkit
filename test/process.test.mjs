@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, describe, test } from "node:test";
@@ -43,6 +43,54 @@ function escapingCommand(pidFile) {
 }
 
 describe("spawnManaged", () => {
+  test("cgroup verification errors resolve to a repeatable report with an unknown scope", { skip: process.platform !== "linux" || containment === "snapshot" }, async (t) => {
+    if (!(await linuxCgroupSupport())) {
+      t.skip("cgroup v2 user scopes are unavailable");
+      return;
+    }
+    const f = await fixture();
+    execFileSync(process.execPath, [path.join(here, "fixtures", "cgroup-verify-fault.mjs")], {
+      timeout: 30_000, env: { ...process.env, HOSTKIT_TEST_ROOT: f.root }, stdio: "pipe",
+    });
+  });
+
+  test("final snapshot errors appear in a resolved and repeatable stop report", { skip: isWin }, async () => {
+    const f = await fixture();
+    execFileSync(process.execPath, ["--experimental-test-module-mocks", path.join(here, "fixtures", "capture-fault.mjs")], {
+      timeout: 30_000, env: { ...process.env, HOSTKIT_TEST_ROOT: f.root }, stdio: "pipe",
+    });
+  });
+
+  test("rejects a queue limit that cannot fit the gate line before spawning", async () => {
+    const f = await fixture();
+    for (const maxQueuedBytes of [0, 1, -1, 1.5, Infinity, NaN]) {
+      await assert.rejects(spawnManaged({ argv: await piArgv(), ...spec(f), maxQueuedBytes }), { code: "EINVAL" });
+    }
+  });
+
+  test("a child that never reads stdin cannot grow the RPC queue beyond its byte limit", async () => {
+    const f = await fixture();
+    const limit = 16 * 1024;
+    const proc = await spawnManaged({
+      argv: [path.join(here, "fixtures", "nonreading-entry.mjs")],
+      ...spec(f), maxQueuedBytes: limit,
+    });
+    const pending = [];
+    try {
+      await waitForEvent(proc.rpc, (event) => event.type === "nonreading_ready");
+      for (let i = 0; i < 64; i++) {
+        pending.push(proc.rpc.send({ type: "prompt", message: "x".repeat(4_096) }).catch((error) => error));
+      }
+      assert.ok(proc.rpc.queuedBytes <= limit);
+    } finally {
+      const report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+      assert.deepEqual(report.leftovers, []);
+    }
+    const results = await Promise.all(pending);
+    assert.ok(results.some((result) => result.code === "EHOSTKIT_RPC_QUEUE_FULL"));
+    assert.equal(await isSameProcess(proc.identity), "gone");
+  });
+
   test("starts pi and answers get_state", async () => {
     const f = await fixture();
     const proc = await spawnManaged({ argv: await piArgv(), ...spec(f) });
@@ -93,6 +141,8 @@ describe("spawnManaged", () => {
     // Windows: the job may terminate the gate before it reads EOF.
     if (!isWin) assert.equal(exit.code, GATE_REFUSED_EXIT_CODE);
     assert.equal(report.steps[0].detail, "process held at the start gate");
+    proc.release();
+    assert.equal(proc.held, false);
   });
 
   test("stop removes a running bash tool and a background process that left pi's process group", async () => {

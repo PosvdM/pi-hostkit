@@ -1,6 +1,6 @@
 import type { Readable, Writable } from "node:stream";
 
-/** A pi RPC command. `id` is assigned by the transport when missing. */
+/** A pi RPC command. The transport always generates a wire id and restores the caller's id in the response. */
 export interface RpcCommand {
   type: string;
   id?: string;
@@ -65,10 +65,19 @@ export interface RpcTransport {
 export interface RpcTransportOptions {
   /** Maximum bytes of one record; default 64 MiB. */
   maxRecordBytes?: number;
+  /** Maximum UTF-8 bytes awaiting write completion, including LF; default 64 MiB. */
+  maxQueuedBytes?: number;
 }
 
 export const DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const DEFAULT_MAX_QUEUED_BYTES = 64 * 1024 * 1024;
 const MAX_TIMED_OUT_IDS = 1024;
+
+function serializeLine(record: object): string {
+  const json = JSON.stringify(record);
+  if (json === undefined) throw new TypeError("RPC record did not serialize to JSON");
+  return `${json}\n`;
+}
 
 export class RpcTimeoutError extends Error {
   readonly code = "EHOSTKIT_RPC_TIMEOUT";
@@ -180,6 +189,16 @@ export class StdioRpcTransport implements RpcTransport {
   private nextId = 0;
   private failure: Error | undefined;
   private blockedReason: string | undefined;
+  private readonly maxQueuedBytes: number;
+  private readonly writes: { line: string; bytes: number }[] = [];
+  private queuedBytes = 0;
+  private waitingDrain = false;
+  private pumping = false;
+  private inputClosing = false;
+  private readonly onDrain = () => {
+    this.waitingDrain = false;
+    this.flushWrites();
+  };
   private readonly events = new Listeners<RpcEvent>();
   private readonly uiRequests = new Listeners<ExtensionUiRequest>();
   private readonly errors = new Listeners<Error>();
@@ -191,6 +210,10 @@ export class StdioRpcTransport implements RpcTransport {
     stdout: Readable,
     opts: RpcTransportOptions = {},
   ) {
+    this.maxQueuedBytes = opts.maxQueuedBytes ?? DEFAULT_MAX_QUEUED_BYTES;
+    if (!Number.isSafeInteger(this.maxQueuedBytes) || this.maxQueuedBytes <= 0) {
+      throw new RangeError("maxQueuedBytes must be a positive safe integer");
+    }
     const splitter = new JsonlSplitter((line) => this.handleLine(line), opts.maxRecordBytes);
     stdout.on("data", (chunk: Buffer) => {
       if (this.failure) return;
@@ -215,6 +238,9 @@ export class StdioRpcTransport implements RpcTransport {
     });
     stdout.on("error", (error) => this.fail(error));
     stdin.on("error", (error) => this.fail(error));
+    stdin.on("close", () => {
+      if (!stdin.writableFinished) this.fail(new RpcClosedError("pi stdin closed before writes completed"));
+    });
   }
 
   /** While blocked, `send` and `respondUi` throw; used while a process is held at the gate. */
@@ -222,9 +248,9 @@ export class StdioRpcTransport implements RpcTransport {
     this.blockedReason = reason;
   }
 
-  /** Writes a raw line without the blocked check; the gate release uses it. */
+  /** Enqueues a raw line without the blocked check; the gate release uses it. */
   writeRaw(line: string): void {
-    this.stdin.write(line);
+    this.enqueueWrite(line);
   }
 
   send(cmd: RpcCommand, opts: { timeoutMs?: number } = {}): Promise<RpcResponse> {
@@ -235,8 +261,19 @@ export class StdioRpcTransport implements RpcTransport {
     // even when the caller reuses its own id. The caller's id is put back on
     // the response.
     const id = `hk-${++this.nextId}`;
+    let line: string;
+    let command: string;
+    let callerId: string | undefined;
+    try {
+      const record = { ...cmd };
+      command = record.type;
+      callerId = record.id;
+      line = serializeLine({ ...record, id });
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return new Promise<RpcResponse>((resolve, reject) => {
-      const entry: Pending = { resolve, reject, command: cmd.type, ...(cmd.id !== undefined ? { callerId: cmd.id } : {}) };
+      const entry: Pending = { resolve, reject, command, ...(callerId !== undefined ? { callerId } : {}) };
       if (opts.timeoutMs !== undefined) {
         entry.timer = setTimeout(() => {
           this.pending.delete(id);
@@ -244,13 +281,15 @@ export class StdioRpcTransport implements RpcTransport {
           // Bound the set; a forgotten id's late response is reported as unmatched.
           // Wire ids are never reused, so forgetting one cannot misroute a response.
           if (this.timedOut.size > MAX_TIMED_OUT_IDS) this.timedOut.delete(this.timedOut.values().next().value!);
-          reject(new RpcTimeoutError(cmd.type, opts.timeoutMs!));
+          reject(new RpcTimeoutError(command, opts.timeoutMs!));
         }, opts.timeoutMs);
       }
       this.pending.set(id, entry);
-      this.stdin.write(`${JSON.stringify({ ...cmd, id })}\n`, (error) => {
-        if (error) this.settle(id, undefined, error);
-      });
+      try {
+        this.enqueueWrite(line);
+      } catch (error) {
+        this.settle(id, undefined, error as Error);
+      }
     });
   }
 
@@ -273,18 +312,69 @@ export class StdioRpcTransport implements RpcTransport {
   respondUi(res: ExtensionUiResponse): void {
     if (this.failure) throw this.failure;
     if (this.blockedReason) throw new RpcClosedError(this.blockedReason);
-    this.stdin.write(`${JSON.stringify({ ...res, type: "extension_ui_response" })}\n`);
+    this.enqueueWrite(serializeLine({ ...res, type: "extension_ui_response" }));
   }
 
   closeInput(): void {
-    if (!this.stdin.writableEnded) this.stdin.end();
+    if (this.inputClosing) return;
+    this.inputClosing = true;
+    if (this.failure) {
+      if (!this.stdin.writableEnded) this.stdin.end();
+      return;
+    }
+    this.flushWrites();
+  }
+
+  private enqueueWrite(line: string): void {
+    if (this.failure) throw this.failure;
+    if (this.inputClosing || this.stdin.writableEnded || this.stdin.destroyed) {
+      throw new RpcClosedError("pi stdin is closed");
+    }
+    const bytes = Buffer.byteLength(line, "utf8");
+    if (bytes > this.maxQueuedBytes - this.queuedBytes) {
+      throw Object.assign(new Error(`RPC write queue exceeds ${this.maxQueuedBytes} bytes`), {
+        code: "EHOSTKIT_RPC_QUEUE_FULL",
+      });
+    }
+    this.writes.push({ line, bytes });
+    this.queuedBytes += bytes;
+    this.flushWrites();
+    if (this.failure) throw this.failure;
+  }
+
+  private flushWrites(): void {
+    if (this.pumping || this.failure) return;
+    this.pumping = true;
+    try {
+      while (!this.waitingDrain && this.writes.length && !this.failure) {
+        const entry = this.writes.shift()!;
+        const writable = this.stdin.write(entry.line, (error) => {
+          if (this.failure) return;
+          this.queuedBytes -= entry.bytes;
+          if (error) this.fail(error);
+        });
+        if (!writable && !this.failure) {
+          this.waitingDrain = true;
+          this.stdin.once("drain", this.onDrain);
+        }
+      }
+      if (this.inputClosing && !this.writes.length && !this.stdin.writableEnded && !this.failure) {
+        this.waitingDrain = false;
+        this.stdin.removeListener("drain", this.onDrain);
+        this.stdin.end();
+      }
+    } catch (error) {
+      this.fail(error as Error);
+    } finally {
+      this.pumping = false;
+    }
   }
 
   private settle(id: string, res: RpcResponse | undefined, error?: Error): void {
     const entry = this.pending.get(id);
     if (!entry) return;
     this.pending.delete(id);
-    if (entry.timer) clearTimeout(entry.timer);
+    if (entry.timer !== undefined) clearTimeout(entry.timer);
     if (error) entry.reject(error);
     else entry.resolve(entry.callerId !== undefined ? { ...res!, id: entry.callerId } : res!);
   }
@@ -315,7 +405,18 @@ export class StdioRpcTransport implements RpcTransport {
   private fail(error: Error, report = true): void {
     if (this.failure) return;
     this.failure = error;
+    this.writes.length = 0;
+    this.queuedBytes = 0;
+    this.waitingDrain = false;
+    this.stdin.removeListener("drain", this.onDrain);
     for (const id of [...this.pending.keys()]) this.settle(id, undefined, error);
+    if (this.inputClosing && !this.stdin.writableEnded) {
+      try {
+        this.stdin.end();
+      } catch {
+        // Preserve the first failure if ending a broken stream also throws.
+      }
+    }
     if (report) this.errors.emit(error);
   }
 }
