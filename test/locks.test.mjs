@@ -172,8 +172,9 @@ describe("session writer lock", () => {
     assert.equal(lock.previous.state, "running");
     assert.equal(lock.previous.writer.pid, identity.pid);
     const recovered = await lock.recoverPreviousWriter(FAST_STOP);
-    // Windows: the pane's Job Object already ended pi when the pane died.
-    assert.equal(recovered, isWin ? "none" : "stopped");
+    // Windows: the pane's Job Object ends pi when the pane dies, possibly a moment after the mutex is abandoned.
+    if (isWin) assert.ok(recovered === "none" || recovered === "stopped", recovered);
+    else assert.equal(recovered, "stopped");
     assert.equal(await isSameProcess(identity), "gone");
     const record = JSON.parse(readFileSync(recordPath(lock.sessionFile), "utf8"));
     assert.equal(record.state, "starting");
