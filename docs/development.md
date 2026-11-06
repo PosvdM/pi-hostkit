@@ -6,7 +6,7 @@
 
 - Node.js 24 及以上和 npm。
 - 编译原生模块所需的工具链，见 [node-gyp 的安装说明](https://github.com/nodejs/node-gyp#installation)：Python 3，以及 C 编译器（macOS 为 Xcode Command Line Tools，Linux 为 gcc 和 make，Windows 为带“使用 C++ 的桌面开发”的 Visual Studio Build Tools）。
-- 运行测试需要 pi 1.5.0：全局安装（`npm install -g @earendil-works/pi-coding-agent@1.5.0`），或用环境变量 `PI_PACKAGE` 指向 pi 的包目录。
+- 运行测试需要 pi 1.5.0：通过官方脚本或全局 npm 安装，或用环境变量 `PI_PACKAGE` 指向 pi 的包目录。未设置 `PI_PACKAGE` 时按 `locatePi` 的顺序定位，见 [design.md](design.md#定位-pi)。
 
 ## 源码结构
 

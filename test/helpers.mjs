@@ -22,7 +22,7 @@ export async function until(fn, ms = 10_000, interval = 25) {
 }
 
 let pi;
-/** pi from PI_PACKAGE, or the global installation. */
+/** pi from PI_PACKAGE, or automatic managed/npm installation discovery. */
 export async function piInstall() {
   pi ??= await locatePi(process.env.PI_PACKAGE ? { piPath: process.env.PI_PACKAGE } : {});
   return pi;

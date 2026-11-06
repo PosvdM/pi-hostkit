@@ -123,6 +123,8 @@ describe("spawnManaged", () => {
     // Windows: the job may terminate the gate before it reads EOF.
     if (!isWin) assert.equal(exit.code, GATE_REFUSED_EXIT_CODE);
     assert.equal(report.steps[0].detail, "process held at the start gate");
+    proc.release();
+    assert.equal(proc.held, false);
   });
 
   test("stop removes a running bash tool and a background process that left pi's process group", async () => {

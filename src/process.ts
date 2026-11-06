@@ -389,7 +389,10 @@ class Managed implements ManagedProcess {
 
   release(): void {
     if (this.released) return;
-    if (this.exitInfo) return;
+    if (this.exitInfo) {
+      this.released = true;
+      return;
+    }
     this.rpc.writeRaw(`${GATE_RELEASE_LINE}\n`);
     this.rpc.block(undefined);
     this.released = true;
