@@ -6,7 +6,7 @@
       "conditions": [
         ["OS=='win'", {
           "sources": ["src/native/hostkit_win.c"],
-          "libraries": ["advapi32.lib"],
+          "libraries": ["advapi32.lib", "shell32.lib"],
           "defines": ["UNICODE", "_UNICODE", "WIN32_LEAN_AND_MEAN"]
         }],
         ["OS!='win'", {

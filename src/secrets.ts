@@ -1,4 +1,5 @@
 import { mkdir, chmod, lstat, open, unlink } from "node:fs/promises";
+import path from "node:path";
 import { nativeFn } from "./native.js";
 
 // Owners other than the current user that are acceptable on Windows: they can
@@ -24,6 +25,17 @@ function posixProblem(stat: Awaited<ReturnType<typeof lstat>>, directory: boolea
   return undefined;
 }
 
+/**
+ * macOS extended ACLs can grant other users access regardless of the mode
+ * bits, and chmod does not remove them. Linux POSIX ACLs need no check: with
+ * group bits 0 the ACL mask is 0, so named entries grant nothing.
+ */
+function macAclProblem(target: string): string | undefined {
+  if (process.platform !== "darwin") return undefined;
+  const count = nativeFn("aclEntryCount")(target);
+  return count ? `has an extended ACL with ${count} entr${count === 1 ? "y" : "ies"}` : undefined;
+}
+
 function windowsProblem(target: string): string | undefined {
   const user = nativeFn("userSid")();
   const acl = nativeFn("readAcl")(target);
@@ -41,8 +53,8 @@ function windowsProblem(target: string): string | undefined {
 /**
  * Checks that `target` is accessible only by the current user. POSIX: owner is
  * the current user, directories at most 0700, files at most 0600, not a
- * symbolic link. Windows: protected DACL whose allow entries name only the
- * current user's SID.
+ * symbolic link, and on macOS no extended ACL. Windows: protected DACL whose
+ * allow entries name only the current user's SID.
  */
 export async function checkPrivate(target: string): Promise<PrivateCheck> {
   let stat;
@@ -56,7 +68,7 @@ export async function checkPrivate(target: string): Promise<PrivateCheck> {
       ? stat.isSymbolicLink()
         ? "is a symbolic link"
         : windowsProblem(target)
-      : posixProblem(stat, stat.isDirectory());
+      : (posixProblem(stat, stat.isDirectory()) ?? macAclProblem(target));
   return problem ? { ok: false, problem: `${target} ${problem}` } : { ok: true };
 }
 
@@ -80,6 +92,7 @@ export async function ensurePrivateDir(dir: string): Promise<void> {
       throw privateError(dir, `${dir} is owned by uid ${stat.uid}, not the current user`);
     }
     if (Number(stat.mode) & 0o077) await chmod(dir, 0o700);
+    if (process.platform === "darwin" && nativeFn("aclEntryCount")(dir)) nativeFn("aclClear")(dir);
   }
   const check = await checkPrivate(dir);
   if (!check.ok) throw privateError(dir, check.problem);
@@ -87,13 +100,18 @@ export async function ensurePrivateDir(dir: string): Promise<void> {
 
 /**
  * Creates `file` exclusively (fails when it exists) so that only the current
- * user can read or write it, then writes `data`. On Windows the private DACL
- * is set before any data is written.
+ * user can read or write it, then writes `data`. The parent directory must
+ * already be private (see `ensurePrivateDir`): other users then cannot reach
+ * the file at all, including in the moment between creating it and setting
+ * its own permissions.
  */
 export async function writePrivateFile(file: string, data: Uint8Array): Promise<void> {
+  const parent = await checkPrivate(path.dirname(path.resolve(file)));
+  if (!parent.ok) throw privateError(file, `parent directory is not private: ${parent.problem}`);
   const handle = await open(file, "wx", 0o600);
   try {
     if (process.platform === "win32") nativeFn("setPrivateAcl")(file, false);
+    if (process.platform === "darwin" && nativeFn("aclEntryCount")(file)) nativeFn("aclClear")(file);
     await handle.writeFile(data);
     await handle.sync();
   } catch (error) {

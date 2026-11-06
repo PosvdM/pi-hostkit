@@ -8,10 +8,11 @@
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <shellapi.h>
+#include <winternl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <tlhelp32.h>
 #include <wchar.h>
 
 #include <node_api.h>
@@ -173,65 +174,140 @@ static napi_value process_object(napi_env env, DWORD pid, DWORD ppid, const char
   return obj;
 }
 
-static DWORD parent_of(DWORD pid) {
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE) return 0;
-  PROCESSENTRY32W e;
-  e.dwSize = sizeof(e);
-  DWORD ppid = 0;
-  if (Process32FirstW(snap, &e)) {
-    do {
-      if (e.th32ProcessID == pid) {
-        ppid = e.th32ParentProcessID;
-        break;
-      }
-    } while (Process32NextW(snap, &e));
+typedef LONG(NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
+
+// One snapshot of every process from NtQuerySystemInformation(
+// SystemProcessInformation). Parent PID and creation time in an entry belong
+// to the same process object, unlike a Toolhelp parent PID combined with a
+// creation time read later through a PID that may have been reused.
+// Returns a malloc'd buffer or NULL (error in *err).
+static BYTE *process_snapshot(DWORD *err) {
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  NtQuerySystemInformationFn query =
+      ntdll ? (NtQuerySystemInformationFn)(void *)GetProcAddress(ntdll, "NtQuerySystemInformation") : NULL;
+  if (!query) {
+    *err = ERROR_PROC_NOT_FOUND;
+    return NULL;
   }
-  CloseHandle(snap);
-  return ppid;
+  ULONG size = 1 << 20;
+  for (int attempt = 0; attempt < 8; attempt++) {
+    BYTE *buf = malloc(size);
+    if (!buf) {
+      *err = ERROR_NOT_ENOUGH_MEMORY;
+      return NULL;
+    }
+    ULONG needed = 0;
+    LONG status = query(5 /* SystemProcessInformation */, buf, size, &needed);
+    if (status >= 0) return buf;
+    free(buf);
+    if (status != (LONG)0xC0000004L /* STATUS_INFO_LENGTH_MISMATCH */) {
+      *err = (DWORD)status;
+      return NULL;
+    }
+    size = (needed > size ? needed : size) + (1 << 16);
+  }
+  *err = ERROR_INSUFFICIENT_BUFFER;
+  return NULL;
 }
 
-// processInfo(pid) -> { pid, ppid, startTime, zombie } | null
+typedef struct {
+  DWORD pid;
+  DWORD ppid;
+  char start[32];
+} proc_entry;
+
+// Iterates a snapshot. Returns 0 at the end.
+static int next_entry(BYTE *buf, size_t *offset, int *done, proc_entry *out) {
+  if (*done) return 0;
+  SYSTEM_PROCESS_INFORMATION *info = (SYSTEM_PROCESS_INFORMATION *)(buf + *offset);
+  // winternl.h names InheritedFromUniqueProcessId "Reserved2"; CreateTime is
+  // at byte 24 of Reserved1 (after WorkingSetPrivateSize, HardFaultCount,
+  // NumberOfThreadsHighWatermark and CycleTime).
+  LARGE_INTEGER created;
+  memcpy(&created, info->Reserved1 + 24, sizeof(created));
+  FILETIME ft;
+  ft.dwLowDateTime = created.LowPart;
+  ft.dwHighDateTime = (DWORD)created.HighPart;
+  out->pid = (DWORD)(ULONG_PTR)info->UniqueProcessId;
+  out->ppid = (DWORD)(ULONG_PTR)info->Reserved2;
+  format_start(&ft, out->start, sizeof(out->start));
+  if (info->NextEntryOffset == 0) *done = 1;
+  else *offset += info->NextEntryOffset;
+  return 1;
+}
+
+// processInfo(pid) -> { pid, ppid, startTime, zombie } | null (not running).
 static napi_value process_info(napi_env env, napi_callback_info info) {
   napi_value argv[1];
   DWORD pid;
   if (!get_args(env, info, 1, argv) || !get_pid(env, argv[0], &pid)) return NULL;
-  char start[32];
-  HANDLE h = open_live(pid, 0, start, sizeof(start));
-  if (!h) return js_null(env);
-  CloseHandle(h);
-  return process_object(env, pid, parent_of(pid), start);
+  DWORD err = 0;
+  BYTE *buf = process_snapshot(&err);
+  if (!buf) return throw_win(env, "NtQuerySystemInformation", err);
+  size_t offset = 0;
+  int done = 0;
+  proc_entry e;
+  napi_value result = NULL;
+  int found = 0;
+  while (next_entry(buf, &offset, &done, &e)) {
+    if (e.pid == pid) {
+      found = 1;
+      break;
+    }
+  }
+  free(buf);
+  if (!found) return js_null(env);
+  // An exited process can stay in the table while handles to it are open.
+  // Mark it as a zombie when it can be opened and has exited; when it cannot
+  // be opened (access denied) it counts as running.
+  int exited = 0;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+  if (h) {
+    FILETIME created, exit_time, kernel, user;
+    char start[32];
+    if (GetProcessTimes(h, &created, &exit_time, &kernel, &user)) {
+      format_start(&created, start, sizeof(start));
+      // Same process object as the snapshot entry: check whether it has exited.
+      if (strcmp(start, e.start) == 0 && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) exited = 1;
+    }
+    CloseHandle(h);
+  } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
+    return js_null(env);
+  }
+  result = process_object(env, e.pid, e.ppid, e.start);
+  if (result && exited) {
+    napi_value v;
+    napi_get_boolean(env, true, &v);
+    napi_set_named_property(env, result, "zombie", v);
+  }
+  return result ? result : NULL;
 }
 
-// listProcesses() -> processInfo objects for processes this user can query.
+// listProcesses() -> processInfo objects for every process (PID 0 excluded).
 static napi_value list_processes(napi_env env, napi_callback_info info) {
   (void)info;
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-  if (snap == INVALID_HANDLE_VALUE) return throw_win(env, "CreateToolhelp32Snapshot", GetLastError());
+  DWORD err = 0;
+  BYTE *buf = process_snapshot(&err);
+  if (!buf) return throw_win(env, "NtQuerySystemInformation", err);
   napi_value array;
   if (napi_create_array(env, &array) != napi_ok) {
-    CloseHandle(snap);
+    free(buf);
     return NULL;
   }
-  PROCESSENTRY32W e;
-  e.dwSize = sizeof(e);
+  size_t offset = 0;
+  int done = 0;
   uint32_t index = 0;
-  if (Process32FirstW(snap, &e)) {
-    do {
-      if (e.th32ProcessID == 0) continue;
-      char start[32];
-      HANDLE h = open_live(e.th32ProcessID, 0, start, sizeof(start));
-      if (!h) continue;
-      CloseHandle(h);
-      napi_value obj = process_object(env, e.th32ProcessID, e.th32ParentProcessID, start);
-      if (!obj) {
-        CloseHandle(snap);
-        return NULL;
-      }
-      napi_set_element(env, array, index++, obj);
-    } while (Process32NextW(snap, &e));
+  proc_entry e;
+  while (next_entry(buf, &offset, &done, &e)) {
+    if (e.pid == 0) continue;
+    napi_value obj = process_object(env, e.pid, e.ppid, e.start);
+    if (!obj) {
+      free(buf);
+      return NULL;
+    }
+    napi_set_element(env, array, index++, obj);
   }
-  CloseHandle(snap);
+  free(buf);
   return array;
 }
 
@@ -243,7 +319,9 @@ typedef struct {
   PWSTR Buffer;
 } HK_UNICODE_STRING;
 
-// processCommandLine(pid) -> string | null (ProcessCommandLineInformation).
+// processCommandLine(pid) -> string[] | null: the command line
+// (ProcessCommandLineInformation) split with CommandLineToArgvW, the rules the
+// Microsoft C runtime and Node use.
 static napi_value process_command_line(napi_env env, napi_callback_info info) {
   napi_value argv[1];
   DWORD pid;
@@ -273,10 +351,28 @@ static napi_value process_command_line(napi_env env, napi_callback_info info) {
     return js_null(env);
   }
   HK_UNICODE_STRING *s = (HK_UNICODE_STRING *)buf;
-  napi_value result;
-  napi_create_string_utf16(env, (const char16_t *)s->Buffer, s->Length / sizeof(wchar_t), &result);
+  size_t chars = s->Length / sizeof(wchar_t);
+  wchar_t *line = malloc((chars + 1) * sizeof(wchar_t));
+  if (!line) {
+    free(buf);
+    return js_null(env);
+  }
+  memcpy(line, s->Buffer, chars * sizeof(wchar_t));
+  line[chars] = 0;
   free(buf);
-  return result;
+  int argc = 0;
+  LPWSTR *args = chars ? CommandLineToArgvW(line, &argc) : NULL;
+  free(line);
+  if (!args) return js_null(env);
+  napi_value array;
+  napi_create_array(env, &array);
+  for (int i = 0; i < argc; i++) {
+    napi_value v;
+    napi_create_string_utf16(env, (const char16_t *)args[i], wcslen(args[i]), &v);
+    napi_set_element(env, array, (uint32_t)i, v);
+  }
+  LocalFree(args);
+  return array;
 }
 
 // terminateProcess(pid, startTime) -> boolean. The creation time is checked on

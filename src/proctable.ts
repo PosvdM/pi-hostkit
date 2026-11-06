@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from "node:fs";
+import { constants } from "node:os";
 import { nativeFn } from "./native.js";
 
 /** One process in the process table. */
@@ -9,7 +10,7 @@ export interface ProcessRow {
   pgid?: number;
   /** Creation time as recorded by the OS; format differs per platform, compare only for equality. */
   startTime: string;
-  /** Exited but not reaped (POSIX). A zombie is treated as gone. */
+  /** Exited but not reaped. A zombie is treated as gone. */
   zombie: boolean;
 }
 
@@ -19,58 +20,80 @@ function bootId(): string {
   return linuxBootId;
 }
 
+function isAbsent(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ESRCH";
+}
+
 /**
  * Linux: `/proc/<pid>/stat` field 22 (start time in clock ticks since boot),
  * prefixed with the boot id. The boot id changes on every reboot, so a
  * recorded identity never matches after a restart. The boot time in
  * `/proc/stat` is not used because it can drift by a second between reads.
+ * Returns null only when the process does not exist; other read errors throw.
  */
 function linuxRow(pid: number): ProcessRow | null {
   let stat: string;
   try {
     stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-  } catch {
-    return null;
+  } catch (error) {
+    if (isAbsent(error)) return null;
+    throw error;
   }
   const close = stat.lastIndexOf(")");
-  if (close < 0) return null;
-  const fields = stat.slice(close + 2).split(" ");
+  const fields = close < 0 ? [] : stat.slice(close + 2).split(" ");
   // fields[0] is field 3 (state); field N is fields[N - 3].
-  const state = fields[0];
-  const ppid = Number(fields[1]);
-  const pgid = Number(fields[2]);
   const ticks = fields[19];
-  if (!ticks) return null;
-  return { pid, ppid, pgid, startTime: `${bootId()}:${ticks}`, zombie: state === "Z" || state === "X" };
+  if (!ticks) throw Object.assign(new Error(`cannot parse /proc/${pid}/stat`), { code: "EHOSTKIT_PROC" });
+  const state = fields[0];
+  return {
+    pid,
+    ppid: Number(fields[1]),
+    pgid: Number(fields[2]),
+    startTime: `${bootId()}:${ticks}`,
+    zombie: state === "Z" || state === "X",
+  };
 }
 
-/** Reads one process, or null when it does not exist or is not visible. */
+/**
+ * Reads one process. Null means the process does not exist; a failed query
+ * throws, so callers never mistake "cannot tell" for "gone".
+ */
 export function processInfo(pid: number): ProcessRow | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   if (process.platform === "linux") return linuxRow(pid);
   return nativeFn("processInfo")(pid);
 }
 
-/** Lists processes visible to the current user. */
+/** Lists processes (on Linux, those whose /proc entry is readable). */
 export function listProcesses(): ProcessRow[] {
   if (process.platform === "linux") {
     const rows: ProcessRow[] = [];
     for (const name of readdirSync("/proc")) {
       if (!/^\d+$/.test(name)) continue;
-      const row = linuxRow(Number(name));
-      if (row) rows.push(row);
+      try {
+        const row = linuxRow(Number(name));
+        if (row) rows.push(row);
+      } catch {
+        // Unreadable entries are skipped; callers that must decide about a
+        // specific process use processInfo, which throws instead.
+      }
     }
     return rows;
   }
   return nativeFn("listProcesses")();
 }
 
-/** Command line arguments of a process; Windows returns the raw command line as one string. */
-export function processCommandLine(pid: number): string[] | string | null {
+/**
+ * Command line arguments of a process, or null when they cannot be read.
+ * Windows splits the command line with CommandLineToArgvW.
+ */
+export function processCommandLine(pid: number): string[] | null {
   if (process.platform === "linux") {
     try {
       const raw = readFileSync(`/proc/${pid}/cmdline`, "utf8");
-      return raw.split("\0").filter((part, index, all) => part !== "" || index < all.length - 1);
+      if (!raw) return null;
+      return (raw.endsWith("\0") ? raw.slice(0, -1) : raw).split("\0");
     } catch {
       return null;
     }
@@ -84,9 +107,15 @@ export function startKey(startTime: string): bigint {
   if (process.platform === "linux") return BigInt(startTime.slice(startTime.lastIndexOf(":") + 1));
   if (process.platform === "darwin") {
     const [sec, usec = "0"] = startTime.split(".");
-    return BigInt(sec) * 1_000_000n + BigInt(usec);
+    return BigInt(sec!) * 1_000_000n + BigInt(usec);
   }
   return BigInt(startTime);
+}
+
+/** Linux: start times from different boots are not comparable. */
+function sameBoot(a: string, b: string): boolean {
+  if (process.platform !== "linux") return true;
+  return a.slice(0, a.lastIndexOf(":")) === b.slice(0, b.lastIndexOf(":"));
 }
 
 /** True when the row exists, matches the start time and is not a zombie. */
@@ -106,18 +135,81 @@ export function descendants(table: ProcessRow[], root: { pid: number; startTime:
     else byParent.set(row.ppid, [row]);
   }
   const result: ProcessRow[] = [];
-  const queue: { pid: number; key: bigint }[] = [{ pid: root.pid, key: startKey(root.startTime) }];
+  const queue: { pid: number; startTime: string; key: bigint }[] = [{ ...root, key: startKey(root.startTime) }];
   const seen = new Set<number>([root.pid]);
   while (queue.length) {
     const parent = queue.shift()!;
     for (const child of byParent.get(parent.pid) ?? []) {
-      if (seen.has(child.pid)) continue;
+      if (seen.has(child.pid) || !sameBoot(child.startTime, parent.startTime)) continue;
       const key = startKey(child.startTime);
       if (key < parent.key) continue;
       seen.add(child.pid);
       result.push(child);
-      queue.push({ pid: child.pid, key });
+      queue.push({ pid: child.pid, startTime: child.startTime, key });
     }
   }
   return result;
+}
+
+let pidfdUsable = process.platform === "linux";
+let pidfdGroupUsable = process.platform === "linux";
+
+function errnoCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code;
+}
+
+/**
+ * POSIX: sends `signal` to the process `id` (or, with `group`, to its current
+ * process group, which must equal `group`) only if its identity still
+ * matches. Linux uses a pidfd opened before the identity check, so the signal
+ * cannot reach a process that reused the PID afterwards. macOS has no pidfd:
+ * a PID reused between the check and kill() remains a documented residual
+ * risk. Returns false when the process is gone or no longer matches.
+ */
+export function signalProcess(id: { pid: number; startTime: string }, signal: NodeJS.Signals, group?: number): boolean {
+  if (pidfdUsable) {
+    let fd: number;
+    try {
+      fd = nativeFn("pidfdOpen")(id.pid);
+    } catch (error) {
+      if (errnoCode(error) !== "ENOSYS") throw error;
+      pidfdUsable = false;
+      return signalProcess(id, signal, group);
+    }
+    if (fd < 0) return false;
+    try {
+      const row = processInfo(id.pid);
+      if (!matches(row, id)) return false;
+      if (group !== undefined && row!.pgid !== group) return false;
+      const signo = constants.signals[signal];
+      if (group === undefined) return nativeFn("pidfdSignal")(fd, signo, false);
+      if (pidfdGroupUsable) {
+        try {
+          return nativeFn("pidfdSignal")(fd, signo, true);
+        } catch (error) {
+          if (errnoCode(error) !== "EINVAL") throw error;
+          pidfdGroupUsable = false; // kernels before 6.9
+        }
+      }
+      // The group exists while this verified member is in it, so its id cannot
+      // be reused until every member has exited.
+      return killQuietly(-group, signal);
+    } finally {
+      nativeFn("fdClose")(fd);
+    }
+  }
+  const row = processInfo(id.pid);
+  if (!matches(row, id)) return false;
+  if (group !== undefined && row!.pgid !== group) return false;
+  return killQuietly(group !== undefined ? -group : id.pid, signal);
+}
+
+function killQuietly(target: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(target, signal);
+    return true;
+  } catch (error) {
+    if (errnoCode(error) === "ESRCH") return false;
+    throw error;
+  }
 }

@@ -1,11 +1,11 @@
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { GATE_RELEASE_LINE } from "./gate-protocol.js";
 import { nativeFn } from "./native.js";
-import { descendants, listProcesses, matches, processInfo, startKey, type ProcessRow } from "./proctable.js";
+import { descendants, listProcesses, matches, processInfo, signalProcess, type ProcessRow } from "./proctable.js";
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
 
 export interface ProcessIdentity {
@@ -83,12 +83,29 @@ export interface ManagedProcess {
 }
 
 const DEFAULT_STOP: Required<StopOptions> = { abortTimeoutMs: 10_000, graceMs: 5_000, termGraceMs: 3_000 };
+const MAX_TIMER_MS = 2 ** 31 - 1;
 const STDERR_TAIL = 64 * 1024;
 const SETTLE_CHECK_MS = 2_000;
 
 const gatePath = path.join(path.dirname(fileURLToPath(import.meta.url)), "gate.js");
 
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Applies defaults per field (`undefined` keeps the default) and rejects
+ * values that would make a wait unbounded or invalid.
+ */
+export function resolveStopOptions(opts: StopOptions = {}): Required<StopOptions> {
+  const out = {} as Required<StopOptions>;
+  for (const key of Object.keys(DEFAULT_STOP) as (keyof StopOptions)[]) {
+    const value = opts[key] ?? DEFAULT_STOP[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > MAX_TIMER_MS) {
+      throw hostkitError("EINVAL", `${key} must be a finite number of milliseconds between 0 and ${MAX_TIMER_MS}`);
+    }
+    out[key] = value;
+  }
+  return out;
+}
 
 function hostkitError(code: string, message: string, extra: Record<string, unknown> = {}): Error {
   return Object.assign(new Error(message), { code, ...extra });
@@ -117,7 +134,11 @@ export function currentProcessIdentity(instanceId: string, runId = "host"): Proc
   return id;
 }
 
-/** `alive` only when the PID exists and its creation time matches; a reused PID is `gone`. */
+/**
+ * `alive` only when the PID exists and its creation time matches; a reused PID
+ * is `gone`. Throws when the process table cannot be queried, so a failed
+ * query is never reported as `gone`.
+ */
 export async function isSameProcess(id: Pick<ProcessIdentity, "pid" | "startTime">): Promise<"alive" | "gone"> {
   return matches(processInfo(id.pid), id) ? "alive" : "gone";
 }
@@ -175,15 +196,57 @@ function cgroupOf(pid: number): string | null {
   }
 }
 
-function cgroupPids(dir: string): number[] {
+function isMissing(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENODEV";
+}
+
+/**
+ * Whether any process remains in the scope or its sub-cgroups
+ * (`cgroup.events` `populated`). A removed directory counts as empty; other
+ * read errors throw, so a failed check is never taken as "empty".
+ */
+function cgroupPopulated(dir: string): boolean {
+  let events: string;
   try {
-    return readFileSync(path.join(dir, "cgroup.procs"), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .map(Number);
-  } catch {
-    return [];
+    events = readFileSync(path.join(dir, "cgroup.events"), "utf8");
+  } catch (error) {
+    if (isMissing(error)) return false;
+    throw error;
   }
+  const match = /^populated (\d)$/m.exec(events);
+  if (!match) throw hostkitError("EHOSTKIT_CGROUP", `cannot read populated from ${dir}/cgroup.events`);
+  return match[1] === "1";
+}
+
+/** PIDs in the scope and all its sub-cgroups. */
+function cgroupPids(dir: string): number[] {
+  const pids: number[] = [];
+  const walk = (current: string) => {
+    let procs: string;
+    try {
+      procs = readFileSync(path.join(current, "cgroup.procs"), "utf8");
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
+    for (const line of procs.split("\n")) if (line) pids.push(Number(line));
+    let entries;
+    try {
+      entries = readdirSync(current, { withFileTypes: true });
+    } catch (error) {
+      if (isMissing(error)) return;
+      throw error;
+    }
+    for (const entry of entries) if (entry.isDirectory()) walk(path.join(current, entry.name));
+  };
+  walk(dir);
+  return pids;
+}
+
+function inScope(pid: number, dir: string): boolean {
+  const current = cgroupOf(pid);
+  return current !== null && (current === dir || current.startsWith(`${dir}/`));
 }
 
 function cgroupKill(dir: string): string {
@@ -192,18 +255,15 @@ function cgroupKill(dir: string): string {
     return "cgroup.kill";
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code !== "ENOENT" && code !== "EINVAL") throw error;
+    if (isMissing(error)) return "scope already removed";
+    if (code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") throw error;
   }
-  // Kernels before 5.14 have no cgroup.kill: signal each member, re-reading
-  // membership right before the signal so a reused PID outside the scope is skipped.
-  for (let round = 0; round < 5; round++) {
-    const pids = cgroupPids(dir);
-    if (!pids.length) break;
-    for (const pid of pids) {
-      if (cgroupOf(pid) !== dir) continue;
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {}
+  // Kernels before 5.14 have no cgroup.kill: SIGKILL each member of the
+  // subtree. Membership and identity are checked right before each signal.
+  for (let round = 0; round < 5 && cgroupPopulated(dir); round++) {
+    for (const pid of cgroupPids(dir)) {
+      const row = processInfo(pid);
+      if (row && inScope(pid, dir)) signalProcess(row, "SIGKILL");
     }
   }
   return "SIGKILL members";
@@ -223,20 +283,7 @@ function scopeUnit(runId: string): string {
   return `pi-hostkit-${safe}-${randomBytes(4).toString("hex")}`;
 }
 
-// ---------- POSIX signals with identity checks ----------
-
-function signalIdentity(id: { pid: number; startTime: string }, signal: NodeJS.Signals, group?: number): boolean {
-  // Check right before signalling. A remaining race (exit and PID reuse between
-  // the check and kill) is accepted and documented in docs/design.md.
-  if (!matches(processInfo(id.pid), id)) return false;
-  try {
-    process.kill(group !== undefined ? -group : id.pid, signal);
-    return true;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ESRCH") return false;
-    throw error;
-  }
-}
+// ---------- snapshot coverage ----------
 
 class SnapshotRecords {
   readonly records = new Map<string, ProcessRow>();
@@ -247,15 +294,18 @@ class SnapshotRecords {
     this.records.set(`${row.pid}:${row.startTime}`, row);
   }
 
-  /** Records every live descendant of the root and members of the root's process group. */
+  /**
+   * Records every live descendant of pi and the members of pi's process group
+   * (pgid = pi's pid). Only while pi itself is alive with the recorded
+   * identity: after pi has exited its PID, and so the group id, may belong to
+   * an unrelated process, and nothing new is added.
+   */
   capture(): void {
     const table = listProcesses();
-    const rootRow = table.find((row) => matches(row, this.root));
-    if (rootRow) for (const row of descendants(table, this.root)) this.remember(row);
-    // Members of pi's own group stay findable after pi exits (POSIX: pgid = pi's pid).
-    const rootKey = startKey(this.root.startTime);
+    if (!table.some((row) => matches(row, this.root))) return;
+    for (const row of descendants(table, this.root)) this.remember(row);
     for (const row of table) {
-      if (row.pgid === this.root.pid && row.pid !== this.root.pid && startKey(row.startTime) >= rootKey) this.remember(row);
+      if (row.pgid === this.root.pid && row.pid !== this.root.pid) this.remember(row);
     }
   }
 
@@ -263,7 +313,12 @@ class SnapshotRecords {
     return [...this.records.values()].filter((row) => matches(processInfo(row.pid), row));
   }
 
-  /** SIGKILL every recorded process group except pi's own, then each recorded process. */
+  /**
+   * SIGKILL the current process group of every recorded process that still
+   * matches its identity (except pi's own group), then each such process. A
+   * group is signalled only through a verified member, while that member is
+   * in it.
+   */
   killDescendants(): number[] {
     const groups = new Set<number>();
     for (const row of this.records.values()) {
@@ -271,21 +326,18 @@ class SnapshotRecords {
       if (!matches(current, row)) continue;
       const pgid = current!.pgid;
       if (pgid !== undefined && pgid !== this.root.pid && pgid > 1 && !groups.has(pgid)) {
-        if (signalIdentity(row, "SIGKILL", pgid)) groups.add(pgid);
+        if (signalProcess(row, "SIGKILL", pgid)) groups.add(pgid);
       }
-      signalIdentity(row, "SIGKILL");
+      signalProcess(row, "SIGKILL");
     }
     return [...groups];
   }
 
-  /** SIGKILL pi's process group when pi or a recorded member of it is still alive. */
+  /** SIGKILL pi's process group through pi or a recorded member that is verified to be in it. */
   killRootGroup(): boolean {
     const members = [this.root as { pid: number; startTime: string }, ...this.records.values()];
     for (const member of members) {
-      const current = processInfo(member.pid);
-      if (matches(current, member) && (member === this.root || current!.pgid === this.root.pid)) {
-        if (signalIdentity(member, "SIGKILL", this.root.pid)) return true;
-      }
+      if (signalProcess(member, "SIGKILL", this.root.pid)) return true;
     }
     return false;
   }
@@ -306,6 +358,27 @@ function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport
 
 function liveRows(pids: number[]): ProcessRow[] {
   return pids.map((pid) => processInfo(pid)).filter((row): row is ProcessRow => !!row && !row.zombie);
+}
+
+/** Kills a cgroup scope and verifies it is empty, sub-cgroups included. */
+async function killScope(dir: string, steps: Steps): Promise<StopReport["leftovers"]> {
+  try {
+    steps.add("kill cgroup", true, cgroupKill(dir));
+  } catch (error) {
+    steps.add("kill cgroup", false, (error as Error).message);
+  }
+  let emptied = false;
+  try {
+    emptied = await poll(() => !cgroupPopulated(dir), SETTLE_CHECK_MS);
+  } catch (error) {
+    steps.add("check cgroup", false, (error as Error).message);
+  }
+  if (emptied) return [];
+  const pids = cgroupPids(dir);
+  // Populated (or unreadable) with no process left that can be listed: report
+  // the scope itself so the stop is not mistaken for a complete one.
+  const rows = liveRows(pids);
+  return rows.length ? rowsToLeftovers(rows) : [{ pid: 0, startTime: "", exe: `cgroup ${dir}` }];
 }
 
 // ---------- spawnManaged ----------
@@ -386,7 +459,15 @@ class Managed implements ManagedProcess {
   }
 
   stop(opts: StopOptions = {}): Promise<StopReport> {
-    this.stopping ??= this.runStop({ ...DEFAULT_STOP, ...opts });
+    if (!this.stopping) {
+      let resolved: Required<StopOptions>;
+      try {
+        resolved = resolveStopOptions(opts);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      this.stopping = this.runStop(resolved);
+    }
     return this.stopping;
   }
 
@@ -403,9 +484,16 @@ class Managed implements ManagedProcess {
     this.timer = undefined;
   }
 
-  private async waitExit(ms: number): Promise<boolean> {
-    if (this.exitInfo) return true;
-    return Promise.race([this.exited.then(() => true), delay(ms).then(() => false)]);
+  /** Waits up to `ms` for exit; the timer is cleared as soon as the process exits. */
+  private waitExit(ms: number): Promise<boolean> {
+    if (this.exitInfo) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(false), ms);
+      void this.exited.then(() => {
+        clearTimeout(timer);
+        resolve(true);
+      });
+    });
   }
 
   private async runStop(opts: Required<StopOptions>): Promise<StopReport> {
@@ -437,7 +525,8 @@ class Managed implements ManagedProcess {
         steps.add("SIGTERM", true, "not needed: process exited");
       } else {
         // pi's RPC mode terminates the command trees it tracks on SIGTERM.
-        const sent = signalIdentity(this.identity, "SIGTERM");
+        // pi is this host's unreaped child here, so its PID cannot be reused.
+        const sent = signalProcess(this.identity, "SIGTERM");
         const exited = sent && (await this.waitExit(opts.termGraceMs));
         steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${opts.termGraceMs} ms` : "not delivered");
       }
@@ -458,13 +547,7 @@ class Managed implements ManagedProcess {
       nativeFn("handleClose")(job);
     } else if (this.mode.kind === "cgroup") {
       const { dir } = this.mode;
-      try {
-        steps.add("kill cgroup", true, cgroupKill(dir));
-      } catch (error) {
-        steps.add("kill cgroup", false, (error as Error).message);
-      }
-      await poll(() => cgroupPids(dir).length === 0, SETTLE_CHECK_MS);
-      leftovers = rowsToLeftovers(liveRows(cgroupPids(dir)));
+      leftovers = await killScope(dir, steps);
     } else {
       this.capture();
       const groups = this.snapshots.killDescendants();
@@ -572,10 +655,11 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
  * Stops a process recorded by an earlier host instance (no RPC connection, not
  * a child of this process). Verifies the identity before every signal. With a
  * recorded cgroup scope of its own, the whole scope is killed even when pi
- * itself has exited: the scope holds only that run's processes.
+ * itself has exited: the scope holds only that run's processes. Without one,
+ * only pi and the descendants found while pi is alive are reached.
  */
 export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}): Promise<StopReport> {
-  const o = { ...DEFAULT_STOP, ...opts };
+  const o = resolveStopOptions(opts);
   const steps = new Steps();
   steps.add("abort", false, "no RPC connection to a recorded process");
   const alive = () => matches(processInfo(id.pid), id);
@@ -599,17 +683,15 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
   const records = new SnapshotRecords(id);
   if (!cgroup) records.capture();
   if (alive()) {
-    const sent = signalIdentity(id, "SIGTERM");
+    const sent = signalProcess(id, "SIGTERM");
     const exited = sent && (await poll(() => !alive(), o.termGraceMs));
     steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${o.termGraceMs} ms` : "not delivered");
   }
 
   if (cgroup) {
-    steps.add("kill cgroup", true, cgroupKill(cgroup));
-    await poll(() => cgroupPids(cgroup).length === 0, SETTLE_CHECK_MS);
-    const leftovers = liveRows(cgroupPids(cgroup));
+    const leftovers = await killScope(cgroup, steps);
     steps.add("verify", leftovers.length === 0);
-    return { steps: steps.steps, coverage: "cgroup", leftovers: rowsToLeftovers(leftovers) };
+    return { steps: steps.steps, coverage: "cgroup", leftovers };
   }
 
   records.capture();
@@ -621,4 +703,9 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
   const leftovers = watch();
   steps.add("verify", leftovers.length === 0);
   return { steps: steps.steps, coverage: "snapshot_visible", leftovers: rowsToLeftovers(leftovers) };
+}
+
+/** Whether `id` has an own cgroup scope that still contains processes (Linux). */
+export function scopePopulated(id: Pick<ProcessIdentity, "cgroup">): boolean {
+  return process.platform === "linux" && isOwnScope(id.cgroup) && cgroupPopulated(id.cgroup!);
 }

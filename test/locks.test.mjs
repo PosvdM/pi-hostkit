@@ -293,6 +293,87 @@ describe("session writer lock", () => {
     await third.release();
   });
 
+  test("release during recovery wins: recovery cannot write or spawn afterwards", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const sessionFile = f.sessionPath("race");
+    const lock = await acquireSessionWriterLock(sessionFile, host());
+    const recovering = lock.recoverPreviousWriter();
+    const releasing = lock.release();
+    // Operations run in call order: recovery completes first, then release.
+    assert.equal(await recovering, "none");
+    await releasing;
+    assert.equal(JSON.parse(readFileSync(recordPath(lock.sessionFile), "utf8")).state, "released");
+    await assert.rejects(lock.spawnWriter({ argv: await piArgv(["--session", sessionFile]), cwd: f.cwd, env: f.env, runId: "r", instanceId: "i" }), {
+      code: "EHOSTKIT_LOCK_STATE",
+    });
+    await assert.rejects(lock.update({ state: "running" }), { code: "EHOSTKIT_LOCK_STATE" });
+
+    const second = await acquireSessionWriterLock(sessionFile, host());
+    const released = second.release();
+    await released;
+    await assert.rejects(second.recoverPreviousWriter(), { code: "EHOSTKIT_LOCK_STATE" });
+  });
+
+  test("spawnWriter requires this lock's --session and one running writer at a time", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const sessionFile = f.sessionPath("single");
+    const lock = await acquireSessionWriterLock(sessionFile, host());
+    await lock.recoverPreviousWriter();
+    const base = { cwd: f.cwd, env: f.env, containment, runId: "w", instanceId: "i" };
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv() }), { code: "EINVAL" });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", f.sessionPath("other")]) }), { code: "EINVAL" });
+    const writer = await lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) });
+    await assert.rejects(lock.spawnWriter({ ...base, argv: await piArgv(["--session", sessionFile]) }), { code: "EHOSTKIT_LOCK_STATE" });
+    await writer.stop(FAST_STOP);
+    await lock.release();
+  });
+
+  test("gates for other sessions or with relative --session are not stopped; recovery fails closed", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const sessionFile = f.sessionPath("prefix");
+    await leaveStartingRecord(sessionFile);
+    const startGate = async (sessionArg) => {
+      const gate = spawn(process.execPath, [path.join(here, "..", "dist", "gate.js"), ...(await piArgv(["--session", sessionArg]))], {
+        cwd: f.cwd,
+        env: f.env,
+        stdio: ["pipe", "ignore", "ignore"],
+        detached: !isWin,
+      });
+      children.add(gate);
+      await new Promise((resolve) => gate.once("spawn", resolve));
+      return gate;
+    };
+    const other = await startGate(`${sessionFile}.bak`);
+    const lock = await acquireWhenFree(sessionFile, "pi-pane");
+    assert.equal(await lock.recoverPreviousWriter(FAST_STOP), "failed");
+    assert.equal(lock.recoveryReports.length, 0);
+    assert.equal(other.exitCode, null, "a gate for a.jsonl.bak must not be stopped");
+
+    const relative = await startGate(path.basename(sessionFile));
+    const again = await acquireWhenFree(sessionFile, "pi-pane");
+    assert.equal(await again.recoverPreviousWriter(FAST_STOP), "failed");
+    assert.equal(relative.exitCode, null);
+    other.kill("SIGKILL");
+    relative.kill("SIGKILL");
+  });
+
+  test("a record with valid JSON but invalid content fails closed", async () => {
+    const f = await piFixture();
+    cleanups.push(f.cleanup);
+    const sessionFile = f.sessionPath("semantic");
+    const first = await acquireSessionWriterLock(sessionFile, host());
+    const recordFile = recordPath(first.sessionFile);
+    await first.release();
+    const bad = JSON.stringify({ version: 1, state: "running", writer: {} });
+    writeFileSync(recordFile, bad);
+    const lock = await acquireSessionWriterLock(sessionFile, host());
+    assert.equal(await lock.recoverPreviousWriter(), "failed");
+    assert.equal(readFileSync(recordFile, "utf8"), bad);
+  });
+
   test("a corrupt record fails closed", async () => {
     const f = await piFixture();
     cleanups.push(f.cleanup);

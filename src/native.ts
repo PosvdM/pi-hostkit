@@ -34,8 +34,13 @@ export interface NativeBinding {
   listProcesses?(): NativeProcessRow[];
   // macOS
   processArgs?(pid: number): string[] | null;
+  aclEntryCount?(path: string): number;
+  aclClear?(path: string): void;
+  // Linux
+  pidfdOpen?(pid: number): number;
+  pidfdSignal?(fd: number, signo: number, group: boolean): boolean;
   // Windows
-  processCommandLine?(pid: number): string | null;
+  processCommandLine?(pid: number): string[] | null;
   terminateProcess?(pid: number, startTime: string): boolean;
   jobCreate?(): number;
   jobAssign?(job: number, pid: number, startTime: string): void;

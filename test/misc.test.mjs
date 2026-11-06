@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, before, describe, test } from "node:test";
@@ -50,6 +51,31 @@ describe("secrets", () => {
       assert.equal(check.ok, false);
       assert.match(check.problem, /wider than 600/);
     }
+  });
+});
+
+describe("secrets: extra rules", () => {
+  test("writePrivateFile refuses a parent directory that is not private", async () => {
+    const dir = path.join(root, "public-parent");
+    mkdirSync(dir, { recursive: true });
+    if (!isWin) chmodSync(dir, 0o755);
+    await assert.rejects(writePrivateFile(path.join(dir, "k"), Buffer.from("x")), { code: "EHOSTKIT_NOT_PRIVATE" });
+  });
+
+  test("macOS: an extended ACL makes a 0600 file not private; ensurePrivateDir removes it from the directory", { skip: process.platform !== "darwin" }, async () => {
+    const dir = path.join(root, "acl");
+    await ensurePrivateDir(dir);
+    const file = path.join(dir, "k");
+    await writePrivateFile(file, Buffer.from("x"));
+    execFileSync("chmod", ["+a", "everyone allow read", file]);
+    assert.equal(statSync(file).mode & 0o777, 0o600);
+    const check = await checkPrivate(file);
+    assert.equal(check.ok, false);
+    assert.match(check.problem, /extended ACL/);
+    execFileSync("chmod", ["+a", "everyone allow list,search", dir]);
+    assert.equal((await checkPrivate(dir)).ok, false);
+    await ensurePrivateDir(dir);
+    assert.deepEqual(await checkPrivate(dir), { ok: true });
   });
 });
 

@@ -91,6 +91,18 @@ describe("StdioRpcTransport", () => {
     assert.deepEqual(diagnostics, ["late_response", "unmatched_response"]);
   });
 
+  test("a timed-out id cannot be reused before its late response arrives", async () => {
+    const t = transport();
+    await assert.rejects(t.rpc.send({ type: "abort", id: "x" }, { timeoutMs: 10 }), RpcTimeoutError);
+    await assert.rejects(t.rpc.send({ type: "get_state", id: "x" }), /cannot be reused/);
+    t.emit({ type: "response", id: "x", command: "abort", success: true });
+    await t.tick();
+    const p = t.rpc.send({ type: "get_state", id: "x" });
+    await t.tick();
+    t.emit({ type: "response", id: "x", command: "get_state", success: true });
+    assert.equal((await p).command, "get_state");
+  });
+
   test("invalid JSON fails the transport and rejects pending commands", async () => {
     const t = transport();
     const errors = [];

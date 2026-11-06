@@ -41,6 +41,7 @@
     "build": "tsc -p tsconfig.json",
     "build:native": "node-gyp rebuild",
     "prebuildify": "prebuildify --napi --strip",
+    "pretest": "npm run build && npm run build:native",
     "test": "node --test --test-concurrency=1 \"test/**/*.test.mjs\""
   },
   "dependencies": {

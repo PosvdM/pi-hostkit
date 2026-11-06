@@ -1,13 +1,15 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
+import { isMainThread } from "node:worker_threads";
 import { assertLocalFilesystem } from "./localfs.js";
 import { nativeFn } from "./native.js";
 import { comparisonKey, realPathOrPending } from "./paths.js";
 import {
   isSameProcess,
+  scopePopulated,
   spawnManaged,
   stopByIdentity,
   type ManagedProcess,
@@ -52,6 +54,11 @@ export interface RecoverOptions extends StopOptions {
   assumeNoWriter?: boolean;
 }
 
+/**
+ * Operations on one lock (`recoverPreviousWriter`, `update`, `spawnWriter`,
+ * `release`) run one at a time in call order; after `release()` the others
+ * throw `EHOSTKIT_LOCK_STATE`.
+ */
 export interface SessionWriterLock extends HeldLock {
   /** Canonical session file path. */
   readonly sessionFile: string;
@@ -70,6 +77,8 @@ export interface SessionWriterLock extends HeldLock {
    * Spawns the writer in the order the protocol requires: held at the start
    * gate, identity recorded as `writer` with state `running`, then released.
    * pi cannot open the session file before its identity is in the record.
+   * `spec.argv` must contain exactly one absolute `--session` naming this
+   * lock's file. Only one writer spawned through the lock may run at a time.
    */
   spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess>;
 }
@@ -97,6 +106,11 @@ interface RawLock {
  * busy, matching flock semantics across open file descriptions.
  */
 function acquireRaw(purpose: string, key: string, posixFile: string): RawLock | null {
+  if (process.platform === "win32" && !isMainThread) {
+    // A mutex belongs to the thread that acquired it and is abandoned when that
+    // thread exits, which would free the lock while the host still runs.
+    throw Object.assign(new Error("pi-hostkit locks must be used from the main thread on Windows"), { code: "EHOSTKIT_THREAD" });
+  }
   if (heldKeys.has(key)) return null;
   let release: () => void;
   if (process.platform === "win32") {
@@ -161,7 +175,39 @@ function sessionPaths(sessionFile: string): SessionPaths {
 
 type ReadRecord = { record?: SessionLockRecord; invalid?: string };
 
-function readRecord(file: string): ReadRecord {
+const STATES = new Set(["starting", "running", "stopping", "released"]);
+const APPS = new Set(["pi-pane", "pi-agora"]);
+
+function isIdentity(value: unknown): value is ProcessIdentity {
+  const v = value as ProcessIdentity;
+  return (
+    !!v &&
+    typeof v === "object" &&
+    Number.isInteger(v.pid) &&
+    v.pid > 0 &&
+    typeof v.startTime === "string" &&
+    v.startTime.length > 0 &&
+    typeof v.runId === "string" &&
+    typeof v.instanceId === "string" &&
+    (v.cgroup === undefined || typeof v.cgroup === "string")
+  );
+}
+
+/** Problem with a parsed record, or undefined when it is a valid record for `key`. */
+function recordProblem(value: SessionLockRecord, key: string): string | undefined {
+  if (!value || typeof value !== "object") return "not an object";
+  if (value.version !== 1) return "unsupported record version";
+  if (!STATES.has(value.state)) return `unknown state ${String(value.state)}`;
+  if (typeof value.sessionFile !== "string" || sha256(comparisonKey(value.sessionFile)) !== key) {
+    return "sessionFile does not belong to this lock";
+  }
+  if (!value.host || !APPS.has(value.host.app) || !isIdentity(value.host.identity)) return "invalid host";
+  if (value.writer !== undefined && !isIdentity(value.writer)) return "invalid writer";
+  if (typeof value.updatedAt !== "string") return "invalid updatedAt";
+  return undefined;
+}
+
+function readRecord(file: string, key: string): ReadRecord {
   let text: string;
   try {
     text = readFileSync(file, "utf8");
@@ -169,13 +215,14 @@ function readRecord(file: string): ReadRecord {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
     return { invalid: (error as Error).message };
   }
+  let value: SessionLockRecord;
   try {
-    const value = JSON.parse(text) as SessionLockRecord;
-    if (value?.version !== 1 || typeof value.state !== "string") return { invalid: "unsupported record version" };
-    return { record: value };
+    value = JSON.parse(text) as SessionLockRecord;
   } catch (error) {
     return { invalid: (error as Error).message };
   }
+  const problem = recordProblem(value, key);
+  return problem ? { invalid: problem } : { record: value };
 }
 
 /** Writes the record atomically (temporary file, then rename). */
@@ -204,44 +251,102 @@ function hasRpcMode(args: string[]): boolean {
   return args.some((arg, i) => arg === "--mode=rpc" || (arg === "--mode" && args[i + 1] === "rpc"));
 }
 
+/** Values of `--session` (`--session <v>` or `--session=<v>`). */
+function sessionArgs(args: string[]): string[] {
+  const values: string[] = [];
+  args.forEach((arg, i) => {
+    if (arg === "--session" && i + 1 < args.length) values.push(args[i + 1]!);
+    else if (arg.startsWith("--session=")) values.push(arg.slice("--session=".length));
+  });
+  return values;
+}
+
+/** Index of a pi-hostkit gate script in `args` (a `gate.js` next to `gate-protocol.js`), or -1. */
+function gateIndex(args: string[]): number {
+  return args.findIndex(
+    (arg, i) =>
+      i <= 1 &&
+      path.isAbsolute(arg) &&
+      path.basename(arg) === "gate.js" &&
+      existsSync(path.join(path.dirname(arg), "gate-protocol.js")),
+  );
+}
+
+type Candidates = { found: ProcessIdentity[]; uncertain: boolean };
+
 /**
- * Processes whose command line names this session file and RPC mode. Used when
- * the previous host died between spawning pi and recording `writer`. A process
- * still held at the start gate keeps its original command line; a loaded pi
- * sets `process.title`, which overwrites the command line on macOS and Linux,
- * so a released pi is usually not found there. Not finding one is therefore
- * never taken as proof that no writer exists.
+ * pi-hostkit gate processes (held, or a loaded pi whose command line is still
+ * readable) in RPC mode whose `--session` names this session file. Used when
+ * the previous host died between spawning pi and recording `writer`.
+ *
+ * Only gate processes are considered, and `--session` must resolve to the same
+ * canonical path; a relative value cannot be resolved without the process's
+ * working directory and makes the search uncertain. A loaded pi sets
+ * `process.title`, which overwrites its command line on macOS and Linux, so it
+ * is usually not found there. Not finding one is therefore never taken as
+ * proof that no writer exists.
  */
-function findWritersByCommandLine(canonical: string): ProcessIdentity[] {
+function findWritersByCommandLine(canonical: string): Candidates {
   const key = comparisonKey(canonical);
   const found: ProcessIdentity[] = [];
+  let uncertain = false;
   for (const row of listProcesses()) {
     if (row.pid === process.pid || row.zombie) continue;
-    const cmd = processCommandLine(row.pid);
-    if (!cmd) continue;
-    let match = false;
-    if (typeof cmd === "string") {
-      const lower = cmd.toLowerCase();
-      match = /--mode(=|\s+)"?rpc\b/.test(lower) && lower.includes(key);
-    } else if (hasRpcMode(cmd)) {
-      match = cmd.some((arg) => {
-        if (!path.isAbsolute(arg)) return false;
-        try {
-          return comparisonKey(realPathOrPending(arg)) === key;
-        } catch {
-          return false;
-        }
-      });
+    const args = processCommandLine(row.pid);
+    if (!args) continue;
+    const gate = gateIndex(args);
+    if (gate < 0) continue;
+    const rest = args.slice(gate + 1);
+    if (!hasRpcMode(rest)) continue;
+    for (const value of sessionArgs(rest)) {
+      if (!path.isAbsolute(value)) {
+        uncertain = true;
+        continue;
+      }
+      let same = false;
+      try {
+        same = comparisonKey(realPathOrPending(value)) === key;
+      } catch {
+        uncertain = true;
+      }
+      if (same) {
+        found.push({ pid: row.pid, startTime: row.startTime, runId: "unknown", instanceId: "unknown" });
+        break;
+      }
     }
-    if (match) found.push({ pid: row.pid, startTime: row.startTime, runId: "unknown", instanceId: "unknown" });
   }
-  return found;
+  return { found, uncertain };
+}
+
+/** `--session` values in a spawn argv must name exactly this lock's file. */
+function assertSessionArg(argv: string[], canonical: string): void {
+  const values = sessionArgs(argv);
+  const key = comparisonKey(canonical);
+  const ok =
+    values.length === 1 &&
+    path.isAbsolute(values[0]!) &&
+    (() => {
+      try {
+        return comparisonKey(realPathOrPending(values[0]!)) === key;
+      } catch {
+        return false;
+      }
+    })();
+  if (!ok) {
+    throw Object.assign(new Error(`spawnWriter argv must contain exactly one absolute --session for ${canonical}`), {
+      code: "EINVAL",
+    });
+  }
 }
 
 class WriterLock implements SessionWriterLock {
   readonly recoveryReports: StopReport[] = [];
   private state: "acquired" | "recovered" | "released" = "acquired";
   private current: SessionLockRecord | undefined;
+  /** Operations on one lock run one at a time, in call order. */
+  private queue: Promise<unknown> = Promise.resolve();
+  private writer: ManagedProcess | undefined;
+  private writerExited = true;
 
   constructor(
     private readonly raw: RawLock,
@@ -255,35 +360,63 @@ class WriterLock implements SessionWriterLock {
     return this.paths.canonical;
   }
 
-  async recoverPreviousWriter(opts: RecoverOptions = {}): Promise<RecoverResult> {
-    if (this.state !== "acquired") throw Object.assign(new Error(`lock is ${this.state}`), { code: "EHOSTKIT_LOCK_STATE" });
-    const result = await this.recover(opts);
-    if (result === "failed") {
-      this.state = "released";
-      this.raw.release();
-      return result;
-    }
-    this.current = {
-      version: 1,
-      sessionFile: this.paths.canonical,
-      host: this.host,
-      state: "starting",
-      updatedAt: new Date().toISOString(),
-    };
-    writeRecord(this.paths.record, this.current);
-    this.state = "recovered";
-    return result;
+  private serial<T>(op: () => Promise<T>): Promise<T> {
+    const next = this.queue.then(op, op);
+    this.queue = next.catch(() => {});
+    return next;
   }
 
-  private async stopAll(writers: ProcessIdentity[], opts: StopOptions): Promise<RecoverResult> {
-    let stopped = false;
-    for (const writer of writers) {
-      if ((await isSameProcess(writer)) === "gone") continue;
-      this.recoveryReports.push(await stopByIdentity(writer, opts));
-      if ((await isSameProcess(writer)) === "alive") return "failed";
-      stopped = true;
+  private requireState(state: "acquired" | "recovered", action: string): void {
+    if (this.state !== state) {
+      throw Object.assign(new Error(`${action}: lock is ${this.state}`), { code: "EHOSTKIT_LOCK_STATE" });
     }
-    return stopped ? "stopped" : "none";
+  }
+
+  /** Releases the OS lock without touching the record (failure paths). */
+  private abandon(): void {
+    this.state = "released";
+    this.raw.release();
+  }
+
+  recoverPreviousWriter(opts: RecoverOptions = {}): Promise<RecoverResult> {
+    return this.serial(async () => {
+      this.requireState("acquired", "recoverPreviousWriter");
+      let result: RecoverResult;
+      try {
+        result = await this.recover(opts);
+      } catch (error) {
+        this.abandon();
+        throw error;
+      }
+      if (result === "failed") {
+        this.abandon();
+        return result;
+      }
+      this.current = {
+        version: 1,
+        sessionFile: this.paths.canonical,
+        host: this.host,
+        state: "starting",
+        updatedAt: new Date().toISOString(),
+      };
+      writeRecord(this.paths.record, this.current);
+      this.state = "recovered";
+      return result;
+    });
+  }
+
+  /**
+   * Stops one recorded or found writer. Succeeds only when the stop report
+   * shows nothing left within its coverage and the writer is gone.
+   */
+  private async stopWriter(writer: ProcessIdentity, opts: StopOptions): Promise<RecoverResult> {
+    const alive = (await isSameProcess(writer)) === "alive";
+    if (!alive && !scopePopulated(writer)) return "none";
+    const report = await stopByIdentity(writer, opts);
+    this.recoveryReports.push(report);
+    if (report.leftovers.length) return "failed";
+    if ((await isSameProcess(writer)) === "alive" || scopePopulated(writer)) return "failed";
+    return "stopped";
   }
 
   private async recover(opts: RecoverOptions): Promise<RecoverResult> {
@@ -291,49 +424,74 @@ class WriterLock implements SessionWriterLock {
     if (this.invalidPrevious && !assumeNoWriter) return "failed";
     const previous = this.previous;
     if (!previous || previous.state === "released") return "none";
-    if (previous.writer) return this.stopAll([previous.writer], stopOpts);
+    if (previous.writer) return this.stopWriter(previous.writer, stopOpts);
     // No writer recorded: the previous host may have died between spawn and record.
-    const candidates = findWritersByCommandLine(this.paths.canonical);
-    if (candidates.length) return this.stopAll(candidates, stopOpts);
-    // Not finding one does not prove there is none (truncated or unreadable command lines).
-    return assumeNoWriter ? "none" : "failed";
+    const { found, uncertain } = findWritersByCommandLine(this.paths.canonical);
+    let stopped = false;
+    for (const candidate of found) {
+      const result = await this.stopWriter(candidate, stopOpts);
+      if (result === "failed") return "failed";
+      if (result === "stopped") stopped = true;
+    }
+    if (stopped && !uncertain) return "stopped";
+    // Not finding one does not prove there is none (overwritten, truncated or
+    // unreadable command lines, relative --session values).
+    return assumeNoWriter ? (stopped ? "stopped" : "none") : "failed";
   }
 
-  async update(patch: Partial<Pick<SessionLockRecord, "writer" | "state">>): Promise<void> {
-    if (this.state !== "recovered" || !this.current) {
-      throw Object.assign(new Error("call recoverPreviousWriter() before update()"), { code: "EHOSTKIT_LOCK_STATE" });
+  update(patch: Partial<Pick<SessionLockRecord, "writer" | "state">>): Promise<void> {
+    return this.serial(async () => this.writeUpdate(patch));
+  }
+
+  private writeUpdate(patch: Partial<Pick<SessionLockRecord, "writer" | "state">>): void {
+    this.requireState("recovered", "update");
+    if (patch.state !== undefined && (!STATES.has(patch.state) || patch.state === "released")) {
+      throw Object.assign(new Error(`invalid state ${patch.state}; use release()`), { code: "EINVAL" });
     }
-    this.current = { ...this.current, ...patch, updatedAt: new Date().toISOString() };
+    if (patch.writer !== undefined && !isIdentity(patch.writer)) {
+      throw Object.assign(new Error("invalid writer identity"), { code: "EINVAL" });
+    }
+    this.current = { ...this.current!, ...patch, updatedAt: new Date().toISOString() };
     writeRecord(this.paths.record, this.current);
   }
 
-  async spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess> {
-    if (this.state !== "recovered") {
-      throw Object.assign(new Error("call recoverPreviousWriter() before spawnWriter()"), { code: "EHOSTKIT_LOCK_STATE" });
-    }
-    const proc = await spawnManaged({ ...spec, startHeld: true });
-    try {
-      await this.update({ writer: proc.identity, state: "running" });
-    } catch (error) {
-      await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
-      throw error;
-    }
-    proc.release();
-    return proc;
+  spawnWriter(spec: Omit<SpawnSpec, "startHeld">): Promise<ManagedProcess> {
+    return this.serial(async () => {
+      this.requireState("recovered", "spawnWriter");
+      if (!this.writerExited) {
+        throw Object.assign(new Error("a writer spawned through this lock is still running"), { code: "EHOSTKIT_LOCK_STATE" });
+      }
+      assertSessionArg(spec.argv, this.paths.canonical);
+      const proc = await spawnManaged({ ...spec, startHeld: true });
+      try {
+        this.writeUpdate({ writer: proc.identity, state: "running" });
+      } catch (error) {
+        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        throw error;
+      }
+      this.writer = proc;
+      this.writerExited = false;
+      void proc.exited.then(() => {
+        if (this.writer === proc) this.writerExited = true;
+      });
+      proc.release();
+      return proc;
+    });
   }
 
   /** Writes `released` (when this host wrote a record) and releases the lock. */
-  async release(): Promise<void> {
-    if (this.state === "released") return;
-    try {
-      if (this.state === "recovered" && this.current) {
-        this.current = { ...this.current, state: "released", updatedAt: new Date().toISOString() };
-        writeRecord(this.paths.record, this.current);
+  release(): Promise<void> {
+    return this.serial(async () => {
+      if (this.state === "released") return;
+      try {
+        if (this.state === "recovered" && this.current) {
+          this.current = { ...this.current, state: "released", updatedAt: new Date().toISOString() };
+          writeRecord(this.paths.record, this.current);
+        }
+      } finally {
+        this.abandon();
       }
-    } finally {
-      this.state = "released";
-      this.raw.release();
-    }
+    });
   }
 }
 
@@ -355,9 +513,12 @@ export async function acquireSessionWriterLock(
 ): Promise<SessionWriterLock | SessionLockBusy> {
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
+  // The lock only excludes hosts on this machine; a session on a network
+  // file system could be opened from another machine with its own lock directory.
+  assertLocalFilesystem(paths.canonical);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
-  if (!raw) return { heldBy: readRecord(paths.record).record };
-  const { record, invalid } = readRecord(paths.record);
+  if (!raw) return { heldBy: readRecord(paths.record, paths.key).record };
+  const { record, invalid } = readRecord(paths.record, paths.key);
   return new WriterLock(raw, paths, host, record, invalid);
 }
 
@@ -370,7 +531,7 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
-  const { record } = readRecord(paths.record);
+  const { record } = readRecord(paths.record, paths.key);
   if (!raw) return { held: true, ...(record ? { record } : {}) };
   raw.release();
   return { held: false, ...(record ? { record } : {}) };

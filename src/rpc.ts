@@ -65,6 +65,7 @@ export interface RpcTransportOptions {
 }
 
 export const DEFAULT_MAX_RECORD_BYTES = 64 * 1024 * 1024;
+const MAX_TIMED_OUT_IDS = 1024;
 
 export class RpcTimeoutError extends Error {
   readonly code = "EHOSTKIT_RPC_TIMEOUT";
@@ -226,12 +227,17 @@ export class StdioRpcTransport implements RpcTransport {
     if (this.blockedReason) return Promise.reject(new RpcClosedError(this.blockedReason));
     const id = cmd.id ?? `hk-${++this.nextId}`;
     if (this.pending.has(id)) return Promise.reject(new Error(`RPC id ${id} is already pending`));
+    // A timed-out id may still get its late response; reusing it would hand
+    // that response to the new command.
+    if (this.timedOut.has(id)) return Promise.reject(new Error(`RPC id ${id} timed out earlier and cannot be reused`));
     return new Promise<RpcResponse>((resolve, reject) => {
       const entry: Pending = { resolve, reject, command: cmd.type };
       if (opts.timeoutMs !== undefined) {
         entry.timer = setTimeout(() => {
           this.pending.delete(id);
           this.timedOut.add(id);
+          // Bound the set; the oldest ids are forgotten (their late responses become unmatched).
+          if (this.timedOut.size > MAX_TIMED_OUT_IDS) this.timedOut.delete(this.timedOut.values().next().value!);
           reject(new RpcTimeoutError(cmd.type, opts.timeoutMs!));
         }, opts.timeoutMs);
       }
