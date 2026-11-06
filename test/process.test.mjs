@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { after, describe, test } from "node:test";
@@ -43,6 +43,24 @@ function escapingCommand(pidFile) {
 }
 
 describe("spawnManaged", () => {
+  test("cgroup verification errors resolve to a repeatable report with an unknown scope", { skip: process.platform !== "linux" || containment === "snapshot" }, async (t) => {
+    if (!(await linuxCgroupSupport())) {
+      t.skip("cgroup v2 user scopes are unavailable");
+      return;
+    }
+    const f = await fixture();
+    execFileSync(process.execPath, [path.join(here, "fixtures", "cgroup-verify-fault.mjs")], {
+      timeout: 30_000, env: { ...process.env, HOSTKIT_TEST_ROOT: f.root }, stdio: "pipe",
+    });
+  });
+
+  test("final snapshot errors appear in a resolved and repeatable stop report", { skip: isWin }, async () => {
+    const f = await fixture();
+    execFileSync(process.execPath, ["--experimental-test-module-mocks", path.join(here, "fixtures", "capture-fault.mjs")], {
+      timeout: 30_000, env: { ...process.env, HOSTKIT_TEST_ROOT: f.root }, stdio: "pipe",
+    });
+  });
+
   test("rejects a queue limit that cannot fit the gate line before spawning", async () => {
     const f = await fixture();
     for (const maxQueuedBytes of [0, 1, -1, 1.5, Infinity, NaN]) {

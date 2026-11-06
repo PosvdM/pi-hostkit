@@ -1,8 +1,53 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SnapshotRecords, stopSnapshot } from "../dist/snapshots.js";
+import { verifiedDescendants } from "../dist/proctable.js";
 
 const root = { pid: 100, startTime: "root", runId: "r", instanceId: "i" };
+
+test("a failed parent query keeps independently verified snapshot branches and reports the failure", async () => {
+  const pi = { ...root, startTime: "1", pgid: 100, ppid: 1, zombie: false };
+  const denied = { pid: 101, ppid: 100, pgid: 101, startTime: "2", zombie: false };
+  const deniedChild = { pid: 103, ppid: 101, pgid: 103, startTime: "3", zombie: false };
+  const good = { pid: 102, ppid: 100, pgid: 102, startTime: "2", zombie: false };
+  const goodChild = { pid: 104, ppid: 102, pgid: 104, startTime: "3", zombie: false };
+  const table = [pi, denied, deniedChild, good, goodChild];
+  const live = new Map(table.map((r) => [r.pid, r]));
+  let capturing = true;
+  const signalled = [];
+  const records = new SnapshotRecords(pi, {
+    listProcesses: () => table,
+    verifiedDescendants,
+    processInfo: (pid) => {
+      if (capturing && pid === denied.pid) throw new Error("parent identity query failed");
+      return live.get(pid) ?? null;
+    },
+    signalProcess: (id) => { signalled.push(id.pid); live.delete(id.pid); return true; },
+  });
+  records.capture();
+  assert.ok(records.records.has("102:2"));
+  assert.ok(records.records.has("104:3"));
+  assert.ok(!records.records.has("103:3"), "a child attributed through the unverified parent is excluded");
+  capturing = false;
+  live.delete(pi.pid); // pi exits after the only snapshot; recorded escaped children remain reachable.
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.ok(signalled.includes(goodChild.pid));
+  assert.ok(report.steps.some((s) => s.step === "snapshot" && !s.ok && s.detail.includes("parent identity query failed")));
+  assert.deepEqual(report.leftovers, []);
+});
+
+test("a failed final snapshot is reported even without any earlier descendant records", async () => {
+  const records = new SnapshotRecords(root, {
+    listProcesses: () => { throw new Error("last snapshot denied"); },
+    processInfo: () => null,
+    signalProcess: () => false,
+    verifiedDescendants,
+  });
+  records.capture();
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(report.steps.some((s) => s.step === "snapshot" && !s.ok && s.detail.includes("last snapshot denied")));
+});
 const row = (pid) => ({ pid, ppid: 100, pgid: pid, startTime: String(pid), zombie: false });
 
 test("one descendant EPERM does not skip other descendants or the pi group", async () => {

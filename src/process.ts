@@ -1,6 +1,6 @@
 import { spawn, execFile, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { GATE_RELEASE_LINE } from "./gate-protocol.js";
@@ -8,6 +8,7 @@ import { nativeFn } from "./native.js";
 import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
 import { SnapshotRecords, stopSnapshot } from "./snapshots.js";
+import { cgroupPopulated, stopCgroup } from "./cgroups.js";
 
 export interface ProcessIdentity {
   pid: number;
@@ -199,80 +200,6 @@ function cgroupOf(pid: number): string | null {
   }
 }
 
-function isMissing(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException).code;
-  return code === "ENOENT" || code === "ENODEV";
-}
-
-/**
- * Whether any process remains in the scope or its sub-cgroups
- * (`cgroup.events` `populated`). A removed directory counts as empty; other
- * read errors throw, so a failed check is never taken as "empty".
- */
-function cgroupPopulated(dir: string): boolean {
-  let events: string;
-  try {
-    events = readFileSync(path.join(dir, "cgroup.events"), "utf8");
-  } catch (error) {
-    if (isMissing(error)) return false;
-    throw error;
-  }
-  const match = /^populated (\d)$/m.exec(events);
-  if (!match) throw hostkitError("EHOSTKIT_CGROUP", `cannot read populated from ${dir}/cgroup.events`);
-  return match[1] === "1";
-}
-
-/** PIDs in the scope and all its sub-cgroups. */
-function cgroupPids(dir: string): number[] {
-  const pids: number[] = [];
-  const walk = (current: string) => {
-    let procs: string;
-    try {
-      procs = readFileSync(path.join(current, "cgroup.procs"), "utf8");
-    } catch (error) {
-      if (isMissing(error)) return;
-      throw error;
-    }
-    for (const line of procs.split("\n")) if (line) pids.push(Number(line));
-    let entries;
-    try {
-      entries = readdirSync(current, { withFileTypes: true });
-    } catch (error) {
-      if (isMissing(error)) return;
-      throw error;
-    }
-    for (const entry of entries) if (entry.isDirectory()) walk(path.join(current, entry.name));
-  };
-  walk(dir);
-  return pids;
-}
-
-function inScope(pid: number, dir: string): boolean {
-  const current = cgroupOf(pid);
-  return current !== null && (current === dir || current.startsWith(`${dir}/`));
-}
-
-function cgroupKill(dir: string): string {
-  try {
-    writeFileSync(path.join(dir, "cgroup.kill"), "1");
-    return "cgroup.kill";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    // ENOENT means either the scope is gone or the kernel has no cgroup.kill.
-    if (isMissing(error) && !existsSync(dir)) return "scope already removed";
-    if (!isMissing(error) && code !== "EINVAL" && code !== "EACCES" && code !== "EPERM") throw error;
-  }
-  // Kernels before 5.14 have no cgroup.kill: SIGKILL each member of the
-  // subtree. Membership and identity are checked right before each signal.
-  for (let round = 0; round < 5 && cgroupPopulated(dir); round++) {
-    for (const pid of cgroupPids(dir)) {
-      const row = processInfo(pid);
-      if (row && inScope(pid, dir)) signalProcess(row, "SIGKILL");
-    }
-  }
-  return "SIGKILL members";
-}
-
 /**
  * Only scopes created by spawnManaged are killed as a whole: the unit name
  * carries a random suffix, so the scope belongs to one run. A recorded path
@@ -304,27 +231,6 @@ function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport
 
 function liveRows(pids: number[]): ProcessRow[] {
   return pids.map((pid) => processInfo(pid)).filter((row): row is ProcessRow => !!row && !row.zombie);
-}
-
-/** Kills a cgroup scope and verifies it is empty, sub-cgroups included. */
-async function killScope(dir: string, steps: Steps): Promise<StopReport["leftovers"]> {
-  try {
-    steps.add("kill cgroup", true, cgroupKill(dir));
-  } catch (error) {
-    steps.add("kill cgroup", false, (error as Error).message);
-  }
-  let emptied = false;
-  try {
-    emptied = await poll(() => !cgroupPopulated(dir), SETTLE_CHECK_MS);
-  } catch (error) {
-    steps.add("check cgroup", false, (error as Error).message);
-  }
-  if (emptied) return [];
-  const pids = cgroupPids(dir);
-  // Populated (or unreadable) with no process left that can be listed: report
-  // the scope itself so the stop is not mistaken for a complete one.
-  const rows = liveRows(pids);
-  return rows.length ? rowsToLeftovers(rows) : [{ pid: 0, startTime: "", exe: `cgroup ${dir}` }];
 }
 
 // ---------- spawnManaged ----------
@@ -421,11 +327,8 @@ class Managed implements ManagedProcess {
   }
 
   private capture(): void {
-    try {
-      this.snapshots.capture();
-    } catch {
-      // A failed snapshot leaves earlier records; the final stop snapshot runs again.
-    }
+    // SnapshotRecords retains both partial records and failures for the stop report.
+    this.snapshots.capture();
   }
 
   private stopTimer(): void {
@@ -500,7 +403,9 @@ class Managed implements ManagedProcess {
       nativeFn("handleClose")(job);
     } else if (this.mode.kind === "cgroup") {
       const { dir } = this.mode;
-      leftovers = await killScope(dir, steps);
+      const report = await stopCgroup(dir, this.identity, (empty) => poll(empty, SETTLE_CHECK_MS));
+      steps.steps.push(...report.steps);
+      leftovers = report.leftovers;
     } else {
       this.capture();
       const report = await stopSnapshot(this.snapshots, (empty) => poll(empty, SETTLE_CHECK_MS));
@@ -674,7 +579,9 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
   }
 
   if (cgroup) {
-    const leftovers = await killScope(cgroup, steps);
+    const report = await stopCgroup(cgroup, id, (empty) => poll(empty, SETTLE_CHECK_MS));
+    steps.steps.push(...report.steps);
+    const leftovers = report.leftovers;
     steps.add("verify", leftovers.length === 0);
     return { steps: steps.steps, coverage: "cgroup", leftovers };
   }

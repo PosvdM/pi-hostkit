@@ -160,7 +160,11 @@ export function descendants(table: ProcessRow[], root: { pid: number; startTime:
  * them (a parent that is still the same process was alive the whole time).
  * Children of a parent that exited during the read are dropped as well.
  */
-export function verifiedDescendants(table: ProcessRow[], root: { pid: number; startTime: string }): ProcessRow[] {
+export function verifiedDescendants(
+  table: ProcessRow[],
+  root: { pid: number; startTime: string },
+  check: (id: { pid: number; startTime: string }) => boolean = (id) => matches(processInfo(id.pid), id),
+): ProcessRow[] {
   const found = descendants(table, root);
   const byPid = new Map(found.map((row) => [row.pid, row]));
   const verdict = new Map<number, boolean>();
@@ -168,7 +172,7 @@ export function verifiedDescendants(table: ProcessRow[], root: { pid: number; st
     let ok = verdict.get(pid);
     if (ok === undefined) {
       const recorded = pid === root.pid ? root : byPid.get(pid);
-      ok = !!recorded && matches(processInfo(pid), recorded);
+      ok = !!recorded && check(recorded);
       verdict.set(pid, ok);
     }
     return ok;

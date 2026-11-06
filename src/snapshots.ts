@@ -7,6 +7,7 @@ const system = { listProcesses, processInfo, signalProcess, verifiedDescendants 
 export class SnapshotRecords {
   readonly records = new Map<string, ProcessRow>();
   readonly failures: string[] = [];
+  readonly captureFailures: string[] = [];
 
   constructor(private readonly root: ProcessIdentity, private readonly ops = system) {}
 
@@ -15,13 +16,30 @@ export class SnapshotRecords {
   }
 
   capture(): void {
-    const table = this.ops.listProcesses();
-    if (!table.some((row) => matches(row, this.root))) return;
-    const tree = this.ops.verifiedDescendants(table, this.root);
-    if (!matches(this.ops.processInfo(this.root.pid), this.root)) return;
-    for (const row of tree) this.remember(row);
-    for (const row of table) {
-      if (row.pgid === this.root.pid && row.pid !== this.root.pid) this.remember(row);
+    const failed = (error: unknown, pid?: number) => {
+      const detail = `${pid === undefined ? "process table" : pid}: ${(error as Error).message}`;
+      if (!this.captureFailures.includes(detail)) this.captureFailures.push(detail);
+    };
+    try {
+      const table = this.ops.listProcesses();
+      if (!table.some((row) => matches(row, this.root))) return;
+      // Confirm the root after reading the table, before attributing any new rows.
+      if (!matches(this.ops.processInfo(this.root.pid), this.root)) return;
+      const tree = this.ops.verifiedDescendants(table, this.root, (id) => {
+        try {
+          return matches(this.ops.processInfo(id.pid), id);
+        } catch (error) {
+          // Only this parent's chain is uncertain; independently checked branches survive.
+          failed(error, id.pid);
+          return false;
+        }
+      });
+      for (const row of tree) this.remember(row);
+      for (const row of table) {
+        if (row.pgid === this.root.pid && row.pid !== this.root.pid) this.remember(row);
+      }
+    } catch (error) {
+      failed(error);
     }
   }
 
@@ -105,6 +123,7 @@ export async function stopSnapshot(
   add("SIGKILL pi group", records.failures.length === beforeRoot, rootSent ? "sent" : "no live member");
   await settle(() => records.remaining().length === 0);
   const leftovers = records.remaining().map(({ pid, startTime }) => ({ pid, startTime }));
+  for (const failure of records.captureFailures) add("snapshot", false, failure);
   for (const failure of records.failures) add("snapshot cleanup", false, failure);
   return { steps, coverage: "snapshot_visible", leftovers };
 }
