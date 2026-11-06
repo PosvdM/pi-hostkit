@@ -1,4 +1,4 @@
-import { accessSync, constants, lstatSync, readlinkSync, realpathSync } from "node:fs";
+import { accessSync, constants, lstatSync, readdirSync, readlinkSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -135,6 +135,68 @@ export function realPathOrPending(target: string, depth = 0): string {
   throw Object.assign(new Error(`Cannot resolve path: ${target}`), { code: "ENOTDIR" });
 }
 
+/** Read-only probe on the nearest existing directory's device; no native addon or probe files. */
+function detectCaseSensitivity(canonical: string): boolean | undefined {
+  try {
+    let existing = canonical;
+    let info;
+    for (;;) {
+      try {
+        info = statSync(existing, { bigint: true });
+        break;
+      } catch (error) {
+        if (!isMissing(error)) throw error;
+        const parent = path.dirname(existing);
+        if (parent === existing) return undefined;
+        existing = parent;
+      }
+    }
+    existing = realpathSync.native(existing);
+    let dir = info.isDirectory() ? existing : path.dirname(existing);
+    const device = statSync(dir, { bigint: true }).dev;
+    // A file-level mount cannot inherit the parent directory's case rules.
+    if (info.dev !== device) return undefined;
+    for (;;) {
+      const entries = new Set(readdirSync(dir));
+      for (const name of entries) {
+        const alternate = name.replace(/[a-z]/i, (letter) => letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase());
+        // Two recorded spellings can be hard links to the same inode on a sensitive volume.
+        if (alternate === name || entries.has(alternate)) continue;
+        const original = lstatSync(path.join(dir, name), { bigint: true });
+        // A mounted child belongs to another device and cannot describe this directory.
+        if (original.dev !== device) continue;
+        if (original.ino === 0n) return undefined;
+        try {
+          const alias = lstatSync(path.join(dir, alternate), { bigint: true });
+          return alias.dev !== original.dev || alias.ino !== original.ino;
+        } catch (error) {
+          if (isMissing(error)) return true;
+          throw error;
+        }
+      }
+      const parent = path.dirname(dir);
+      // Never infer a mounted volume's rules from the parent volume.
+      if (parent === dir || statSync(parent, { bigint: true }).dev !== device) return undefined;
+      dir = parent;
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function assertCaseInsensitiveFilesystem(canonical: string): void {
+  if (process.platform !== "darwin") return;
+  try {
+    if (detectCaseSensitivity(canonical) === false) return;
+  } catch {
+    // A failed probe cannot justify folding two distinct paths into one key.
+  }
+  throw Object.assign(
+    new Error(`Cannot establish a case-insensitive filesystem for ${canonical}; use a case-insensitive macOS volume`),
+    { code: "EHOSTKIT_CASE_SENSITIVE_FS" },
+  );
+}
+
 /**
  * Canonical path of a tool path argument: pi's resolution rules, then real path
  * (symbolic links and Windows junctions resolved). `read` also tries pi's
@@ -143,7 +205,9 @@ export function realPathOrPending(target: string, depth = 0): string {
  */
 export function canonicalPathSync(input: string, cwd: string, mode: PathMode): string {
   const resolved = mode === "read" ? resolveReadToolPath(input, cwd) : resolveToolPath(input, cwd);
-  return realPathOrPending(resolved);
+  const canonical = realPathOrPending(resolved);
+  assertCaseInsensitiveFilesystem(canonical);
+  return canonical;
 }
 
 export async function canonicalPath(input: string, cwd: string, mode: PathMode): Promise<string> {
@@ -153,8 +217,9 @@ export async function canonicalPath(input: string, cwd: string, mode: PathMode):
 /**
  * Key for comparing canonical paths. Windows: `\` separators, no `\\?\`
  * prefix, case folded (NTFS per-directory case sensitivity is ignored, as in
- * pi). macOS: NFC and case folded (the default APFS volume is case- and
- * normalization-insensitive). Linux: unchanged.
+ * pi). macOS: NFC and case folded, after establishing that the containing
+ * filesystem is case-insensitive; sensitive or indeterminate volumes are refused.
+ * Linux: unchanged.
  */
 export function comparisonKey(canonical: string): string {
   if (process.platform === "win32") {
@@ -163,7 +228,10 @@ export function comparisonKey(canonical: string): string {
     else if (p.startsWith("\\\\?\\")) p = p.slice(4);
     return path.win32.resolve(p).toLowerCase();
   }
-  if (process.platform === "darwin") return canonical.normalize("NFC").toLowerCase().normalize("NFC");
+  if (process.platform === "darwin") {
+    assertCaseInsensitiveFilesystem(canonical);
+    return canonical.normalize("NFC").toLowerCase().normalize("NFC");
+  }
   return canonical;
 }
 
