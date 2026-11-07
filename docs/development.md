@@ -66,9 +66,21 @@ npm test
 | --- | --- |
 | `test/rpc.test.mjs` | 分帧和传输层，用内存流模拟 pi |
 | `test/locate.test.mjs` | 临时 HOME 的官方安装布局、环境变量优先级、激活切换、npm 回退；只在隔离模块副本中替换 npm 查询 |
+| `test/locate-faults.test.mjs` | 显式、官方、npm 候选的系统查询失败分类与失败缓存重试 |
+| `test/locks-faults.test.mjs` | 获取/释放与恢复查询、临时记录创建/写入/提交/删除、候选之间的独立清理、启动写者及回收双失败 |
+| `test/secrets-faults.test.mjs` | 私密目录与文件的查询、ACL、创建/写入/sync/关闭、最终复查与失败删除 |
+| `test/paths-faults.test.mjs` | 读取变体、真实路径/链接和 macOS 卷探测的失败分类 |
+| `test/rpc-faults.test.mjs` | 输出流错误/关闭、挂起请求与背压队列清理、关闭输入时首错与收尾错误同时保留 |
+| `test/process-faults.test.mjs` | 独立模块 mock 进程的 Windows Job/恢复停止/启动回收与 Linux 进程表、pidfd/进程组退路故障 |
+| `test/native-faults.test.mjs` | 临时编译带系统调用包装器的原生副本；原生查询、信号、截断、资源回收与结果构造故障 |
+| `test/native-loader.test.mjs` | 原生模块懒加载、加载失败后重试、函数缺失与调用错误 |
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
 | `test/snapshot-faults.test.mjs` | 内部快照模块的后代 `EPERM`、查询失败、部分分支保留、最后快照失败与 `StopReport` |
 | `test/existence-faults.test.mjs` | 严格存在性错误分类、记录 scope 查询失败的覆盖保留、gate 协议查询不明不能被其他候选掩盖 |
+| `test/localfs-faults.test.mjs` | 本地磁盘探测的严格上溯、跨挂载边界、原生查询失败与悬空链接目标 |
+| `test/gate-faults.test.mjs` | 门闩读取的暂不可读、管道结束、权限与 I/O 错误；失败不能加载入口 |
+| `test/platform-mounts.test.mjs` | 真实大小写敏感 APFS 的路径与锁拒绝、真实 SSHFS 远程挂载及其中的权限查询失败 |
+| `test/cgroup-subtree.test.mjs` | 真实委派 scope 的两棵子 cgroup；整体清理与部分查询失败时独立清理 |
 | `test/cgroup-faults.test.mjs` | cgroup 旧内核退回、逐 PID 信号与查询错误、部分/最终列举失败、已知身份及未知哨兵、独立 pi 保底 |
 | `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
 | `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
@@ -83,6 +95,10 @@ npm test
 | `test/fixtures/capture-fault.mjs` | POSIX 子进程用 Node 模块 mock 注入快照失败，验证真实 `Managed.stop` 返回报告并缓存成功结果 |
 | `test/fixtures/cgroup-verify-fault.mjs` | Linux 真实 user scope 启动后临时替换内置 fs 调用，验证最终检查失败也返回带未知 scope 的可重复报告 |
 | `test/fixtures/marker-entry.mjs` | gate 测试用的入口：被加载时写一个标记文件，记下参数和收到的第一行输入 |
+| `test/fixtures/boundary-module.mjs` | 隔离源码副本的模块依赖替换；不改变生产导出 |
+| `test/fixtures/process-faults.mjs`、`test/fixtures/proctable-faults.mjs` | 独立 Node 模块 mock 子进程中的逐进程查询、信号和回收故障 |
+| `test/fixtures/native-fault-build.mjs`、`test/fixtures/native-fault-worker.mjs` | 在临时目录构建/加载原生故障副本，按系统调用注入并核对资源净变化；子进程退出后删除 DLL 和目录 |
+| `test/fixtures/cgroup-subtree.mjs` | 进入真实委派 scope 后创建两棵子 cgroup 并放入实际子进程 |
 | `test/fixtures/fake-provider.ts` | 按脚本回复的本地 provider，pi 以 `-e` 加载；测试不联网，也不需要模型服务的密钥 |
 
 `test/locks.test.mjs` 把 `HOME`（Windows 上 `USERPROFILE`）指向临时目录，不碰真实的 `~/.pi/hostkit/locks`。释放记录失败通过测试进程临时替换内置 fs 调用注入，并在 `finally` 恢复；写者查询错误在 `test/fixtures/release-query-fault.mjs` 的独立子进程中用 `--experimental-test-module-mocks` 注入，不改变生产 API。Windows 异主 mutex 测试需要可指定其他 owner 的提权令牌，本机未提权时明确跳过；CI 要求真正执行。
@@ -94,6 +110,8 @@ npm test
 | `PI_PACKAGE` | pi 的包目录。设置后测试使用该安装，并跳过自动定位 smoke 用例；隔离 HOME 的定位测试仍执行 |
 | `HOSTKIT_TEST_CONTAINMENT` | `auto`（默认）或 `snapshot`，传给 `spawnManaged` 的 `containment`；在 Linux 上用 `snapshot` 测试快照模式 |
 | `HOSTKIT_TEST_REQUIRE_CGROUP` | 设为 `1` 时，Linux 上 cgroup v2 user scope 不可用则测试失败；用于防止 CI 静默退回快照模式 |
+| `HOSTKIT_TEST_APFS` | CI 用 `hdiutil` 创建并挂载的大小写敏感 APFS 测试卷；未设置时只跳过该真实挂载用例 |
+| `HOSTKIT_TEST_REMOTE` | Linux auto CI 用 SSHFS 挂载的远程目录；未设置时只跳过该真实挂载用例 |
 | `KEEP_FIXTURES` | 设置后保留测试的临时目录，便于排查 |
 
 在 Linux 上本地测试 cgroup 模式，需要当前用户的 systemd 实例，且环境中有 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS`；可先运行 `systemd-run --user --scope true` 确认。
@@ -106,7 +124,9 @@ npm test
 
 - 矩阵：ubuntu-latest、macos-latest、windows-latest 各以 `containment=auto` 运行一次，ubuntu-latest 再以 `containment=snapshot` 运行一次。
 - 步骤：安装 Node 24，`npm ci`（构建原生模块和 `dist/`），全局安装 pi 1.5.0，`npm test`。
-- Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。
+- Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。子树用例另建带 `Delegate=yes` 的 scope，创建两个实际子 cgroup；CI 不允许因缺少 cgroup 支持跳过。
+- macOS 用 `hdiutil create -fs "Case-sensitive APFS"` 创建 256 MiB 的大小写敏感 APFS 磁盘映像并挂载，在其中验证路径比较与会话锁拒绝；测试结束后卸载。
+- Linux auto 安装 SSHFS 与 OpenSSH server，用运行器临时目录中的专用密钥启动本机端口 2222 的 SSH 服务并挂载 SFTP 目录。远程卷用例同时检查明确非本地和无法遍历目录的 `EACCES`，不改宿主真实 HOME 下的 SSH 配置；测试结束后卸载并停止该 SSH 服务。
 
 `prebuild` 任务为六个目标构建预编译模块：
 
@@ -120,6 +140,8 @@ npm test
 | windows-11-arm | win32 arm64 |
 
 每个任务 `npm ci --ignore-scripts` 后运行 `prebuildify --napi --strip`，非交叉编译的目标再用 `node-gyp-build` 加载一次并调用 `fsInfo`，然后上传 `prebuilds-<运行器>` artifact。`collect prebuilds` 任务把它们合并成一个 `prebuilds` artifact。预编译模块目前不随包分发，见 [README](../README.md#安装)。
+
+系统边界的逐检查点、故障注入与真实平台测试映射见 [failure-boundaries.md](failure-boundaries.md)；[设计不变式](design.md#故障处理不变式)约束测试预期。
 
 ## 修改约定
 

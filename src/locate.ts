@@ -39,11 +39,17 @@ export function isSupportedPiVersion(version: string): boolean {
   return cmp(v, SUPPORTED_PI_RANGE.min) >= 0 && cmp(v, SUPPORTED_PI_RANGE.below) < 0;
 }
 
+function missingInstall(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR" || code === "EHOSTKIT_PI_NOT_FOUND";
+}
+
 async function readPackage(dir: string): Promise<Record<string, unknown> | undefined> {
   try {
     return JSON.parse(await readFile(path.join(dir, "package.json"), "utf8"));
-  } catch {
-    return undefined;
+  } catch (error) {
+    if (missingInstall(error) || error instanceof SyntaxError) return undefined;
+    throw error;
   }
 }
 
@@ -55,12 +61,13 @@ async function installAt(dir: string): Promise<PiInstall> {
   }
   const bin = pkg.bin;
   const relative = typeof bin === "string" ? bin : (bin as Record<string, string> | undefined)?.pi;
-  if (!relative) throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `${packageDir}/package.json has no bin.pi`);
+  if (typeof relative !== "string" || !relative) throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `${packageDir}/package.json has no bin.pi`);
   const cliEntry = path.join(packageDir, relative);
   let cliInfo;
   try {
     cliInfo = await stat(cliEntry);
-  } catch {
+  } catch (error) {
+    if (!missingInstall(error)) throw error;
     throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `pi entry ${cliEntry} does not exist`);
   }
   if (!cliInfo.isFile()) {
@@ -74,7 +81,8 @@ async function fromPiPath(piPath: string): Promise<PiInstall> {
   let info;
   try {
     info = await stat(piPath);
-  } catch {
+  } catch (error) {
+    if (!missingInstall(error)) throw error;
     throw hostkitError("EHOSTKIT_PI_NOT_FOUND", `piPath ${piPath} does not exist`);
   }
   if (info.isDirectory()) return installAt(piPath);
@@ -107,15 +115,16 @@ function managedInstallRoots(): string[] {
 async function fromManagedInstall(root: string): Promise<PiInstall | undefined> {
   try {
     const marker = JSON.parse((await readFile(path.join(root, "managed-install.json"), "utf8")).replace(/^\uFEFF/, ""));
-    if (marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") return undefined;
+    if (!marker || typeof marker !== "object" || marker.kind !== "pi-managed-install" || marker.schemaVersion !== 1 || marker.layout !== "releases-v1") return undefined;
     const version = (await readFile(path.join(root, "current-version"), "utf8")).trim();
     // A release identifier is a single directory name, never a relative path.
     if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version)) return undefined;
     const install = await installAt(path.join(root, "releases", version, "node_modules", ...PI_PACKAGE_NAME.split("/")));
     return install.version === version ? install : undefined;
-  } catch {
-    // Missing or incomplete managed installs do not hide a usable npm installation.
-    return undefined;
+  } catch (error) {
+    // 缺失或损坏的安装可以回退；权限和 I/O 错误不能证明候选不可用。
+    if (missingInstall(error) || error instanceof SyntaxError) return undefined;
+    throw error;
   }
 }
 
@@ -164,7 +173,8 @@ export async function locatePi(opts: LocatePiOptions = {}): Promise<PiInstall> {
   const dir = path.join(root, ...PI_PACKAGE_NAME.split("/"));
   try {
     return await installAt(dir);
-  } catch {
+  } catch (error) {
+    if (!missingInstall(error)) throw error;
     throw hostkitError(
       "EHOSTKIT_PI_NOT_FOUND",
       `pi is not installed globally (looked in ${dir}); install ${PI_PACKAGE_NAME} or set piPath`,

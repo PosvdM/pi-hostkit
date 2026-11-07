@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { SnapshotRecords, stopSnapshot } from "../dist/snapshots.js";
-import { verifiedDescendants } from "../dist/proctable.js";
+import { ProcessTableError, verifiedDescendants } from "../dist/proctable.js";
 
 const root = { pid: 100, startTime: "root", runId: "r", instanceId: "i" };
 
@@ -92,4 +92,93 @@ test("failed exit queries remain in leftovers and do not block cleanup", async (
   assert.ok(sent.includes(root.pid));
   assert.deepEqual(records.alive().map((r) => r.pid), [denied.pid]);
   assert.match(records.failures.join("\n"), /query denied/);
+});
+
+test("快照的部分进程表失败保留可读分支，错误必须写入报告", async () => {
+  const pi = { ...root, startTime: "1", ppid: 1, pgid: 100, zombie: false };
+  const child = { ...row(101), startTime: "2" };
+  const live = new Map([[pi.pid, pi], [child.pid, child]]);
+  const records = new SnapshotRecords(pi, {
+    listProcesses: () => { throw new ProcessTableError([new Error("另一行不可读")], [pi, child]); },
+    verifiedDescendants,
+    processInfo: (pid) => live.get(pid) ?? null,
+    signalProcess: (id) => { live.delete(id.pid); return true; },
+  });
+  records.capture();
+  assert.ok(records.records.has("101:2"));
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("另一行不可读")));
+});
+
+test("快照 settle 拒绝仍返回报告，并在最终查询继续保留未知身份", async () => {
+  const child = row(101);
+  const records = new SnapshotRecords(root, {
+    processInfo: () => { throw new Error("退出状态未知"); },
+    signalProcess: () => false,
+  });
+  records.remember(child);
+  const report = await stopSnapshot(records, async () => { throw new Error("等待失败"); });
+  assert.deepEqual(report.leftovers.map((entry) => entry.pid), [101, 100]);
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("等待失败")));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("退出状态未知")));
+});
+
+test("pi 组信号失败继续逐成员尝试并独立终止 pi 本身", async () => {
+  const pi = { ...root, pgid: 100, zombie: false };
+  const child = { ...row(101), pgid: 100 };
+  const live = new Map([[100, pi], [101, child]]);
+  const sent = [];
+  const records = new SnapshotRecords(root, {
+    processInfo: (pid) => live.get(pid) ?? null,
+    signalProcess: (id, signal, group) => {
+      sent.push([id.pid, group]);
+      if (group !== undefined) throw new Error(`组失败 ${id.pid}`);
+      live.delete(id.pid); return true;
+    },
+  });
+  records.remember(child);
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.ok(sent.some(([pid, group]) => pid === 100 && group === undefined));
+  assert.ok(sent.some(([pid, group]) => pid === 101 && group === 100));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("组失败 100")));
+  assert.deepEqual(report.leftovers, []);
+});
+
+test("后代组信号失败仍尝试单进程；后代查询失败不影响其余目标", async () => {
+  const first = row(101), denied = row(102), other = row(103);
+  const live = new Map([[101, first], [102, denied], [103, other]]);
+  const sent = [];
+  const records = new SnapshotRecords(root, {
+    processInfo: (pid) => { if (pid === 102) throw "身份字符串异常"; return live.get(pid) ?? null; },
+    signalProcess: (id, signal, group) => {
+      sent.push([id.pid, group]);
+      if (group === 101) throw new Error("后代组失败");
+      if (group === undefined) live.delete(id.pid);
+      return true;
+    },
+  });
+  for (const entry of [first, denied, other]) records.remember(entry);
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.ok(sent.some(([pid, group]) => pid === 101 && group === undefined));
+  assert.ok(sent.some(([pid]) => pid === 103));
+  assert.deepEqual(report.leftovers.map((entry) => entry.pid), [102]);
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("后代组失败")));
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("身份字符串异常")));
+});
+
+test("快照根身份复查失败不记入不确定新行，已有记录不丢失", async () => {
+  const pi = { ...root, startTime: "1", ppid: 1, zombie: false };
+  const child = { ...row(101), startTime: "2" };
+  const records = new SnapshotRecords(pi, {
+    listProcesses: () => [pi, child], verifiedDescendants,
+    processInfo: () => { throw new Error("根复查失败"); },
+    signalProcess: () => false,
+  });
+  records.remember(row(102));
+  records.capture();
+  assert.equal(records.records.size, 1);
+  const report = await stopSnapshot(records, async (empty) => empty());
+  assert.deepEqual(report.leftovers.map((entry) => entry.pid), [102, 100]);
+  assert.ok(report.steps.some((step) => !step.ok && step.detail?.includes("根复查失败")));
 });

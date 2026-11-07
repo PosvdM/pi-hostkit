@@ -16,12 +16,16 @@ export interface ProcessRow {
 
 let linuxBootId: string | undefined;
 function bootId(): string {
-  linuxBootId ??= readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+  if (linuxBootId === undefined) {
+    const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    if (!value) throw Object.assign(new Error("cannot read Linux boot identity"), { code: "EHOSTKIT_PROC" });
+    linuxBootId = value;
+  }
   return linuxBootId;
 }
 
 function isAbsent(error: unknown): boolean {
-  const code = (error as NodeJS.ErrnoException).code;
+  const code = (error as NodeJS.ErrnoException | null)?.code;
   return code === "ENOENT" || code === "ESRCH";
 }
 
@@ -44,7 +48,10 @@ function linuxRow(pid: number): ProcessRow | null {
   const fields = close < 0 ? [] : stat.slice(close + 2).split(" ");
   // fields[0] is field 3 (state); field N is fields[N - 3].
   const ticks = fields[19];
-  if (!ticks) throw Object.assign(new Error(`cannot parse /proc/${pid}/stat`), { code: "EHOSTKIT_PROC" });
+  if (!ticks || !/^\d+$/.test(ticks) || !/^[A-Za-z]$/.test(fields[0] ?? "") ||
+      ![fields[1], fields[2]].every((value) => value !== undefined && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)))) {
+    throw Object.assign(new Error(`cannot parse /proc/${pid}/stat`), { code: "EHOSTKIT_PROC" });
+  }
   const state = fields[0];
   return {
     pid,
@@ -65,20 +72,28 @@ export function processInfo(pid: number): ProcessRow | null {
   return nativeFn("processInfo")(pid);
 }
 
-/** Lists processes (on Linux, those whose /proc entry is readable). */
+/** 内部部分结果：调用者可继续处理可读行，同时报告所有查询失败。 */
+export class ProcessTableError extends AggregateError {
+  constructor(errors: unknown[], readonly rows: ProcessRow[]) {
+    super(errors, errors.map((error) => error instanceof Error ? error.message : String(error)).join("; "));
+  }
+}
+
+/** 列出进程；查询失败抛错，内部保留可读行供清理和报告使用。 */
 export function listProcesses(): ProcessRow[] {
   if (process.platform === "linux") {
     const rows: ProcessRow[] = [];
+    const failures: unknown[] = [];
     for (const name of readdirSync("/proc")) {
       if (!/^\d+$/.test(name)) continue;
       try {
         const row = linuxRow(Number(name));
         if (row) rows.push(row);
-      } catch {
-        // Unreadable entries are skipped; callers that must decide about a
-        // specific process use processInfo, which throws instead.
+      } catch (error) {
+        failures.push(new Error(`${name}: ${error instanceof Error ? error.message : String(error)}`, { cause: error }));
       }
     }
+    if (failures.length) throw new ProcessTableError(failures, rows);
     return rows;
   }
   return nativeFn("listProcesses")();
@@ -190,7 +205,28 @@ let pidfdUsable = process.platform === "linux";
 let pidfdGroupUsable = process.platform === "linux";
 
 function errnoCode(error: unknown): string | undefined {
-  return (error as NodeJS.ErrnoException).code;
+  return (error as NodeJS.ErrnoException | null)?.code;
+}
+
+/** 关闭失败和原操作失败都必须保留，不能由 finally 覆盖原错误。 */
+function withPidfd(fd: number, action: () => boolean): boolean {
+  let failed = false;
+  let original: unknown;
+  try {
+    return action();
+  } catch (error) {
+    failed = true;
+    original = error;
+    throw error;
+  } finally {
+    try {
+      nativeFn("fdClose")(fd);
+    } catch (error) {
+      if (!failed) throw error;
+      const detail = (value: unknown) => value instanceof Error ? value.message : String(value);
+      throw new AggregateError([original, error], `${detail(original)}; close pidfd: ${detail(error)}`);
+    }
+  }
 }
 
 /**
@@ -219,16 +255,14 @@ export function signalProcess(id: { pid: number; startTime: string }, signal: No
       return signalProcess(id, signal, group);
     }
     if (fd < 0) return false;
-    try {
+    return withPidfd(fd, () => {
       const row = processInfo(id.pid);
       if (!matches(row, id)) return false;
       const signo = constants.signals[signal];
       if (group === undefined) return nativeFn("pidfdSignal")(fd, signo, false);
       if (row!.pgid !== group) return false;
       return signalGroupLinux(id, group, signal);
-    } finally {
-      nativeFn("fdClose")(fd);
-    }
+    });
   }
   const row = processInfo(id.pid);
   if (!matches(row, id)) return false;
@@ -251,7 +285,7 @@ function signalGroupLinux(member: { pid: number; startTime: string }, group: num
   if (pidfdGroupUsable) {
     const leaderFd = nativeFn("pidfdOpen")(group);
     if (leaderFd >= 0) {
-      try {
+      const sent = withPidfd(leaderFd, () => {
         const leader = processInfo(group);
         if (leader?.pgid === group && memberStill()) {
           try {
@@ -261,9 +295,9 @@ function signalGroupLinux(member: { pid: number; startTime: string }, group: num
             pidfdGroupUsable = false; // kernels before 6.9
           }
         }
-      } finally {
-        nativeFn("fdClose")(leaderFd);
-      }
+        return false;
+      });
+      if (sent) return true;
     }
   }
   // Leader gone or kernel without group pidfd signals: kill(-group) after a

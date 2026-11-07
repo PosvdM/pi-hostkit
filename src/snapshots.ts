@@ -1,8 +1,9 @@
 import type { ProcessIdentity, StopReport } from "./process.js";
-import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
+import { listProcesses, matches, processInfo, ProcessTableError, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
 
 // Internal dependency seam for deterministic fault tests; not a package export.
 const system = { listProcesses, processInfo, signalProcess, verifiedDescendants };
+const errorDetail = (error: unknown) => error instanceof Error ? error.message : String(error);
 
 export class SnapshotRecords {
   readonly records = new Map<string, ProcessRow>();
@@ -17,11 +18,18 @@ export class SnapshotRecords {
 
   capture(): void {
     const failed = (error: unknown, pid?: number) => {
-      const detail = `${pid === undefined ? "process table" : pid}: ${(error as Error).message}`;
+      const detail = `${pid === undefined ? "process table" : pid}: ${errorDetail(error)}`;
       if (!this.captureFailures.includes(detail)) this.captureFailures.push(detail);
     };
     try {
-      const table = this.ops.listProcesses();
+      let table: ProcessRow[];
+      try {
+        table = this.ops.listProcesses();
+      } catch (error) {
+        if (!(error instanceof ProcessTableError)) throw error;
+        failed(error);
+        table = error.rows;
+      }
       if (!table.some((row) => matches(row, this.root))) return;
       // Confirm the root after reading the table, before attributing any new rows.
       if (!matches(this.ops.processInfo(this.root.pid), this.root)) return;
@@ -44,7 +52,7 @@ export class SnapshotRecords {
   }
 
   private failed(row: Pick<ProcessRow, "pid">, error: unknown): void {
-    const detail = `${row.pid}: ${(error as Error).message}`;
+    const detail = `${row.pid}: ${errorDetail(error)}`;
     if (!this.failures.includes(detail)) this.failures.push(detail);
   }
 
@@ -92,6 +100,15 @@ export class SnapshotRecords {
     }
   }
 
+  killRoot(): boolean {
+    try {
+      return this.ops.signalProcess(this.root, "SIGKILL");
+    } catch (error) {
+      this.failed(this.root, error);
+      return false;
+    }
+  }
+
   remaining(): { pid: number; startTime: string }[] {
     return [...this.alive(), ...(this.rootAlive() ? [this.root] : [])];
   }
@@ -121,7 +138,15 @@ export async function stopSnapshot(
   const beforeRoot = records.failures.length;
   const rootSent = records.killRootGroup();
   add("SIGKILL pi group", records.failures.length === beforeRoot, rootSent ? "sent" : "no live member");
-  await settle(() => records.remaining().length === 0);
+  // 进程组查询或信号失败不能阻止按身份单独终止 pi。
+  const beforeSingle = records.failures.length;
+  const singleSent = records.killRoot();
+  add("SIGKILL pi", records.failures.length === beforeSingle, singleSent ? "sent" : "not running or identity changed");
+  try {
+    await settle(() => records.remaining().length === 0);
+  } catch (error) {
+    add("settle snapshot", false, errorDetail(error));
+  }
   const leftovers = records.remaining().map(({ pid, startTime }) => ({ pid, startTime }));
   for (const failure of records.captureFailures) add("snapshot", false, failure);
   for (const failure of records.failures) add("snapshot cleanup", false, failure);

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -19,7 +19,7 @@ import {
   type StopOptions,
   type StopReport,
 } from "./process.js";
-import { listProcesses, processCommandLine } from "./proctable.js";
+import { listProcesses, processCommandLine, ProcessTableError, type ProcessRow } from "./proctable.js";
 import { ensurePrivateDir } from "./secrets.js";
 import { pathExistsStrict } from "./fs-probe.js";
 
@@ -105,6 +105,28 @@ interface RawLock {
   release(): void;
 }
 
+function aggregateFailure(errors: unknown[], message: string): AggregateError {
+  const failure = new AggregateError(errors, message);
+  const code = (errors[0] as NodeJS.ErrnoException | null | undefined)?.code;
+  return code === undefined ? failure : Object.assign(failure, { code });
+}
+
+/** 通过已有 Error.cause 交付清理结果，保留原错误及其已有上下文。 */
+function withRecoveryCause(error: unknown, result: unknown): unknown {
+  if (error instanceof Error) {
+    try {
+      const cause = error.cause === undefined ? result : new AggregateError([error.cause, result], "恢复查询与清理上下文");
+      Object.defineProperty(error, "cause", { value: cause, configurable: true, writable: true });
+      return error;
+    } catch {
+      // 冻结的错误不能附加 cause，保留为聚合错误中的首项。
+    }
+  }
+  const failure = aggregateFailure([error], "恢复查询失败，清理结果见 cause");
+  Object.defineProperty(failure, "cause", { value: result, configurable: true });
+  return failure;
+}
+
 /**
  * POSIX: `flock(LOCK_EX | LOCK_NB)` on `posixFile`, which is never deleted.
  * Windows: named mutex `Global\pi-hostkit-v1-<SID>-<purpose>-<sha256(key)>`; an
@@ -130,12 +152,22 @@ function acquireRaw(purpose: string, key: string, posixFile: string): RawLock | 
   }
   heldKeys.add(key);
   let released = false;
+  let failed = false;
+  let releaseFailure: unknown;
   return {
     release() {
       if (released) return;
+      // close 失败后描述符或句柄可能已经失效，不能重试关闭已复用的编号。
+      if (failed) throw releaseFailure;
+      try {
+        release();
+      } catch (error) {
+        failed = true;
+        releaseFailure = error;
+        throw error;
+      }
       released = true;
       heldKeys.delete(key);
-      release();
     },
   };
 }
@@ -236,25 +268,48 @@ function readRecord(file: string, key: string): ReadRecord {
   }
 }
 
-/** Writes the record atomically (temporary file, then rename). */
+/** 原子提交记录；仅清理由本次调用独占创建的临时文件。 */
 function writeRecord(file: string, record: SessionLockRecord): void {
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  for (let attempt = 0; ; attempt++) {
-    try {
-      renameSync(tmp, file);
-      return;
-    } catch (error) {
-      // Windows refuses to replace a file another process has open for a moment.
-      const code = (error as NodeJS.ErrnoException).code;
-      if (process.platform !== "win32" || attempt >= 20 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) {
-        try {
-          unlinkSync(tmp);
-        } catch {}
-        throw error;
+  const data = `${JSON.stringify(record, null, 2)}\n`;
+  let fd: number | undefined;
+  let created = false;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    created = true;
+    writeFileSync(fd, data);
+    const closing = fd;
+    fd = undefined;
+    closeSync(closing);
+    for (let attempt = 0; ; attempt++) {
+      try {
+        renameSync(tmp, file);
+        return;
+      } catch (error) {
+        // Windows 可能因其他进程短暂打开目标记录而拒绝替换。
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== "win32" || attempt >= 20 || (code !== "EPERM" && code !== "EACCES" && code !== "EBUSY")) throw error;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
     }
+  } catch (error) {
+    const failures: unknown[] = [error];
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch (cleanup) {
+        failures.push(cleanup);
+      }
+    }
+    if (created) {
+      try {
+        unlinkSync(tmp);
+      } catch (cleanup) {
+        if ((cleanup as NodeJS.ErrnoException).code !== "ENOENT") failures.push(cleanup);
+      }
+    }
+    if (failures.length > 1) throw aggregateFailure(failures, `Cannot clean up lock record ${tmp}`);
+    throw error;
   }
 }
 
@@ -273,7 +328,7 @@ function sameFile(file: string, key: string): boolean {
   return comparisonKey(realPathOrPending(file)) === key;
 }
 
-type Candidates = { found: ProcessIdentity[]; uncertain: boolean };
+type Candidates = { found: ProcessIdentity[]; uncertain: boolean; failure?: ProcessTableError };
 
 /**
  * pi-hostkit gate processes (held, or a loaded pi whose command line is still
@@ -292,10 +347,30 @@ function findWritersByCommandLine(canonical: string): Candidates {
   const key = comparisonKey(canonical);
   const found: ProcessIdentity[] = [];
   let uncertain = false;
-  for (const row of listProcesses()) {
+  let failure: ProcessTableError | undefined;
+  let rows: ProcessRow[];
+  try {
+    rows = listProcesses();
+  } catch (error) {
+    if (!(error instanceof ProcessTableError)) throw error;
+    // 部分进程表仍包含可确认的候选；清理后再报告枚举失败，不能跳过这些写者。
+    rows = error.rows;
+    failure = error;
+    uncertain = true;
+  }
+  for (const row of rows) {
     if (row.pid === process.pid || row.zombie) continue;
-    const args = processCommandLine(row.pid);
-    if (!args) continue;
+    let args: string[] | null;
+    try {
+      args = processCommandLine(row.pid);
+    } catch {
+      uncertain = true;
+      continue;
+    }
+    if (!args) {
+      uncertain = true;
+      continue;
+    }
     let gate: number;
     try {
       gate = gateIndex(args);
@@ -318,7 +393,7 @@ function findWritersByCommandLine(canonical: string): Candidates {
       uncertain = true;
     }
   }
-  return { found, uncertain };
+  return { found, uncertain, ...(failure ? { failure } : {}) };
 }
 
 /**
@@ -347,7 +422,8 @@ function assertSessionArg(argv: string[], canonical: string): void {
 
 class WriterLock implements SessionWriterLock {
   readonly recoveryReports: StopReport[] = [];
-  private state: "acquired" | "recovered" | "released" = "acquired";
+  private state: "acquired" | "recovered" | "release_unknown" | "released" = "acquired";
+  private releaseFailure: unknown;
   private current: SessionLockRecord | undefined;
   /** Operations on one lock run one at a time, in call order. */
   private queue: Promise<unknown> = Promise.resolve();
@@ -378,10 +454,26 @@ class WriterLock implements SessionWriterLock {
     }
   }
 
-  /** Releases the OS lock without touching the record (failure paths). */
+  /** 原生释放开始后立即终止可写状态；报错时不能假定内核锁仍然持有。 */
   private abandon(): void {
+    if (this.state === "release_unknown") throw this.releaseFailure;
+    this.state = "release_unknown";
+    try {
+      this.raw.release();
+    } catch (error) {
+      this.releaseFailure = error;
+      throw error;
+    }
     this.state = "released";
-    this.raw.release();
+  }
+
+  private abandonAfter(error: unknown): never {
+    try {
+      this.abandon();
+    } catch (cleanup) {
+      throw aggregateFailure([error, cleanup], "Cannot release failed session lock");
+    }
+    throw error;
   }
 
   recoverPreviousWriter(opts: RecoverOptions = {}): Promise<RecoverResult> {
@@ -391,8 +483,7 @@ class WriterLock implements SessionWriterLock {
       try {
         result = await this.recover(opts);
       } catch (error) {
-        this.abandon();
-        throw error;
+        this.abandonAfter(error);
       }
       if (result === "failed") {
         this.abandon();
@@ -408,8 +499,7 @@ class WriterLock implements SessionWriterLock {
       try {
         writeRecord(this.paths.record, record);
       } catch (error) {
-        this.abandon();
-        throw error;
+        this.abandonAfter(error);
       }
       this.current = record;
       this.state = "recovered";
@@ -422,12 +512,37 @@ class WriterLock implements SessionWriterLock {
    * shows nothing left within its coverage and the writer is gone.
    */
   private async stopWriter(writer: ProcessIdentity, opts: StopOptions): Promise<RecoverResult> {
-    const alive = (await isSameProcess(writer)) === "alive";
-    if (!alive && !scopePopulated(writer)) return "none";
-    const report = await stopByIdentity(writer, opts);
+    let queryFailed = false;
+    let queryError: unknown;
+    let alive: boolean | undefined;
+    try {
+      alive = (await isSameProcess(writer)) === "alive";
+      if (!alive && !scopePopulated(writer)) return "none";
+    } catch (error) {
+      queryFailed = true;
+      queryError = error;
+    }
+    let report: StopReport;
+    try {
+      report = await stopByIdentity(writer, opts);
+    } catch (error) {
+      // 前置查询未知不能跳过独立清理，清理拒绝也不能覆盖原查询错误。
+      throw queryFailed ? withRecoveryCause(queryError, error) : error;
+    }
+    if (queryFailed) {
+      report = { ...report, steps: [{
+        step: "query writer before recovery", ok: false, at: new Date().toISOString(),
+        detail: queryError instanceof Error ? queryError.message : String(queryError),
+      }, ...report.steps] };
+    }
     this.recoveryReports.push(report);
+    if (queryFailed) throw withRecoveryCause(queryError, report);
     if (report.leftovers.length) return "failed";
-    if ((await isSameProcess(writer)) === "alive" || scopePopulated(writer)) return "failed";
+    try {
+      if ((await isSameProcess(writer)) === "alive" || scopePopulated(writer)) return "failed";
+    } catch (error) {
+      throw withRecoveryCause(error, report);
+    }
     return "stopped";
   }
 
@@ -438,13 +553,23 @@ class WriterLock implements SessionWriterLock {
     if (!previous || previous.state === "released") return "none";
     if (previous.writer) return this.stopWriter(previous.writer, stopOpts);
     // No writer recorded: the previous host may have died between spawn and record.
-    const { found, uncertain } = findWritersByCommandLine(this.paths.canonical);
+    const { found, uncertain, failure } = findWritersByCommandLine(this.paths.canonical);
     let stopped = false;
+    let failed = false;
+    const failures: unknown[] = failure ? [failure] : [];
     for (const candidate of found) {
-      const result = await this.stopWriter(candidate, stopOpts);
-      if (result === "failed") return "failed";
-      if (result === "stopped") stopped = true;
+      try {
+        const result = await this.stopWriter(candidate, stopOpts);
+        if (result === "failed") failed = true;
+        if (result === "stopped") stopped = true;
+      } catch (error) {
+        // 一个候选的停止失败不能阻断其他已知候选的清理。
+        failures.push(error);
+      }
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw aggregateFailure(failures, "Cannot recover session writers");
+    if (failed) return "failed";
     if (stopped && !uncertain) return "stopped";
     // Not finding one does not prove there is none (overwritten, truncated or
     // unreadable command lines, relative --session values).
@@ -479,36 +604,54 @@ class WriterLock implements SessionWriterLock {
       }
       assertSessionArg(spec.argv, this.paths.canonical);
       const proc = await spawnManaged({ ...spec, startHeld: true });
-      try {
-        this.writeUpdate({ writer: proc.identity, state: "running" });
-      } catch (error) {
-        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
-        throw error;
-      }
+      // 记录提交失败时仍须记住活写者，防止普通 release 或后续 spawn 绕过身份核对。
       this.writer = proc;
       this.writerExited = false;
       void proc.exited.then(() => {
         if (this.writer === proc) this.writerExited = true;
       });
       try {
+        this.writeUpdate({ writer: proc.identity, state: "running" });
         proc.release();
       } catch (error) {
-        await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
-        throw error;
+        await this.stopFailedWriter(proc, error);
       }
       return proc;
     });
+  }
+
+  private async stopFailedWriter(proc: ManagedProcess, error: unknown): Promise<never> {
+    let report: StopReport;
+    try {
+      report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+    } catch (cleanup) {
+      throw aggregateFailure([error, cleanup], "Cannot stop failed session writer");
+    }
+    const failed = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
+      !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")) &&
+      !(step.step === "SIGKILL pi" && step.detail === "not running or identity changed"));
+    if (report.leftovers.length || failed.length) {
+      // 调用方拿不到失败的 ManagedProcess，停止报告必须随抛出的错误保留。
+      const cleanup = new Error(`Cannot stop failed session writer: ${failed.length} failed steps; ${report.leftovers.length} leftovers`, { cause: report });
+      throw aggregateFailure([error, cleanup], "Cannot stop failed session writer");
+    }
+    throw error;
   }
 
   /** Commit the released record before changing ownership or in-memory state. */
   release(opts: { writerSwitchedAway?: boolean } = {}): Promise<void> {
     return this.serial(async () => {
       if (this.state === "released") return;
+      if (this.state === "release_unknown") throw this.releaseFailure;
       const record = this.current ?? (this.previous?.state !== "released" ? this.previous : undefined);
-      if (!opts.writerSwitchedAway && record?.writer) {
+      if (!opts.writerSwitchedAway) {
+        const writers = [record?.writer];
+        if (this.writer && !this.writerExited && !writers.includes(this.writer.identity)) writers.push(this.writer.identity);
         try {
-          if ((await isSameProcess(record.writer)) !== "gone") {
-            throw new Error("the session writer is still running");
+          for (const writer of writers) {
+            if (writer && (await isSameProcess(writer)) !== "gone") {
+              throw new Error("the session writer is still running");
+            }
           }
         } catch (cause) {
           throw Object.assign(new Error("release: writer exit cannot be confirmed", { cause }), { code: "EHOSTKIT_LOCK_STATE" });
@@ -551,7 +694,11 @@ export async function acquireSessionWriterLock(
     const { record, invalid } = readRecord(paths.record, paths.key);
     return new WriterLock(raw, paths, host, record, invalid);
   } catch (error) {
-    raw.release();
+    try {
+      raw.release();
+    } catch (cleanup) {
+      throw aggregateFailure([error, cleanup], "Cannot release failed session acquisition");
+    }
     throw error;
   }
 }
@@ -565,11 +712,20 @@ export async function probeSessionWriterLock(sessionFile: string): Promise<{ hel
   await prepareLocksDir();
   const paths = sessionPaths(sessionFile);
   const raw = acquireRaw("session", `session\n${paths.key}`, paths.lock);
+  const failures: unknown[] = [];
   try {
     const { record } = readRecord(paths.record, paths.key);
     return { held: !raw, ...(record ? { record } : {}) };
+  } catch (error) {
+    failures.push(error);
+    throw error;
   } finally {
-    raw?.release();
+    try {
+      raw?.release();
+    } catch (cleanup) {
+      if (failures.length) throw aggregateFailure([...failures, cleanup], "Cannot release failed session probe");
+      throw cleanup;
+    }
   }
 }
 

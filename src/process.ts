@@ -5,7 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { GATE_RELEASE_LINE } from "./gate-protocol.js";
 import { nativeFn } from "./native.js";
-import { listProcesses, matches, processInfo, signalProcess, verifiedDescendants, type ProcessRow } from "./proctable.js";
+import { matches, processInfo, signalProcess } from "./proctable.js";
 import { StdioRpcTransport, type RpcTransport } from "./rpc.js";
 import { SnapshotRecords, stopSnapshot } from "./snapshots.js";
 import { cgroupPopulated, stopCgroup } from "./cgroups.js";
@@ -195,9 +195,12 @@ function cgroupOf(pid: number): string | null {
     const line = readFileSync(`/proc/${pid}/cgroup`, "utf8")
       .split("\n")
       .find((l) => l.startsWith("0::"));
-    return line ? path.posix.join("/sys/fs/cgroup", line.slice(3)) : null;
-  } catch {
-    return null;
+    if (!line || !line.slice(3).startsWith("/")) throw hostkitError("EHOSTKIT_SPAWN", `cannot read unified cgroup for ${pid}`);
+    return path.posix.join("/sys/fs/cgroup", line.slice(3));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "ENOENT" || code === "ESRCH") return null;
+    throw error;
   }
 }
 
@@ -226,12 +229,12 @@ class Steps {
   }
 }
 
-function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport["leftovers"] {
-  return rows.map((row) => ({ pid: row.pid, startTime: row.startTime }));
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
-function liveRows(pids: number[]): ProcessRow[] {
-  return pids.map((pid) => processInfo(pid)).filter((row): row is ProcessRow => !!row && !row.zombie);
+function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport["leftovers"] {
+  return rows.map((row) => ({ pid: row.pid, startTime: row.startTime }));
 }
 
 // ---------- spawnManaged ----------
@@ -363,12 +366,16 @@ class Managed implements ManagedProcess {
         const res = await this.rpc.send({ type: "abort" }, { timeoutMs: opts.abortTimeoutMs });
         steps.add("abort", res.success, res.success ? undefined : res.error);
       } catch (error) {
-        steps.add("abort", false, (error as Error).message);
+        steps.add("abort", false, errorDetail(error));
       }
     }
 
-    this.rpc.closeInput();
-    steps.add("closeInput", true);
+    try {
+      this.rpc.closeInput();
+      steps.add("closeInput", true);
+    } catch (error) {
+      steps.add("closeInput", false, errorDetail(error));
+    }
     const exitedOnEof = await this.waitExit(opts.graceMs);
     steps.add("grace", exitedOnEof, exitedOnEof ? "exited" : `still running after ${opts.graceMs} ms`);
 
@@ -384,7 +391,7 @@ class Managed implements ManagedProcess {
           const exited = sent && (await this.waitExit(opts.termGraceMs));
           steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${opts.termGraceMs} ms` : "not delivered");
         } catch (error) {
-          steps.add("SIGTERM", false, (error as Error).message);
+          steps.add("SIGTERM", false, errorDetail(error));
         }
       }
     }
@@ -396,12 +403,57 @@ class Managed implements ManagedProcess {
         nativeFn("jobTerminate")(job);
         steps.add("TerminateJobObject", true);
       } catch (error) {
-        steps.add("TerminateJobObject", false, (error as Error).message);
+        steps.add("TerminateJobObject", false, errorDetail(error));
       }
-      const jobPids = () => nativeFn("jobProcessIds")(job);
-      await poll(() => jobPids().length === 0, SETTLE_CHECK_MS);
-      leftovers = rowsToLeftovers(liveRows(jobPids()));
-      nativeFn("handleClose")(job);
+      const known = new Map<number, StopReport["leftovers"][number]>();
+      const failures = new Set<string>();
+      const failed = (step: string, error: unknown) => {
+        const detail = errorDetail(error);
+        const key = `${step}: ${detail}`;
+        if (!failures.has(key)) steps.add(step, false, detail);
+        failures.add(key);
+      };
+      let queried = false;
+      const query = (): boolean => {
+        let pids: number[];
+        try {
+          pids = nativeFn("jobProcessIds")(job);
+          queried = true;
+        } catch (error) {
+          queried = false;
+          failed("query Job Object", error);
+          return false;
+        }
+        const members = new Set(pids);
+        for (const pid of known.keys()) if (!members.has(pid)) known.delete(pid);
+        for (const pid of members) {
+          try {
+            const row = processInfo(pid);
+            if (row && !row.zombie) known.set(pid, { pid, startTime: row.startTime });
+            else known.delete(pid);
+          } catch (error) {
+            if (!known.has(pid)) known.set(pid, { pid, startTime: pid === this.identity.pid ? this.identity.startTime : "" });
+            failed(`query Job PID ${pid}`, error);
+          }
+        }
+        return pids.length === 0;
+      };
+      try {
+        await poll(query, SETTLE_CHECK_MS);
+        // 最后一次 Job 查询失败时，即使已知成员为空也不能报告清理完成。
+        const empty = query();
+        leftovers = [...known.values()];
+        if (!empty && (!queried || !leftovers.length)) {
+          leftovers.push({ pid: 0, startTime: "", exe: `Job Object ${job}` });
+        }
+      } finally {
+        try {
+          nativeFn("handleClose")(job);
+          steps.add("close Job Object", true);
+        } catch (error) {
+          steps.add("close Job Object", false, errorDetail(error));
+        }
+      }
     } else if (this.mode.kind === "cgroup") {
       const { dir } = this.mode;
       const report = await stopCgroup(dir, this.identity, (empty) => poll(empty, SETTLE_CHECK_MS));
@@ -420,7 +472,7 @@ class Managed implements ManagedProcess {
       try {
         gone = !matches(processInfo(this.identity.pid), this.identity);
       } catch (error) {
-        steps.add("query pi", false, (error as Error).message);
+        steps.add("query pi", false, errorDetail(error));
       }
       if (!gone && !leftovers.some((row) => row.pid === this.identity.pid && row.startTime === this.identity.startTime)) {
         leftovers.push({ pid: this.identity.pid, startTime: this.identity.startTime });
@@ -460,30 +512,83 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  await new Promise<void>((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  });
-
+  let exited = false;
   let job: number | undefined;
-  const abandon = (error: Error): never => {
-    try {
-      child.kill("SIGKILL");
-    } catch {}
-    if (job !== undefined) {
-      try {
-        nativeFn("handleClose")(job);
-      } catch {}
-    }
+  let identity: ProcessIdentity | null = null;
+  const childErrors: unknown[] = [];
+  const onChildError = (error: Error) => { childErrors.push(error); };
+  child.on("error", onChildError);
+  child.once("exit", () => { exited = true; });
+  child.once("close", () => child.removeListener("error", onChildError));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => { child.removeListener("error", onStartError); resolve(); };
+      const onStartError = (error: Error) => { child.removeListener("spawn", onSpawn); reject(error); };
+      child.once("spawn", onSpawn);
+      child.once("error", onStartError);
+    });
+  } catch (error) {
+    child.removeListener("error", onChildError);
     throw error;
+  }
+  const pid = child.pid!;
+
+  const abandon = async (primary: unknown, extra: unknown[] = [], closeJob = true): Promise<never> => {
+    const failures: unknown[] = [primary, ...extra];
+    const added = new Set<string>();
+    const add = (error: unknown) => {
+      const detail = errorDetail(error);
+      if (!added.has(detail)) { added.add(detail); failures.push(error); }
+    };
+    // end 可能因背压延迟关闭；destroy 同时保证未放行的 gate 收到 EOF。
+    const input = child.stdin;
+    const onInputError = (error: Error) => add(error);
+    if (input) {
+      input.on("error", onInputError);
+      input.once("close", () => input.removeListener("error", onInputError));
+      try { input.end(); } catch (error) { add(error); }
+      try { input.destroy(); } catch (error) { add(error); }
+    }
+    let sent: boolean | undefined;
+    if (!exited) {
+      try { sent = child.kill("SIGKILL"); } catch (error) { add(error); }
+    }
+    if (closeJob && job !== undefined) {
+      try { nativeFn("handleClose")(job); } catch (error) { add(error); }
+    }
+    let gone = exited;
+    try {
+      gone = await poll(() => {
+        if (exited) return true;
+        try {
+          const row = processInfo(pid);
+          return identity ? !matches(row, identity) : !row || row.zombie;
+        } catch (error) {
+          add(error);
+          return false;
+        }
+      }, SETTLE_CHECK_MS);
+    } catch (error) { add(error); }
+    // kill 返回 false 只有在随后明确确认退出时才可视为无需发送。
+    if (sent === false && !gone) add(new Error(`启动回收未发送 SIGKILL：PID ${pid}`));
+    if (!gone) {
+      add(new Error(`启动回收未能在 ${SETTLE_CHECK_MS} ms 内确认 PID ${pid} 退出`, {
+        cause: { pid, ...(identity ? { identity } : {}), errors: childErrors },
+      }));
+    }
+    // 接住 kill/destroy 在下一轮事件循环发出的错误，即使退出已经得到确认。
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const error of childErrors) add(error);
+    // 状态仍未知时保留收集器，延后的 error 也能从未确认退出错误的 cause.errors 中取得。
+    if (gone) child.removeListener("error", onChildError);
+    if (failures.length > 1) {
+      throw Object.assign(new AggregateError(failures, failures.map(errorDetail).join("; ")), {
+        code: (primary as NodeJS.ErrnoException | null)?.code,
+      });
+    }
+    throw primary;
   };
 
-  let exited = false;
-  child.once("exit", () => {
-    exited = true;
-  });
-  const pid = child.pid!;
-  let identity: ProcessIdentity | null = null;
   let mode: Mode = { kind: "snapshot" };
   try {
     if (unit) {
@@ -505,20 +610,39 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
       mode = { kind: "job", job };
     }
   } catch (error) {
-    abandon(error as Error);
+    return abandon(error);
   }
 
-  const rpc = new StdioRpcTransport(child.stdin!, child.stdout!, { maxRecordBytes: spec.maxRecordBytes, maxQueuedBytes: spec.maxQueuedBytes });
-  rpc.block("pi is held at the start gate; call release() first");
-  const managed = new Managed(child, identity!, mode, rpc, spec.snapshotIntervalMs ?? 5_000);
+  let managed!: Managed;
+  try {
+    const rpc = new StdioRpcTransport(child.stdin!, child.stdout!, { maxRecordBytes: spec.maxRecordBytes, maxQueuedBytes: spec.maxQueuedBytes });
+    rpc.block("pi is held at the start gate; call release() first");
+    managed = new Managed(child, identity!, mode, rpc, spec.snapshotIntervalMs ?? 5_000);
+  } catch (error) {
+    return abandon(error);
+  }
   if (!spec.startHeld) {
     try {
       managed.release();
     } catch (error) {
-      await managed.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+      let report: StopReport;
+      try {
+        report = await managed.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+      } catch (stopError) {
+        // stop 的 finally 已处理 Job；回收仍由宿主持有的子进程，不重放句柄关闭。
+        return abandon(error, [stopError], false);
+      }
+      // 放行失败时没有 ManagedProcess 可交给调用方，清理报告必须随错误保留。
+      const failures = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
+        !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")));
+      if (report.leftovers.length || failures.length) {
+        const cleanup = new Error(`stop after release failure: ${failures.map((step) => `${step.step}: ${step.detail ?? "failed"}`).join("; ")}; ${report.leftovers.length} leftovers`, { cause: report });
+        return abandon(error, [cleanup], false);
+      }
       throw error;
     }
   }
+  child.removeListener("error", onChildError);
   return managed;
 }
 
@@ -539,24 +663,34 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
     try {
       return matches(processInfo(id.pid), id);
     } catch (error) {
-      steps.add("query pi", false, (error as Error).message);
+      steps.add("query pi", false, errorDetail(error));
       return true;
     }
   };
-  steps.add("identity", true, alive() ? "alive" : "gone");
+  const beforeIdentity = steps.steps.length;
+  const same = alive();
+  const identityKnown = steps.steps.length === beforeIdentity;
+  steps.add("identity", identityKnown, identityKnown ? (same ? "alive" : "gone") : "unknown");
 
   if (process.platform === "win32") {
-    const table = listProcesses();
-    const tree = alive() ? verifiedDescendants(table, id) : [];
-    const killed = alive() && nativeFn("terminateProcess")(id.pid, id.startTime);
-    steps.add("TerminateProcess pi", killed, killed ? undefined : "not running");
-    for (const row of tree) nativeFn("terminateProcess")(row.pid, row.startTime);
-    steps.add("TerminateProcess descendants", true, `${tree.length} processes`);
-    const watch = [id, ...tree];
-    await poll(() => watch.every((row) => !matches(processInfo(row.pid), row)), SETTLE_CHECK_MS);
-    const leftovers = watch.filter((row) => matches(processInfo(row.pid), row));
+    const records = new SnapshotRecords(id);
+    records.capture();
+    for (const failure of records.captureFailures) steps.add("snapshot", false, failure);
+    const tree = [...records.records.values()];
+    for (const row of [id, ...tree]) {
+      const step = row === id ? "TerminateProcess pi" : "TerminateProcess descendant";
+      try {
+        const killed = nativeFn("terminateProcess")(row.pid, row.startTime);
+        steps.add(step, killed, `${row.pid}: ${killed ? "sent" : "not running or identity changed"}`);
+      } catch (error) {
+        steps.add(step, false, `${row.pid}: ${errorDetail(error)}`);
+      }
+    }
+    await poll(() => records.remaining().length === 0, SETTLE_CHECK_MS);
+    const leftovers = rowsToLeftovers(records.remaining());
+    for (const failure of records.failures) steps.add("query recorded process", false, failure);
     steps.add("verify", leftovers.length === 0);
-    return { steps: steps.steps, coverage: "snapshot_visible", leftovers: rowsToLeftovers(leftovers) };
+    return { steps: steps.steps, coverage: "snapshot_visible", leftovers };
   }
 
   let cgroup: string | undefined;
@@ -565,7 +699,7 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
       if (pathExistsStrict(id.cgroup!)) cgroup = id.cgroup;
     } catch (error) {
       // An unreadable recorded scope must not silently become snapshot coverage.
-      steps.add("check cgroup directory", false, (error as Error).message);
+      steps.add("check cgroup directory", false, errorDetail(error));
       cgroup = id.cgroup;
     }
   }
@@ -574,7 +708,7 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
     try {
       records.capture();
     } catch (error) {
-      steps.add("snapshot", false, (error as Error).message);
+      steps.add("snapshot", false, errorDetail(error));
     }
   };
   if (!cgroup) capture();
@@ -584,7 +718,7 @@ export async function stopByIdentity(id: ProcessIdentity, opts: StopOptions = {}
       const exited = sent && (await poll(() => !alive(), o.termGraceMs));
       steps.add("SIGTERM", sent, exited ? "exited" : sent ? `still running after ${o.termGraceMs} ms` : "not delivered");
     } catch (error) {
-      steps.add("SIGTERM", false, (error as Error).message);
+      steps.add("SIGTERM", false, errorDetail(error));
     }
   }
 

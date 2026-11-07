@@ -353,7 +353,8 @@ describe("session writer lock", () => {
     children.add(gate);
     await new Promise((resolve) => gate.once("spawn", resolve));
     const lock = await acquireWhenFree(sessionFile, "pi-pane");
-    assert.equal(await lock.recoverPreviousWriter(FAST_STOP), "stopped");
+    // 此测试只构造一个写者；其他进程的命令行可能不可读，由测试明确确认没有额外写者。
+    assert.equal(await lock.recoverPreviousWriter({ ...FAST_STOP, assumeNoWriter: true }), "stopped");
     assert.equal(lock.recoveryReports.length, 1);
     await until(() => gate.exitCode !== null || gate.signalCode !== null, 5_000);
     await lock.release();
@@ -376,9 +377,11 @@ describe("session writer lock", () => {
       assert.equal(result, "failed");
     } else if (result === "failed") {
       // pi overwrote its command line with process.title: not findable, so recovery refuses.
-      assert.equal(await isSameProcess(identity), "alive");
-      const { stopByIdentity } = await import("../dist/index.js");
-      await stopByIdentity(identity, FAST_STOP);
+      // 已发现的写者可能已停止，但其他进程的命令行仍不可读，恢复仍须失败。
+      if ((await isSameProcess(identity)) === "alive") {
+        const { stopByIdentity } = await import("../dist/index.js");
+        await stopByIdentity(identity, FAST_STOP);
+      }
     } else {
       assert.equal(result, "stopped");
     }

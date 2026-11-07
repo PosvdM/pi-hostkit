@@ -25,6 +25,16 @@
     }                                                                          \
   } while (0)
 
+// 持有临时资源时，N-API 失败也必须经过释放路径。
+#define CHECK_RELEASE(call, cleanup)                                            \
+  do {                                                                         \
+    if ((call) != napi_ok) {                                                    \
+      cleanup;                                                                 \
+      napi_throw_error(env, "EHOSTKIT", "N-API call failed: " #call);           \
+      return NULL;                                                             \
+    }                                                                          \
+  } while (0)
+
 static napi_value throw_win(napi_env env, const char *op, DWORD err) {
   char message[512];
   char sys[256] = "";
@@ -52,6 +62,15 @@ static napi_value throw_win(napi_env env, const char *op, DWORD err) {
   napi_set_named_property(env, error, "errno", errno_v);
   napi_throw(env, error);
   return NULL;
+}
+
+// 保留主错误的码和 errno，同时让清理失败的操作与系统错误号可见。
+static napi_value throw_win_pair(napi_env env, const char *op, DWORD err,
+                                const char *cleanup, DWORD cleanup_err) {
+  char operations[256];
+  snprintf(operations, sizeof(operations), "%s; %s failed (Windows error %lu)",
+           op, cleanup, (unsigned long)cleanup_err);
+  return throw_win(env, operations, err);
 }
 
 static napi_value js_null(napi_env env) {
@@ -87,8 +106,8 @@ static wchar_t *get_wstring(napi_env env, napi_value value) {
     napi_throw_error(env, "ENOMEM", "out of memory");
     return NULL;
   }
-  napi_get_value_string_utf16(env, value, (char16_t *)buf, len + 1, &len);
-  if (wcslen(buf) != len) {
+  if (napi_get_value_string_utf16(env, value, (char16_t *)buf, len + 1, &len) != napi_ok ||
+      wcslen(buf) != len) {
     free(buf);
     napi_throw_type_error(env, "EINVAL", "string must not contain NUL");
     return NULL;
@@ -107,7 +126,11 @@ static char *get_utf8(napi_env env, napi_value value) {
     napi_throw_error(env, "ENOMEM", "out of memory");
     return NULL;
   }
-  napi_get_value_string_utf8(env, value, buf, len + 1, &len);
+  if (napi_get_value_string_utf8(env, value, buf, len + 1, &len) != napi_ok || strlen(buf) != len) {
+    free(buf);
+    napi_throw_type_error(env, "EINVAL", "string must not contain NUL");
+    return NULL;
+  }
   return buf;
 }
 
@@ -123,7 +146,11 @@ static int get_handle(napi_env env, napi_value value, HANDLE *out) {
 
 static napi_value make_handle(napi_env env, HANDLE h) {
   napi_value v;
-  napi_create_int64(env, (int64_t)(intptr_t)h, &v);
+  if (napi_create_int64(env, (int64_t)(intptr_t)h, &v) != napi_ok) {
+    CloseHandle(h);
+    napi_throw_error(env, "EHOSTKIT", "cannot return native handle");
+    return NULL;
+  }
   return v;
 }
 
@@ -144,17 +171,24 @@ static void format_start(const FILETIME *ft, char *out, size_t size) {
   snprintf(out, size, "%llu", (unsigned long long)u.QuadPart);
 }
 
-// Opens a live process and reads its creation time. Returns NULL when the
-// process does not exist, has exited, or cannot be queried.
-static HANDLE open_live(DWORD pid, DWORD extra_access, char *start, size_t size) {
+// 只有确认不存在或已退出时才令 err 为零；访问和查询失败必须交给调用方。
+static HANDLE open_live(DWORD pid, DWORD extra_access, char *start, size_t size, DWORD *err) {
+  *err = ERROR_SUCCESS;
   HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE | extra_access, FALSE, pid);
-  if (!h) return NULL;
-  if (WaitForSingleObject(h, 0) != WAIT_TIMEOUT) {
-    CloseHandle(h);
+  if (!h) {
+    DWORD code = GetLastError();
+    if (code != ERROR_INVALID_PARAMETER) *err = code;
+    return NULL;
+  }
+  DWORD wait = WaitForSingleObject(h, 0);
+  if (wait != WAIT_TIMEOUT) {
+    if (wait != WAIT_OBJECT_0) *err = wait == WAIT_FAILED ? GetLastError() : ERROR_INVALID_DATA;
+    if (!CloseHandle(h) && !*err) *err = GetLastError();
     return NULL;
   }
   FILETIME created, exited, kernel, user;
   if (!GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+    *err = GetLastError();
     CloseHandle(h);
     return NULL;
   }
@@ -183,7 +217,7 @@ typedef LONG(NTAPI *NtQuerySystemInformationFn)(ULONG, PVOID, ULONG, PULONG);
 // to the same process object, unlike a Toolhelp parent PID combined with a
 // creation time read later through a PID that may have been reused.
 // Returns a malloc'd buffer or NULL (error in *err).
-static BYTE *process_snapshot(DWORD *err) {
+static BYTE *process_snapshot(DWORD *err, size_t *length) {
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
   NtQuerySystemInformationFn query =
       ntdll ? (NtQuerySystemInformationFn)(void *)GetProcAddress(ntdll, "NtQuerySystemInformation") : NULL;
@@ -200,13 +234,26 @@ static BYTE *process_snapshot(DWORD *err) {
     }
     ULONG needed = 0;
     LONG status = query(5 /* SystemProcessInformation */, buf, size, &needed);
-    if (status >= 0) return buf;
+    if (status >= 0) {
+      if (needed < sizeof(SYSTEM_PROCESS_INFORMATION) || needed > size) {
+        free(buf);
+        *err = ERROR_INVALID_DATA;
+        return NULL;
+      }
+      *length = needed;
+      return buf;
+    }
     free(buf);
     if (status != (LONG)0xC0000004L /* STATUS_INFO_LENGTH_MISMATCH */) {
       *err = (DWORD)status;
       return NULL;
     }
-    size = (needed > size ? needed : size) + (1 << 16);
+    ULONG next = needed > size ? needed : size;
+    if (next > MAXDWORD - (1 << 16)) {
+      *err = ERROR_INSUFFICIENT_BUFFER;
+      return NULL;
+    }
+    size = next + (1 << 16);
   }
   *err = ERROR_INSUFFICIENT_BUFFER;
   return NULL;
@@ -218,10 +265,13 @@ typedef struct {
   char start[32];
 } proc_entry;
 
-// Iterates a snapshot. Returns 0 at the end.
-static int next_entry(BYTE *buf, size_t *offset, int *done, proc_entry *out) {
+// 返回 1 表示一项，0 表示结束，-1 表示系统快照不完整。
+static int next_entry(BYTE *buf, size_t length, size_t *offset, int *done, proc_entry *out) {
   if (*done) return 0;
+  if (*offset > length || length - *offset < sizeof(SYSTEM_PROCESS_INFORMATION)) return -1;
   SYSTEM_PROCESS_INFORMATION *info = (SYSTEM_PROCESS_INFORMATION *)(buf + *offset);
+  if (info->NextEntryOffset && (info->NextEntryOffset < sizeof(*info) ||
+      info->NextEntryOffset > length - *offset || info->NextEntryOffset % sizeof(void *) != 0)) return -1;
   // winternl.h names InheritedFromUniqueProcessId "Reserved2"; CreateTime is
   // at byte 24 of Reserved1 (after WorkingSetPrivateSize, HardFaultCount,
   // NumberOfThreadsHighWatermark and CycleTime).
@@ -244,37 +294,51 @@ static napi_value process_info(napi_env env, napi_callback_info info) {
   DWORD pid;
   if (!get_args(env, info, 1, argv) || !get_pid(env, argv[0], &pid)) return NULL;
   DWORD err = 0;
-  BYTE *buf = process_snapshot(&err);
+  size_t length = 0;
+  BYTE *buf = process_snapshot(&err, &length);
   if (!buf) return throw_win(env, "NtQuerySystemInformation", err);
   size_t offset = 0;
-  int done = 0;
+  int done = 0, rc;
   proc_entry e;
   napi_value result = NULL;
   int found = 0;
-  while (next_entry(buf, &offset, &done, &e)) {
+  while ((rc = next_entry(buf, length, &offset, &done, &e)) > 0) {
     if (e.pid == pid) {
       found = 1;
       break;
     }
   }
   free(buf);
+  if (rc < 0) return throw_win(env, "process snapshot entry", ERROR_INVALID_DATA);
   if (!found) return js_null(env);
-  // An exited process can stay in the table while handles to it are open.
-  // Mark it as a zombie when it can be opened and has exited; when it cannot
-  // be opened (access denied) it counts as running.
+  // 持有句柄的已退出进程可能仍在快照内；查询失败不能作为存活或退出结论。
   int exited = 0;
   HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
   if (h) {
     FILETIME created, exit_time, kernel, user;
     char start[32];
-    if (GetProcessTimes(h, &created, &exit_time, &kernel, &user)) {
-      format_start(&created, start, sizeof(start));
-      // Same process object as the snapshot entry: check whether it has exited.
-      if (strcmp(start, e.start) == 0 && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) exited = 1;
+    if (!GetProcessTimes(h, &created, &exit_time, &kernel, &user)) {
+      err = GetLastError();
+      CloseHandle(h);
+      return throw_win(env, "GetProcessTimes", err);
     }
-    CloseHandle(h);
-  } else if (GetLastError() == ERROR_INVALID_PARAMETER) {
-    return js_null(env);
+    format_start(&created, start, sizeof(start));
+    if (strcmp(start, e.start) != 0) {
+      if (!CloseHandle(h)) return throw_win(env, "CloseHandle(process)", GetLastError());
+      return js_null(env);
+    }
+    DWORD wait = WaitForSingleObject(h, 0);
+    err = GetLastError();
+    BOOL closed = CloseHandle(h);
+    DWORD close_err = GetLastError();
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT)
+      return throw_win(env, "WaitForSingleObject", wait == WAIT_FAILED ? err : ERROR_INVALID_DATA);
+    if (!closed) return throw_win(env, "CloseHandle(process)", close_err);
+    exited = wait == WAIT_OBJECT_0;
+  } else {
+    err = GetLastError();
+    if (err == ERROR_INVALID_PARAMETER) return js_null(env);
+    return throw_win(env, "OpenProcess", err);
   }
   result = process_object(env, e.pid, e.ppid, e.start);
   if (result && exited) {
@@ -289,27 +353,26 @@ static napi_value process_info(napi_env env, napi_callback_info info) {
 static napi_value list_processes(napi_env env, napi_callback_info info) {
   (void)info;
   DWORD err = 0;
-  BYTE *buf = process_snapshot(&err);
+  size_t length = 0;
+  BYTE *buf = process_snapshot(&err, &length);
   if (!buf) return throw_win(env, "NtQuerySystemInformation", err);
   napi_value array;
-  if (napi_create_array(env, &array) != napi_ok) {
-    free(buf);
-    return NULL;
-  }
+  CHECK_RELEASE(napi_create_array(env, &array), free(buf));
   size_t offset = 0;
-  int done = 0;
+  int done = 0, rc;
   uint32_t index = 0;
   proc_entry e;
-  while (next_entry(buf, &offset, &done, &e)) {
+  while ((rc = next_entry(buf, length, &offset, &done, &e)) > 0) {
     if (e.pid == 0) continue;
     napi_value obj = process_object(env, e.pid, e.ppid, e.start);
     if (!obj) {
       free(buf);
       return NULL;
     }
-    napi_set_element(env, array, index++, obj);
+    CHECK_RELEASE(napi_set_element(env, array, index++, obj), free(buf));
   }
   free(buf);
+  if (rc < 0) return throw_win(env, "process snapshot entry", ERROR_INVALID_DATA);
   return array;
 }
 
@@ -331,49 +394,73 @@ static napi_value process_command_line(napi_env env, napi_callback_info info) {
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
   NtQueryInformationProcessFn query =
       ntdll ? (NtQueryInformationProcessFn)(void *)GetProcAddress(ntdll, "NtQueryInformationProcess") : NULL;
-  if (!query) return js_null(env);
+  if (!query) return throw_win(env, "NtQueryInformationProcess", ERROR_PROC_NOT_FOUND);
   char start[32];
-  HANDLE h = open_live(pid, 0, start, sizeof(start));
-  if (!h) return js_null(env);
+  DWORD err = ERROR_SUCCESS;
+  HANDLE h = open_live(pid, 0, start, sizeof(start), &err);
+  if (!h) return err ? throw_win(env, "OpenProcess/query", err) : js_null(env);
   ULONG needed = 0;
-  query(h, 60 /* ProcessCommandLineInformation */, NULL, 0, &needed);
-  if (needed == 0 || needed > 1024 * 1024) {
+  LONG status = query(h, 60 /* ProcessCommandLineInformation */, NULL, 0, &needed);
+  if (status < 0 && status != (LONG)0xC0000004L && status != (LONG)0xC0000023L) {
     CloseHandle(h);
-    return js_null(env);
+    return throw_win(env, "NtQueryInformationProcess(size)", (DWORD)status);
   }
-  void *buf = malloc(needed);
+  if (needed < sizeof(HK_UNICODE_STRING) || needed > 1024 * 1024) {
+    CloseHandle(h);
+    return throw_win(env, "NtQueryInformationProcess(size)", ERROR_INVALID_DATA);
+  }
+  ULONG capacity = needed;
+  void *buf = malloc(capacity);
   if (!buf) {
     CloseHandle(h);
-    return js_null(env);
+    return throw_win(env, "command line allocation", ERROR_NOT_ENOUGH_MEMORY);
   }
-  LONG status = query(h, 60, buf, needed, &needed);
-  CloseHandle(h);
-  if (status < 0) {
+  status = query(h, 60, buf, capacity, &needed);
+  BOOL closed = CloseHandle(h);
+  DWORD close_err = GetLastError();
+  if (status < 0 || !closed) {
     free(buf);
-    return js_null(env);
+    return throw_win(env, status < 0 ? "NtQueryInformationProcess" : "CloseHandle(process)",
+                     status < 0 ? (DWORD)status : close_err);
   }
   HK_UNICODE_STRING *s = (HK_UNICODE_STRING *)buf;
+  // 系统缓冲区中的字符串也需完整且位于本次分配内，不能返回截断的参数。
+  uintptr_t base = (uintptr_t)buf, ptr = (uintptr_t)s->Buffer;
+  if (needed < sizeof(*s) || needed > capacity || s->Length % sizeof(wchar_t) != 0 ||
+      s->Length > s->MaximumLength || (s->Length &&
+      (ptr < base + sizeof(*s) || ptr > base + needed || s->Length > base + needed - ptr))) {
+    free(buf);
+    return throw_win(env, "command line buffer", ERROR_INVALID_DATA);
+  }
   size_t chars = s->Length / sizeof(wchar_t);
   wchar_t *line = malloc((chars + 1) * sizeof(wchar_t));
   if (!line) {
     free(buf);
-    return js_null(env);
+    return throw_win(env, "command line allocation", ERROR_NOT_ENOUGH_MEMORY);
   }
-  memcpy(line, s->Buffer, chars * sizeof(wchar_t));
+  if (chars) memcpy(line, s->Buffer, chars * sizeof(wchar_t));
   line[chars] = 0;
   free(buf);
   int argc = 0;
   LPWSTR *args = chars ? CommandLineToArgvW(line, &argc) : NULL;
   free(line);
-  if (!args) return js_null(env);
+  if (chars && !args) return throw_win(env, "CommandLineToArgvW", GetLastError());
   napi_value array;
-  napi_create_array(env, &array);
+  if (napi_create_array(env, &array) != napi_ok) {
+    if (args) LocalFree(args);
+    napi_throw_error(env, "EHOSTKIT", "cannot return command line");
+    return NULL;
+  }
   for (int i = 0; i < argc; i++) {
     napi_value v;
-    napi_create_string_utf16(env, (const char16_t *)args[i], wcslen(args[i]), &v);
-    napi_set_element(env, array, (uint32_t)i, v);
+    if (napi_create_string_utf16(env, (const char16_t *)args[i], wcslen(args[i]), &v) != napi_ok ||
+        napi_set_element(env, array, (uint32_t)i, v) != napi_ok) {
+      LocalFree(args);
+      napi_throw_error(env, "EHOSTKIT", "cannot return command line argument");
+      return NULL;
+    }
   }
-  LocalFree(args);
+  if (args) LocalFree(args);
   return array;
 }
 
@@ -386,19 +473,34 @@ static napi_value terminate_process(napi_env env, napi_callback_info info) {
   char *expected = get_utf8(env, argv[1]);
   if (!expected) return NULL;
   char start[32];
-  HANDLE h = open_live(pid, PROCESS_TERMINATE, start, sizeof(start));
+  DWORD err = ERROR_SUCCESS;
+  HANDLE h = open_live(pid, PROCESS_TERMINATE, start, sizeof(start), &err);
   napi_value result;
-  if (!h || strcmp(start, expected) != 0) {
-    if (h) CloseHandle(h);
+  if (!h && err) {
     free(expected);
+    return throw_win(env, "OpenProcess/query", err);
+  }
+  if (!h || strcmp(start, expected) != 0) {
+    BOOL closed = !h || CloseHandle(h);
+    DWORD close_err = GetLastError();
+    free(expected);
+    if (!closed) return throw_win(env, "CloseHandle(process)", close_err);
     napi_get_boolean(env, false, &result);
     return result;
   }
   free(expected);
   BOOL ok = TerminateProcess(h, 1);
-  DWORD err = GetLastError();
-  CloseHandle(h);
-  if (!ok && err != ERROR_ACCESS_DENIED) return throw_win(env, "TerminateProcess", err);
+  err = GetLastError();
+  // 访问拒绝也可能发生在仍活着的进程上，不能被折叠成已退出。
+  if (!ok && err == ERROR_ACCESS_DENIED && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+    if (!CloseHandle(h)) return throw_win(env, "CloseHandle(process)", GetLastError());
+    napi_get_boolean(env, false, &result);
+    return result;
+  }
+  BOOL closed = CloseHandle(h);
+  DWORD close_err = GetLastError();
+  if (!ok) return throw_win(env, "TerminateProcess", err);
+  if (!closed) return throw_win(env, "CloseHandle(process)", close_err);
   napi_get_boolean(env, ok != 0, &result);
   return result;
 }
@@ -430,10 +532,13 @@ static napi_value job_assign(napi_env env, napi_callback_info info) {
   char *expected = get_utf8(env, argv[2]);
   if (!expected) return NULL;
   char start[32];
-  HANDLE h = open_live(pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE, start, sizeof(start));
+  DWORD err = ERROR_SUCCESS;
+  HANDLE h = open_live(pid, PROCESS_SET_QUOTA | PROCESS_TERMINATE, start, sizeof(start), &err);
   if (!h) {
     free(expected);
-    return throw_win(env, "OpenProcess", GetLastError() ? GetLastError() : ERROR_INVALID_PARAMETER);
+    if (err) return throw_win(env, "OpenProcess/query", err);
+    napi_throw_error(env, "ESRCH", "process exited before job assignment");
+    return NULL;
   }
   if (strcmp(start, expected) != 0) {
     free(expected);
@@ -443,9 +548,11 @@ static napi_value job_assign(napi_env env, napi_callback_info info) {
   }
   free(expected);
   BOOL ok = AssignProcessToJobObject(job, h);
-  DWORD err = GetLastError();
-  CloseHandle(h);
+  err = GetLastError();
+  BOOL closed = CloseHandle(h);
+  DWORD close_err = GetLastError();
   if (!ok) return throw_win(env, "AssignProcessToJobObject", err);
+  if (!closed) return throw_win(env, "CloseHandle(process)", close_err);
   return js_undefined(env);
 }
 
@@ -476,17 +583,23 @@ static napi_value job_process_ids(napi_env env, napi_callback_info info) {
       }
       return throw_win(env, "QueryInformationJobObject", err);
     }
-    if (list->NumberOfAssignedProcesses > list->NumberOfProcessIdsInList && capacity < 65536) {
-      capacity = list->NumberOfAssignedProcesses + 16;
+    if (list->NumberOfProcessIdsInList > capacity) {
       free(list);
+      return throw_win(env, "QueryInformationJobObject", ERROR_INVALID_DATA);
+    }
+    if (list->NumberOfAssignedProcesses > list->NumberOfProcessIdsInList) {
+      free(list);
+      if (capacity >= 65536)
+        return throw_win(env, "QueryInformationJobObject", ERROR_MORE_DATA);
+      capacity = capacity > 16384 ? 65536 : capacity * 4;
       continue;
     }
     napi_value array;
-    napi_create_array(env, &array);
+    CHECK_RELEASE(napi_create_array(env, &array), free(list));
     for (DWORD i = 0; i < list->NumberOfProcessIdsInList; i++) {
       napi_value v;
-      napi_create_uint32(env, (uint32_t)list->ProcessIdList[i], &v);
-      napi_set_element(env, array, i, v);
+      CHECK_RELEASE(napi_create_uint32(env, (uint32_t)list->ProcessIdList[i], &v), free(list));
+      CHECK_RELEASE(napi_set_element(env, array, i, v), free(list));
     }
     free(list);
     return array;
@@ -573,8 +686,17 @@ static napi_value mutex_acquire(napi_env env, napi_callback_info info) {
   if (!h) return throw_win(env, "CreateMutex/owner verification", err);
   DWORD wait = WaitForSingleObject(h, 0);
   err = GetLastError();
-  if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) return make_handle(env, h);
-  CloseHandle(h);
+  if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+    napi_value v;
+    if (napi_create_int64(env, (int64_t)(intptr_t)h, &v) == napi_ok) return v;
+    ReleaseMutex(h);
+    CloseHandle(h);
+    napi_throw_error(env, "EHOSTKIT", "cannot return mutex handle");
+    return NULL;
+  }
+  BOOL closed = CloseHandle(h);
+  DWORD close_err = GetLastError();
+  if (!closed && wait == WAIT_TIMEOUT) return throw_win(env, "CloseHandle(mutex)", close_err);
   if (wait == WAIT_TIMEOUT) {
     napi_value v;
     napi_create_int32(env, -1, &v);
@@ -589,8 +711,12 @@ static napi_value mutex_release(napi_env env, napi_callback_info info) {
   if (!get_args(env, info, 1, argv) || !get_handle(env, argv[0], &h)) return NULL;
   BOOL released = ReleaseMutex(h);
   DWORD err = GetLastError();
-  CloseHandle(h);
+  BOOL closed = CloseHandle(h);
+  DWORD close_err = GetLastError();
+  if (!released && !closed)
+    return throw_win_pair(env, "ReleaseMutex", err, "CloseHandle(mutex)", close_err);
   if (!released) return throw_win(env, "ReleaseMutex", err);
+  if (!closed) return throw_win(env, "CloseHandle(mutex)", close_err);
   return js_undefined(env);
 }
 
@@ -614,7 +740,7 @@ static napi_value fs_info(napi_env env, napi_callback_info info) {
     case DRIVE_RAMDISK: name = "ramdisk"; local = 1; break;
     case DRIVE_REMOTE: name = "remote"; local = 0; break;
     case DRIVE_CDROM: name = "cdrom"; local = 0; break;
-    default: name = "unknown"; local = 0;
+    default: return throw_win(env, "GetDriveType", ERROR_NOT_READY);
   }
   // UNC paths that are not \\?\ or \\.\ device paths are network shares.
   if (root[0] == L'\\' && root[1] == L'\\' && root[2] != L'?' && root[2] != L'.') {
@@ -638,28 +764,58 @@ static PSID current_user_sid(DWORD *err) {
     return NULL;
   }
   DWORD size = 0;
-  GetTokenInformation(token, TokenUser, NULL, 0, &size);
+  BOOL sized = GetTokenInformation(token, TokenUser, NULL, 0, &size);
+  *err = GetLastError();
+  if (sized || *err != ERROR_INSUFFICIENT_BUFFER || size < sizeof(TOKEN_USER)) {
+    CloseHandle(token);
+    if (sized || *err == ERROR_INSUFFICIENT_BUFFER) *err = ERROR_INVALID_DATA;
+    return NULL;
+  }
   TOKEN_USER *user = malloc(size);
-  if (!user || !GetTokenInformation(token, TokenUser, user, size, &size)) {
+  if (!user) {
+    *err = ERROR_NOT_ENOUGH_MEMORY;
+    CloseHandle(token);
+    return NULL;
+  }
+  if (!GetTokenInformation(token, TokenUser, user, size, &size)) {
     *err = GetLastError();
     free(user);
     CloseHandle(token);
     return NULL;
   }
-  CloseHandle(token);
+  if (!CloseHandle(token)) {
+    *err = GetLastError();
+    free(user);
+    return NULL;
+  }
+  if (!IsValidSid(user->User.Sid)) {
+    *err = ERROR_INVALID_SID;
+    free(user);
+    return NULL;
+  }
   DWORD len = GetLengthSid(user->User.Sid);
   PSID sid = malloc(len);
-  if (sid) CopySid(len, sid, user->User.Sid);
+  if (!sid) *err = ERROR_NOT_ENOUGH_MEMORY;
+  else if (!CopySid(len, sid, user->User.Sid)) {
+    *err = GetLastError();
+    free(sid);
+    sid = NULL;
+  } else *err = ERROR_SUCCESS;
   free(user);
   return sid;
 }
 
 static napi_value sid_string(napi_env env, PSID sid) {
   LPWSTR s = NULL;
-  if (!sid || !ConvertSidToStringSidW(sid, &s)) return js_null(env);
+  if (!sid) return js_null(env);
+  if (!ConvertSidToStringSidW(sid, &s)) return throw_win(env, "ConvertSidToStringSid", GetLastError());
   napi_value v;
-  napi_create_string_utf16(env, (const char16_t *)s, wcslen(s), &v);
+  napi_status status = napi_create_string_utf16(env, (const char16_t *)s, wcslen(s), &v);
   LocalFree(s);
+  if (status != napi_ok) {
+    napi_throw_error(env, "EHOSTKIT", "cannot return SID");
+    return NULL;
+  }
   return v;
 }
 
@@ -680,7 +836,7 @@ static napi_value set_private_acl(napi_env env, napi_callback_info info) {
   napi_value argv[2];
   if (!get_args(env, info, 2, argv)) return NULL;
   bool is_dir = false;
-  napi_get_value_bool(env, argv[1], &is_dir);
+  CHECK(napi_get_value_bool(env, argv[1], &is_dir));
   wchar_t *path = get_wstring(env, argv[0]);
   if (!path) return NULL;
   DWORD err = 0;
@@ -762,9 +918,21 @@ static napi_value create_private_file(napi_env env, napi_callback_info info) {
   err = GetLastError();
   LocalFree(acl);
   free(sid);
+  if (h == INVALID_HANDLE_VALUE) {
+    free(path);
+    return throw_win(env, "CreateFile", err);
+  }
+  if (!CloseHandle(h)) {
+    DWORD close_err = GetLastError();
+    // CREATE_NEW 已确认文件属于本次创建；失败返回前尝试删除，不重放可能失效的句柄。
+    BOOL deleted = DeleteFileW(path);
+    DWORD delete_err = GetLastError();
+    free(path);
+    if (!deleted)
+      return throw_win_pair(env, "CloseHandle(file)", close_err, "DeleteFileW", delete_err);
+    return throw_win(env, "CloseHandle(file)", close_err);
+  }
   free(path);
-  if (h == INVALID_HANDLE_VALUE) return throw_win(env, "CreateFile", err);
-  CloseHandle(h);
   return js_undefined(env);
 }
 
@@ -784,21 +952,31 @@ static napi_value read_acl(napi_env env, napi_callback_info info) {
   if (err != ERROR_SUCCESS) return throw_win(env, "GetNamedSecurityInfo", err);
   SECURITY_DESCRIPTOR_CONTROL control = 0;
   DWORD revision = 0;
-  GetSecurityDescriptorControl(sd, &control, &revision);
+  if (!GetSecurityDescriptorControl(sd, &control, &revision)) {
+    err = GetLastError();
+    LocalFree(sd);
+    return throw_win(env, "GetSecurityDescriptorControl", err);
+  }
   napi_value obj, v, aces;
-  napi_create_object(env, &obj);
-  napi_set_named_property(env, obj, "owner", sid_string(env, owner));
-  napi_get_boolean(env, (control & SE_DACL_PROTECTED) != 0, &v);
-  napi_set_named_property(env, obj, "protected", v);
-  napi_get_boolean(env, dacl == NULL, &v);
-  napi_set_named_property(env, obj, "nullDacl", v);
-  napi_create_array(env, &aces);
+  CHECK_RELEASE(napi_create_object(env, &obj), LocalFree(sd));
+  v = sid_string(env, owner);
+  if (!v) { LocalFree(sd); return NULL; }
+  CHECK_RELEASE(napi_set_named_property(env, obj, "owner", v), LocalFree(sd));
+  CHECK_RELEASE(napi_get_boolean(env, (control & SE_DACL_PROTECTED) != 0, &v), LocalFree(sd));
+  CHECK_RELEASE(napi_set_named_property(env, obj, "protected", v), LocalFree(sd));
+  CHECK_RELEASE(napi_get_boolean(env, dacl == NULL, &v), LocalFree(sd));
+  CHECK_RELEASE(napi_set_named_property(env, obj, "nullDacl", v), LocalFree(sd));
+  CHECK_RELEASE(napi_create_array(env, &aces), LocalFree(sd));
   if (dacl) {
     for (DWORD i = 0; i < dacl->AceCount; i++) {
       ACE_HEADER *header = NULL;
-      if (!GetAce(dacl, i, (LPVOID *)&header)) continue;
+      if (!GetAce(dacl, i, (LPVOID *)&header)) {
+        err = GetLastError();
+        LocalFree(sd);
+        return throw_win(env, "GetAce", err);
+      }
       napi_value ace;
-      napi_create_object(env, &ace);
+      CHECK_RELEASE(napi_create_object(env, &ace), LocalFree(sd));
       const char *type = "other";
       PSID sid = NULL;
       ACCESS_MASK mask = 0;
@@ -813,15 +991,17 @@ static napi_value read_acl(napi_env env, napi_callback_info info) {
         sid = (PSID)&d->SidStart;
         mask = d->Mask;
       }
-      napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &v);
-      napi_set_named_property(env, ace, "type", v);
-      napi_set_named_property(env, ace, "sid", sid_string(env, sid));
-      napi_create_uint32(env, mask, &v);
-      napi_set_named_property(env, ace, "mask", v);
-      napi_set_element(env, aces, i, ace);
+      CHECK_RELEASE(napi_create_string_utf8(env, type, NAPI_AUTO_LENGTH, &v), LocalFree(sd));
+      CHECK_RELEASE(napi_set_named_property(env, ace, "type", v), LocalFree(sd));
+      v = sid_string(env, sid);
+      if (!v) { LocalFree(sd); return NULL; }
+      CHECK_RELEASE(napi_set_named_property(env, ace, "sid", v), LocalFree(sd));
+      CHECK_RELEASE(napi_create_uint32(env, mask, &v), LocalFree(sd));
+      CHECK_RELEASE(napi_set_named_property(env, ace, "mask", v), LocalFree(sd));
+      CHECK_RELEASE(napi_set_element(env, aces, i, ace), LocalFree(sd));
     }
   }
-  napi_set_named_property(env, obj, "aces", aces);
+  CHECK_RELEASE(napi_set_named_property(env, obj, "aces", aces), LocalFree(sd));
   LocalFree(sd);
   return obj;
 }
