@@ -27,7 +27,7 @@
 | `locks.ts:findWritersByCommandLine`、`gateIndex` | 进程列表、命令行、gate 协议文件存在性、路径比较 | 不可读候选属于未知，不能被另一已停止候选掩盖；部分进程表仍清理可读候选，之后保留枚举失败和停止失败；`test/existence-faults.test.mjs`、`test/locks.test.mjs`、`test/locks-faults.test.mjs`。 |
 | `locks.ts:recoverPreviousWriter` | 写者身份、scope 人口、停止前任、提交 `starting` | 查询失败释放取得的锁且保留旧记录；停止报告保留；原始故障与释放故障同时可见；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
 | `locks.ts:spawnWriter` | 查询已有写者、启动 gate、提交 writer、放行；异常停止 | 登记失败不能放行；登记/放行与停止同时失败保留原因和占用；`test/locks-faults.test.mjs`、`test/locks.test.mjs`。 |
-| `locks.ts:SessionWriterLock.release` | 写者退出查询、提交 `released`、原生释放 | 未确认退出不释放；提交失败可重试；`test/locks.test.mjs`、`test/locks-faults.test.mjs`、`test/fixtures/release-query-fault.mjs`。 |
+| `locks.ts:SessionWriterLock.release` | 写者退出查询、提交 `released`、原生释放 | 未确认退出不释放；提交失败可重试；原生释放未知后旧对象终止，不再恢复、写记录或启动写者，重复释放返回原错；`test/locks.test.mjs`、`test/locks-faults.test.mjs`、`test/fixtures/release-query-fault.mjs`。 |
 | `secrets.ts:checkPrivate` | `lstat`、Windows SID/DACL、macOS ACL | 查询失败不得返回 `ok: true`；`test/secrets-faults.test.mjs`。 |
 | `secrets.ts:ensurePrivateDir` | `mkdir`、`lstat`、`chmod`、ACL 修改与最终复查 | 任一步失败拒绝，不声称已私密；`test/secrets-faults.test.mjs`、`test/misc.test.mjs`。 |
 | `secrets.ts:writePrivateFile` | 父目录检查、排他创建/重新打开、ACL、写入、`sync`、`close`、最终复查、失败删除 | 仅清理本次创建文件；关闭、删除与原故障保留；最终复查失败也清理；`test/secrets-faults.test.mjs`。 |

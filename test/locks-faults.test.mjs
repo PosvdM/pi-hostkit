@@ -51,6 +51,7 @@ async function fixture(platform = "linux") {
     "./localfs.js": { assertLocalFilesystem: () => invoke("localfs") },
     "./secrets.js": { ensurePrivateDir: async () => invoke("private-dir") },
     "./native.js": { nativeFn: (name) => () => {
+      if (status.releaseActuallyCompletes && ["fdClose", "mutexRelease"].includes(name)) held = false;
       invoke(name);
       if (name === "userSid") return "sid";
       if (["flockAcquire", "mutexAcquire"].includes(name)) { if (held) return -1; held = true; return 10; }
@@ -184,6 +185,35 @@ for (const [platform, code] of [["linux", "EIO"], ["linux", "EINTR"], ["win32", 
     await assert.rejects(lock.release(), (e) => e === error);
     assert.equal(f.calls.filter((c) => c === operation).length, 1);
     assert.equal((await f.mod.probeSessionWriterLock(f.file)).held, true);
+  });
+}
+
+for (const [platform, code] of [["linux", "EINTR"], ["win32", "EIO"]]) {
+  test(`恢复后 ${platform} 实际释放但报 ${code}，旧对象永久失去写入资格`, async () => {
+    const f = await fixture(platform);
+    const lock = await f.acquire();
+    assert.equal(await lock.recoverPreviousWriter(), "none");
+    f.status.releaseActuallyCompletes = true;
+    const operation = platform === "win32" ? "mutexRelease" : "fdClose";
+    const failure = f.setFault(operation, code);
+    await assert.rejects(lock.release(), (error) => error === failure);
+    assert.equal(f.held(), false, "内核锁已实际释放");
+    assert.equal(JSON.parse(f.files.get(f.recordFile)).state, "released");
+    // 另一宿主已取得内核锁并写入记录，原对象不得覆盖它或启动新写者。
+    const external = JSON.stringify({ state: "running", host: "另一宿主" });
+    f.files.set(f.recordFile, external);
+    const writes = f.calls.filter((call) => call === "write").length;
+    f.failures.clear();
+    await assert.rejects(lock.update({ state: "running" }), { code: "EHOSTKIT_LOCK_STATE" });
+    await assert.rejects(lock.spawnWriter({ argv: ["cli.js", "--mode", "rpc", "--session", f.file] }), { code: "EHOSTKIT_LOCK_STATE" });
+    await assert.rejects(lock.recoverPreviousWriter(), { code: "EHOSTKIT_LOCK_STATE" });
+    await assert.rejects(lock.release(), (error) => error === failure);
+    await assert.rejects(lock.release({ writerSwitchedAway: true }), (error) => error === failure);
+    assert.equal(f.files.get(f.recordFile), external);
+    assert.equal(f.calls.filter((call) => call === "write").length, writes);
+    assert.equal(f.calls.includes("spawn"), false);
+    assert.equal(f.calls.filter((call) => call === operation).length, 1);
+    assert.equal((await f.mod.probeSessionWriterLock(f.file)).held, true, "进程内未知占用仍保留");
   });
 }
 

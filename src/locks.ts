@@ -406,7 +406,8 @@ function assertSessionArg(argv: string[], canonical: string): void {
 
 class WriterLock implements SessionWriterLock {
   readonly recoveryReports: StopReport[] = [];
-  private state: "acquired" | "recovered" | "released" = "acquired";
+  private state: "acquired" | "recovered" | "release_unknown" | "released" = "acquired";
+  private releaseFailure: unknown;
   private current: SessionLockRecord | undefined;
   /** Operations on one lock run one at a time, in call order. */
   private queue: Promise<unknown> = Promise.resolve();
@@ -437,9 +438,16 @@ class WriterLock implements SessionWriterLock {
     }
   }
 
-  /** Releases the OS lock without touching the record (failure paths). */
+  /** 原生释放开始后立即终止可写状态；报错时不能假定内核锁仍然持有。 */
   private abandon(): void {
-    this.raw.release();
+    if (this.state === "release_unknown") throw this.releaseFailure;
+    this.state = "release_unknown";
+    try {
+      this.raw.release();
+    } catch (error) {
+      this.releaseFailure = error;
+      throw error;
+    }
     this.state = "released";
   }
 
@@ -593,6 +601,7 @@ class WriterLock implements SessionWriterLock {
   release(opts: { writerSwitchedAway?: boolean } = {}): Promise<void> {
     return this.serial(async () => {
       if (this.state === "released") return;
+      if (this.state === "release_unknown") throw this.releaseFailure;
       const record = this.current ?? (this.previous?.state !== "released" ? this.previous : undefined);
       if (!opts.writerSwitchedAway) {
         const writers = [record?.writer];
