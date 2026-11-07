@@ -71,7 +71,13 @@ mock.module("node:child_process", { namedExports: {
     const child = new EventEmitter();
     child.pid = root.pid;
     child.stdin = new PassThrough(); child.stdout = new PassThrough(); child.stderr = new PassThrough();
-    child.kill = () => { state.calls.push(["child.kill"]); if (state.killChild) return state.killChild(); return true; };
+    child.kill = () => {
+      state.calls.push(["child.kill"]);
+      if (state.killChild) return state.killChild();
+      state.live.delete(root.pid);
+      child.emit("exit", null, "SIGKILL");
+      return true;
+    };
     if (state.constructManaged) child.stderr.setEncoding = () => { throw fault("Managed 构造失败"); };
     state.child = child;
     queueMicrotask(() => state.spawnEvent ? state.spawnEvent(child) : child.emit("spawn"));
@@ -325,6 +331,63 @@ test("spawn 的 Job 分配失败回收子进程和已创建句柄", async () => 
   assert.equal(state.closeCount, 1);
 });
 
+for (const stage of ["assign", "stop-reject"]) {
+  for (const emitted of [false, true]) {
+    test(`${stage} 回收 kill 返回 false（error 事件=${emitted}）关闭输入并报告未确认进程`, async () => {
+      reset();
+      const primary = fault("启动主错误");
+      if (stage === "assign") state.assign = () => { throw primary; };
+      else {
+        Object.defineProperty(process, "platform", { value: "darwin" });
+        state.release = () => { throw primary; };
+        state.stopSnapshot = async () => { throw fault("停止拒绝"); };
+        state.keepRoot = true;
+        state.signal = () => false;
+      }
+      const killError = Object.assign(new Error("kill 权限失败事件"), { code: "EPERM" });
+      state.killChild = () => {
+        if (emitted) queueMicrotask(() => state.child.emit("error", killError));
+        return false;
+      };
+      try {
+        const operation = stage === "assign" ? spawn() : spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" });
+        await assert.rejects(operation, (error) => {
+          assert.ok(error instanceof AggregateError);
+          assert.equal(error.errors[0], primary);
+          assert.equal(error.code, "EIO");
+          assert.match(error.message, /未发送 SIGKILL/);
+          const unknown = error.errors.find((failure) => failure.cause?.pid === root.pid);
+          assert.ok(unknown);
+          assert.equal(unknown.cause.identity.pid, root.pid);
+          if (emitted) {
+            assert.ok(error.errors.includes(killError));
+            assert.ok(unknown.cause.errors.includes(killError));
+          }
+          return true;
+        });
+        assert.equal(state.child.stdin.writableEnded, true);
+        assert.equal(state.child.stdin.destroyed, true);
+        assert.equal(state.calls.filter(([name]) => name === "child.kill").length, 1);
+        assert.equal(state.closeCount, stage === "assign" ? 1 : 0);
+      } finally {
+        Object.defineProperty(process, "platform", { value: "win32" });
+      }
+    });
+  }
+}
+
+test("kill 返回 false 但随后明确退出时，只保留启动主错误", async () => {
+  reset();
+  const primary = fault("Job 分配失败");
+  state.assign = () => { throw primary; };
+  state.killChild = () => {
+    queueMicrotask(() => state.child.emit("exit", 0, null));
+    return false;
+  };
+  await assert.rejects(spawn(), (error) => error === primary);
+  assert.equal(state.child.stdin.destroyed, true);
+});
+
 for (const kind of ["constructRpc", "constructManaged"]) {
   test(`${kind} 构造失败回收 gate 和 Job，回收双错全部保留`, async () => {
     reset();
@@ -336,7 +399,8 @@ for (const kind of ["constructRpc", "constructManaged"]) {
       assert.match(error.message, /构造失败/);
       assert.match(error.message, /gate 回收失败/);
       assert.match(error.message, /Job 回收失败/);
-      assert.equal(error.errors.length, 3);
+      assert.match(error.message, /未能在 2000 ms 内确认/);
+      assert.equal(error.errors.length, 4);
       assert.equal(error.code, "EIO");
       return true;
     });
@@ -402,13 +466,16 @@ test("gate 放行和 stop 同时拒绝时，两种错误都返回调用方", asy
   try {
     reset();
     state.release = () => { throw fault("原始放行错误"); };
+    state.keepRoot = true;
+    state.signal = () => false;
     state.stopSnapshot = async () => { throw fault("停止本身拒绝"); };
     state.killChild = () => { throw fault("停止拒绝后的子进程回收失败"); };
     await assert.rejects(spawnManaged({ argv: ["unused"], cwd: ".", env: {}, runId: "r", instanceId: "i" }), (error) => {
       assert.ok(error instanceof AggregateError);
       assert.match(error.message, /原始放行错误/); assert.match(error.message, /停止本身拒绝/);
       assert.match(error.message, /停止拒绝后的子进程回收失败/);
-      assert.equal(error.errors.length, 3);
+      assert.match(error.message, /未能在 2000 ms 内确认/);
+      assert.equal(error.errors.length, 4);
       assert.equal(error.code, "EIO");
       return true;
     });

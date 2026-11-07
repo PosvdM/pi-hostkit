@@ -512,40 +512,83 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
     windowsHide: true,
     stdio: ["pipe", "pipe", "pipe"],
   });
-  await new Promise<void>((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  });
-
+  let exited = false;
   let job: number | undefined;
-  const abandon = (error: Error): never => {
-    const failures: unknown[] = [error];
+  let identity: ProcessIdentity | null = null;
+  const childErrors: unknown[] = [];
+  const onChildError = (error: Error) => { childErrors.push(error); };
+  child.on("error", onChildError);
+  child.once("exit", () => { exited = true; });
+  child.once("close", () => child.removeListener("error", onChildError));
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const onSpawn = () => { child.removeListener("error", onStartError); resolve(); };
+      const onStartError = (error: Error) => { child.removeListener("spawn", onSpawn); reject(error); };
+      child.once("spawn", onSpawn);
+      child.once("error", onStartError);
+    });
+  } catch (error) {
+    child.removeListener("error", onChildError);
+    throw error;
+  }
+  const pid = child.pid!;
+
+  const abandon = async (primary: unknown, extra: unknown[] = [], closeJob = true): Promise<never> => {
+    const failures: unknown[] = [primary, ...extra];
+    const added = new Set<string>();
+    const add = (error: unknown) => {
+      const detail = errorDetail(error);
+      if (!added.has(detail)) { added.add(detail); failures.push(error); }
+    };
+    // end 可能因背压延迟关闭；destroy 同时保证未放行的 gate 收到 EOF。
+    const input = child.stdin;
+    const onInputError = (error: Error) => add(error);
+    if (input) {
+      input.on("error", onInputError);
+      input.once("close", () => input.removeListener("error", onInputError));
+      try { input.end(); } catch (error) { add(error); }
+      try { input.destroy(); } catch (error) { add(error); }
+    }
+    let sent: boolean | undefined;
+    if (!exited) {
+      try { sent = child.kill("SIGKILL"); } catch (error) { add(error); }
+    }
+    if (closeJob && job !== undefined) {
+      try { nativeFn("handleClose")(job); } catch (error) { add(error); }
+    }
+    let gone = exited;
     try {
-      child.kill("SIGKILL");
-    } catch (killError) {
-      failures.push(killError);
+      gone = await poll(() => {
+        if (exited) return true;
+        try {
+          const row = processInfo(pid);
+          return identity ? !matches(row, identity) : !row || row.zombie;
+        } catch (error) {
+          add(error);
+          return false;
+        }
+      }, SETTLE_CHECK_MS);
+    } catch (error) { add(error); }
+    // kill 返回 false 只有在随后明确确认退出时才可视为无需发送。
+    if (sent === false && !gone) add(new Error(`启动回收未发送 SIGKILL：PID ${pid}`));
+    if (!gone) {
+      add(new Error(`启动回收未能在 ${SETTLE_CHECK_MS} ms 内确认 PID ${pid} 退出`, {
+        cause: { pid, ...(identity ? { identity } : {}), errors: childErrors },
+      }));
     }
-    if (job !== undefined) {
-      try {
-        nativeFn("handleClose")(job);
-      } catch (closeError) {
-        failures.push(closeError);
-      }
-    }
+    // 接住 kill/destroy 在下一轮事件循环发出的错误，即使退出已经得到确认。
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    for (const error of childErrors) add(error);
+    // 状态仍未知时保留收集器，延后的 error 也能从未确认退出错误的 cause.errors 中取得。
+    if (gone) child.removeListener("error", onChildError);
     if (failures.length > 1) {
       throw Object.assign(new AggregateError(failures, failures.map(errorDetail).join("; ")), {
-        code: (error as NodeJS.ErrnoException | null)?.code,
+        code: (primary as NodeJS.ErrnoException | null)?.code,
       });
     }
-    throw error;
+    throw primary;
   };
 
-  let exited = false;
-  child.once("exit", () => {
-    exited = true;
-  });
-  const pid = child.pid!;
-  let identity: ProcessIdentity | null = null;
   let mode: Mode = { kind: "snapshot" };
   try {
     if (unit) {
@@ -567,7 +610,7 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
       mode = { kind: "job", job };
     }
   } catch (error) {
-    abandon(error as Error);
+    return abandon(error);
   }
 
   let managed!: Managed;
@@ -576,7 +619,7 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
     rpc.block("pi is held at the start gate; call release() first");
     managed = new Managed(child, identity!, mode, rpc, spec.snapshotIntervalMs ?? 5_000);
   } catch (error) {
-    abandon(error as Error);
+    return abandon(error);
   }
   if (!spec.startHeld) {
     try {
@@ -586,29 +629,20 @@ export async function spawnManaged(spec: SpawnSpec): Promise<ManagedProcess> {
       try {
         report = await managed.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
       } catch (stopError) {
-        const failures = [error, stopError];
-        // stop 的 Job 句柄由其 finally 处理；这里只回收仍由本机持有的子进程，避免重复关闭句柄。
-        try {
-          child.kill("SIGKILL");
-        } catch (killError) {
-          failures.push(killError);
-        }
-        throw Object.assign(new AggregateError(failures, failures.map(errorDetail).join("; ")), {
-          code: (error as NodeJS.ErrnoException | null)?.code,
-        });
+        // stop 的 finally 已处理 Job；回收仍由宿主持有的子进程，不重放句柄关闭。
+        return abandon(error, [stopError], false);
       }
       // 放行失败时没有 ManagedProcess 可交给调用方，清理报告必须随错误保留。
       const failures = report.steps.filter((step) => !step.ok && step.step !== "grace" &&
         !(step.step === "abort" && ["process held at the start gate", "process already exited"].includes(step.detail ?? "")));
       if (report.leftovers.length || failures.length) {
         const cleanup = new Error(`stop after release failure: ${failures.map((step) => `${step.step}: ${step.detail ?? "failed"}`).join("; ")}; ${report.leftovers.length} leftovers`, { cause: report });
-        throw Object.assign(new AggregateError([error, cleanup], `${errorDetail(error)}; ${cleanup.message}`), {
-          code: (error as NodeJS.ErrnoException | null)?.code,
-        });
+        return abandon(error, [cleanup], false);
       }
       throw error;
     }
   }
+  child.removeListener("error", onChildError);
   return managed;
 }
 

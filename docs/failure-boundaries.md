@@ -39,7 +39,7 @@
 | `proctable.ts:signalProcess`、`signalGroupLinux` | pidfd 打开、成员/组长身份复查、pidfd 发信号、`process.kill`、fd 关闭 | 只对身份一致目标发送；只为已约定的不支持错误退路；原始与关闭失败同时保留；`test/process-faults.test.mjs` 的 `proctable-faults.mjs`。 |
 | `snapshots.ts:SnapshotRecords` | 进程表、父身份、逐目标身份、组和单进程信号、退出复查 | 局部失败不取消独立分支或 pi；已知未知身份留在报告；`test/snapshot-faults.test.mjs`、`test/process-faults.test.mjs`、`test/fixtures/capture-fault.mjs`。 |
 | `process.ts` 的 Linux 能力与启动查询 | 控制器/可执行文件探测、`execFile(systemd-run)`、`/proc/<pid>/cgroup` | 不可用只选择有限覆盖的快照模式；启动失败不得放行 gate，不能用能力探测推断进程已退出；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
-| `process.ts:spawnManaged` | `spawn`、初始身份、Job 创建与分配、RPC/Managed 构造、门闩放行及失败回收 | 启动失败关闭 gate/Job，清理错误不覆盖首错；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
+| `process.ts:spawnManaged` | `spawn`、初始身份、Job 创建与分配、RPC/Managed 构造、门闩放行及失败回收 | 启动失败关闭/销毁 gate 输入，收集 kill 抛错、false 与 error 事件，2 秒有界确认退出；未知时 cause 保留 PID/身份/错误，Job 不重放关闭；清理错误不覆盖首错；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
 | `process.ts:Managed.runStop` | abort、关闭输入、SIGTERM、Job 终止/列举/逐成员身份/关闭、最终 pi 复查 | 每阶段故障进入报告，Job 查询未知使用容器哨兵；句柄始终进入关闭路径；`test/process-faults.test.mjs`。 |
 | `process.ts:stopByIdentity` | 根身份、Windows 快照/逐目标终止、recorded scope 查询、SIGTERM、最终停止 | 单目标失败不跳过其余目标；未知身份与快照失败可见；`test/process-faults.test.mjs`、`test/existence-faults.test.mjs`。 |
 | `cgroups.ts:cgroupPopulated` | `cgroup.events`、目录严格存在性 | 文件缺失须确认整个目录已回收才算空；格式与查询失败均未知；`test/cgroup-faults.test.mjs`。 |
