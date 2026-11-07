@@ -19,7 +19,7 @@ import {
   type StopOptions,
   type StopReport,
 } from "./process.js";
-import { listProcesses, processCommandLine } from "./proctable.js";
+import { listProcesses, processCommandLine, ProcessTableError, type ProcessRow } from "./proctable.js";
 import { ensurePrivateDir } from "./secrets.js";
 import { pathExistsStrict } from "./fs-probe.js";
 
@@ -312,7 +312,7 @@ function sameFile(file: string, key: string): boolean {
   return comparisonKey(realPathOrPending(file)) === key;
 }
 
-type Candidates = { found: ProcessIdentity[]; uncertain: boolean };
+type Candidates = { found: ProcessIdentity[]; uncertain: boolean; failure?: ProcessTableError };
 
 /**
  * pi-hostkit gate processes (held, or a loaded pi whose command line is still
@@ -331,7 +331,18 @@ function findWritersByCommandLine(canonical: string): Candidates {
   const key = comparisonKey(canonical);
   const found: ProcessIdentity[] = [];
   let uncertain = false;
-  for (const row of listProcesses()) {
+  let failure: ProcessTableError | undefined;
+  let rows: ProcessRow[];
+  try {
+    rows = listProcesses();
+  } catch (error) {
+    if (!(error instanceof ProcessTableError)) throw error;
+    // 部分进程表仍包含可确认的候选；清理后再报告枚举失败，不能跳过这些写者。
+    rows = error.rows;
+    failure = error;
+    uncertain = true;
+  }
+  for (const row of rows) {
     if (row.pid === process.pid || row.zombie) continue;
     let args: string[] | null;
     try {
@@ -366,7 +377,7 @@ function findWritersByCommandLine(canonical: string): Candidates {
       uncertain = true;
     }
   }
-  return { found, uncertain };
+  return { found, uncertain, ...(failure ? { failure } : {}) };
 }
 
 /**
@@ -493,10 +504,10 @@ class WriterLock implements SessionWriterLock {
     if (!previous || previous.state === "released") return "none";
     if (previous.writer) return this.stopWriter(previous.writer, stopOpts);
     // No writer recorded: the previous host may have died between spawn and record.
-    const { found, uncertain } = findWritersByCommandLine(this.paths.canonical);
+    const { found, uncertain, failure } = findWritersByCommandLine(this.paths.canonical);
     let stopped = false;
     let failed = false;
-    const failures: unknown[] = [];
+    const failures: unknown[] = failure ? [failure] : [];
     for (const candidate of found) {
       try {
         const result = await this.stopWriter(candidate, stopOpts);

@@ -3,6 +3,7 @@ import { createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import { test } from "node:test";
 import { boundaryModule, fault } from "./fixtures/boundary-module.mjs";
+import { ProcessTableError } from "../dist/proctable.js";
 
 const identity = { pid: 123, startTime: "start", runId: "run", instanceId: "instance" };
 const host = { app: "pi-pane", identity };
@@ -80,6 +81,7 @@ async function fixture(platform = "linux") {
       return true;
     } },
     "./proctable.js": {
+      ProcessTableError,
       listProcesses: () => { invoke("processes"); return status.rows; },
       processCommandLine: (pid) => {
         invoke("commandline");
@@ -479,6 +481,31 @@ for (const stage of ["record-cleanup", "abandon", "acquire", "probe", "multiple-
       assert.deepEqual(e.errors, [primary, cleanup]);
       return true;
     });
+  });
+}
+
+for (const stopFails of [false, true]) {
+  test(`部分进程表保留可读写者并报告查询失败（停止失败=${stopFails}）`, async () => {
+    const f = await fixture();
+    const old = JSON.stringify({ version: 1, sessionFile: f.file, host, state: "starting", updatedAt: "old" });
+    f.files.set(f.recordFile, old);
+    const candidate = { pid: 789, startTime: "b" };
+    f.status.args.set(candidate.pid, [path.resolve("gate.js"), "cli.js", "--mode", "rpc", "--session", f.file]);
+    const query = new ProcessTableError([fault("EACCES")], [candidate]);
+    f.failures.set("processes", query);
+    f.status.identities.push("alive", "gone");
+    const cleanup = fault("EPERM");
+    if (stopFails) f.status.stopErrors.push(cleanup);
+    const lock = await f.acquire();
+    await assert.rejects(lock.recoverPreviousWriter(), (error) => {
+      if (stopFails) assert.deepEqual(error.errors, [query, cleanup]);
+      else assert.equal(error, query);
+      return true;
+    });
+    assert.deepEqual(f.status.stopped, [candidate.pid]);
+    assert.equal(f.files.get(f.recordFile), old);
+    assert.equal(f.held(), false);
+    assert.equal(lock.recoveryReports.length, stopFails ? 0 : 1);
   });
 }
 
