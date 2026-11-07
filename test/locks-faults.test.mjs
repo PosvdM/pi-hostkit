@@ -259,6 +259,67 @@ for (const operation of ["identity", "scope", "processes", "commandline"]) {
   });
 }
 
+for (const query of ["identity", "scope"]) {
+  for (const outcome of ["clean", "leftovers", "stop-error"]) {
+    test(`前置 ${query} 查询未知仍独立停止（${outcome}），再抛原错并交付清理结果`, async () => {
+      const f = await fixture();
+      const writer = { ...identity, cgroup: "/sys/fs/cgroup/pi-hostkit-review-01234567.scope" };
+      const old = JSON.stringify({ version: 1, sessionFile: f.file, host, writer, state: "running", updatedAt: "old" });
+      f.files.set(f.recordFile, old);
+      const error = fault("EACCES", "前置查询失败");
+      if (query === "identity") f.status.identities.push(error);
+      else { f.status.identities.push("gone"); f.status.scopes.push(error); }
+      const report = { coverage: "cgroup", steps: [{ step: "kill cgroup", ok: true, at: "now" }], leftovers: outcome === "leftovers" ? [writer] : [] };
+      f.status.report = report;
+      const cleanup = fault("EPERM", "停止拒绝");
+      if (outcome === "stop-error") f.status.stopErrors.push(cleanup);
+      const lock = await f.acquire();
+      await assert.rejects(lock.recoverPreviousWriter({ assumeNoWriter: true }), (actual) => {
+        assert.equal(actual, error);
+        assert.equal(actual.code, "EACCES");
+        if (outcome === "stop-error") assert.equal(actual.cause, cleanup);
+        else {
+          assert.equal(actual.cause, lock.recoveryReports[0]);
+          assert.deepEqual(actual.cause.leftovers, report.leftovers);
+          assert.ok(actual.cause.steps.some((step) => step.step === "query writer before recovery" && !step.ok));
+          assert.ok(actual.cause.steps.some((step) => step.step === "kill cgroup" && step.ok));
+        }
+        return true;
+      });
+      assert.deepEqual(f.status.stopped, [writer.pid]);
+      assert.equal(lock.recoveryReports.length, outcome === "stop-error" ? 0 : 1);
+      assert.equal(f.files.get(f.recordFile), old);
+      assert.equal(f.held(), false);
+      assert.equal(f.calls.includes("create"), false);
+    });
+  }
+}
+
+for (const frozen of [false, true]) {
+  test(`恢复查询首错的既有 cause 保留（冻结=${frozen}）`, async () => {
+    const f = await fixture();
+    f.files.set(f.recordFile, JSON.stringify({ version: 1, sessionFile: f.file, host, writer: identity, state: "running", updatedAt: "old" }));
+    const previous = new Error("原上下文");
+    const error = Object.assign(new Error("查询未知", { cause: previous }), { code: "EIO" });
+    if (frozen) Object.freeze(error);
+    f.status.identities.push(error);
+    const lock = await f.acquire();
+    await assert.rejects(lock.recoverPreviousWriter(), (actual) => {
+      assert.equal(actual.code, "EIO");
+      if (frozen) {
+        assert.equal(actual.errors[0], error);
+        assert.equal(actual.cause, lock.recoveryReports[0]);
+      } else {
+        assert.equal(actual, error);
+        assert.deepEqual(actual.cause.errors, [previous, lock.recoveryReports[0]]);
+      }
+      return true;
+    });
+    assert.deepEqual(f.status.stopped, [identity.pid]);
+    assert.equal(f.held(), false);
+  });
+}
+
 test("恢复失败和原生释放失败同时可见，之后不得重放关闭", async () => {
   const f = await fixture();
   const lock = await f.acquire();
@@ -308,7 +369,7 @@ for (const firstFails of ["leftovers", "query", "stop"]) {
     if (firstFails === "stop") f.status.stopErrors.push(error);
     if (firstFails === "leftovers") assert.equal(await lock.recoverPreviousWriter(), "failed");
     else await assert.rejects(lock.recoverPreviousWriter(), (e) => e === error);
-    assert.deepEqual(f.status.stopped, firstFails === "query" ? [789] : [456, 789]);
+    assert.deepEqual(f.status.stopped, [456, 789]);
     assert.deepEqual(lock.recoveryReports.at(-1).leftovers, []);
     assert.equal(f.held(), false);
   });

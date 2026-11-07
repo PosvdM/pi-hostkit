@@ -456,7 +456,8 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 
 - `none` 或 `stopped`：把记录改写为本宿主的 `starting`（不带 `writer`）。之后才能调用 `update` 和 `spawnWriter`；在此之前调用它们抛出 `EHOSTKIT_LOCK_STATE`。`recoverPreviousWriter` 每把锁只能调用一次。
 - `failed`：锁被自动释放，记录保持原样，不拉起新写者。使用方告诉用户“上一个写者状态不明”，用户人工确认没有遗留的 pi 进程后，使用方重新取锁并以 `assumeNoWriter: true` 调用，此时第 1 步和第 4 步中无法判断的部分按 `none` 处理（agora 中这是用户级操作）。找到的候选仍会被停止，停止失败仍是 `failed`。
-- 恢复过程中抛出错误（例如进程表无法读取，或写入 `starting` 记录失败）时，锁同样被释放，错误抛给调用方。
+- 前置写者身份或 scope 人口查询未知时，仍先调用 `stopByIdentity` 按身份及 owned scope 独立尝试清理，再抛出原查询错误，不把后续清理完成误报为恢复成功。停止返回的报告保存在 `recoveryReports`，并通过原错误的标准 `cause` 交给调用方；停止自身拒绝时 `cause` 保留该清理错误。原错误已有 `cause` 时用聚合上下文同时保留，错误不可扩展时以保留原错误和错误码的聚合错误包装。不增加公开类型或错误码。
+- 恢复过程中抛出错误（例如进程表无法读取，或写入 `starting` 记录失败）时，锁同样被释放，旧记录保持原样，错误抛给调用方。
 - 停止遗留写者产生的 `StopReport` 保存在 `recoveryReports` 里。
 
 同一把锁上的 `recoverPreviousWriter`、`update`、`spawnWriter`、`release` 按调用顺序逐个执行，后一个等前一个完成。所以在恢复进行中调用 `release()`，释放会排在恢复之后，恢复不会在锁已释放后再写记录；`release()` 之后其他操作抛出 `EHOSTKIT_LOCK_STATE`。`update` 不接受 `state: "released"`（用 `release()`），`writer` 必须是完整的进程身份；值为 `undefined` 的字段保持不变。

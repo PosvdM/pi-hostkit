@@ -111,6 +111,22 @@ function aggregateFailure(errors: unknown[], message: string): AggregateError {
   return code === undefined ? failure : Object.assign(failure, { code });
 }
 
+/** 通过已有 Error.cause 交付清理结果，保留原错误及其已有上下文。 */
+function withRecoveryCause(error: unknown, result: unknown): unknown {
+  if (error instanceof Error) {
+    try {
+      const cause = error.cause === undefined ? result : new AggregateError([error.cause, result], "恢复查询与清理上下文");
+      Object.defineProperty(error, "cause", { value: cause, configurable: true, writable: true });
+      return error;
+    } catch {
+      // 冻结的错误不能附加 cause，保留为聚合错误中的首项。
+    }
+  }
+  const failure = aggregateFailure([error], "恢复查询失败，清理结果见 cause");
+  Object.defineProperty(failure, "cause", { value: result, configurable: true });
+  return failure;
+}
+
 /**
  * POSIX: `flock(LOCK_EX | LOCK_NB)` on `posixFile`, which is never deleted.
  * Windows: named mutex `Global\pi-hostkit-v1-<SID>-<purpose>-<sha256(key)>`; an
@@ -496,12 +512,37 @@ class WriterLock implements SessionWriterLock {
    * shows nothing left within its coverage and the writer is gone.
    */
   private async stopWriter(writer: ProcessIdentity, opts: StopOptions): Promise<RecoverResult> {
-    const alive = (await isSameProcess(writer)) === "alive";
-    if (!alive && !scopePopulated(writer)) return "none";
-    const report = await stopByIdentity(writer, opts);
+    let queryFailed = false;
+    let queryError: unknown;
+    let alive: boolean | undefined;
+    try {
+      alive = (await isSameProcess(writer)) === "alive";
+      if (!alive && !scopePopulated(writer)) return "none";
+    } catch (error) {
+      queryFailed = true;
+      queryError = error;
+    }
+    let report: StopReport;
+    try {
+      report = await stopByIdentity(writer, opts);
+    } catch (error) {
+      // 前置查询未知不能跳过独立清理，清理拒绝也不能覆盖原查询错误。
+      throw queryFailed ? withRecoveryCause(queryError, error) : error;
+    }
+    if (queryFailed) {
+      report = { ...report, steps: [{
+        step: "query writer before recovery", ok: false, at: new Date().toISOString(),
+        detail: queryError instanceof Error ? queryError.message : String(queryError),
+      }, ...report.steps] };
+    }
     this.recoveryReports.push(report);
+    if (queryFailed) throw withRecoveryCause(queryError, report);
     if (report.leftovers.length) return "failed";
-    if ((await isSameProcess(writer)) === "alive" || scopePopulated(writer)) return "failed";
+    try {
+      if ((await isSameProcess(writer)) === "alive" || scopePopulated(writer)) return "failed";
+    } catch (error) {
+      throw withRecoveryCause(error, report);
+    }
     return "stopped";
   }
 
