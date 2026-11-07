@@ -7,7 +7,8 @@
         ["OS=='win'", {
           "sources": ["src/native/hostkit_win.c"],
           "libraries": ["advapi32.lib", "shell32.lib"],
-          "defines": ["UNICODE", "_UNICODE", "WIN32_LEAN_AND_MEAN"]
+          "defines": ["UNICODE", "_UNICODE", "WIN32_LEAN_AND_MEAN"],
+          "msvs_settings": { "VCCLCompilerTool": { "AdditionalOptions": ["/utf-8"] } }
         }],
         ["OS!='win'", {
           "sources": ["src/native/hostkit_posix.c"],
