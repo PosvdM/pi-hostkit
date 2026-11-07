@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
 import { randomUUID } from "node:crypto";
@@ -185,12 +185,18 @@ if (win) {
     assert.deepEqual(b._stats().slice(5, 7), [1, 0]);
   });
   succeeds("私有文件与 ACL 正常读写", () => {
+    const originalOwner = b.readAcl(file).owner;
+    const user = b.userSid();
     b.setPrivateAcl(file, false);
     const acl = b.readAcl(file);
-    assert.equal(acl.owner, b.userSid());
+    // 提权进程创建的文件可能由 Administrators 持有；设置 DACL 不改属主。
+    assert.equal(acl.owner, originalOwner);
+    assert.ok([user, "S-1-5-32-544", "S-1-5-18"].includes(acl.owner));
     assert.equal(acl.protected, true);
     assert.equal(acl.nullDacl, false);
     assert.equal(acl.aces.length, 1);
+    assert.equal(acl.aces[0].type, "allow");
+    assert.equal(acl.aces[0].sid, user);
   });
   for (const op of ["GetNamedSecurityInfoW", "GetSecurityDescriptorControl", "GetAce", "ConvertSidToStringSidW", "napi_create_object", "napi_create_array", "napi_set_named_property", "napi_set_element"])
     fails(`readAcl：${op} 失败不能返回不完整的权限结论`, op, () => b.readAcl(file));
@@ -264,7 +270,7 @@ if (win) {
     });
     // 显式写入 ACL，避免无 ACL 文件的 ENOENT 快路径遮住枚举故障。
     test("macOS ACL 故障准备：写入可枚举条目", () => {
-      execFileSync("/bin/chmod", ["+a", `user:${process.getuid()} allow read`, file], { timeout: 10_000 });
+      execFileSync("/bin/chmod", ["+a", `user:${userInfo().username} allow read`, file], { timeout: 10_000 });
       assert.ok(b.aclEntryCount(file) > 0);
     });
     for (const op of ["acl_get_link_np", "acl_get_entry", "acl_free"])
