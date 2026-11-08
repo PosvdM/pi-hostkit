@@ -46,6 +46,7 @@ export interface NativeBinding {
   jobAssign?(job: number, pid: number, startTime: string): void;
   jobTerminate?(job: number): void;
   jobProcessIds?(job: number): number[];
+  jobProcessIdentity?(job: number, pid: number): { pid: number; startTime: string } | null;
   handleClose?(handle: number): void;
   mutexAcquire?(name: string): number;
   mutexRelease?(handle: number): void;
