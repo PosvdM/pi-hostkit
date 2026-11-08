@@ -26,12 +26,12 @@ pi-hostkit 封装托管 pi 子进程时与操作系统相关的能力。pi-agora
 
 系统调用可能失败，也可能只返回部分数据。下列规则适用于 TypeScript 与原生模块；修改任何系统边界时，须检查[边界与故障测试清单](failure-boundaries.md)。
 
-1. **不存在必须有证据。** 权限、I/O、格式损坏、截断和无法查询均属于未知，不能当成路径不存在、进程已退出或容器已清空。每种接口只接受其明确约定的缺失错误；本地磁盘探测只在 `ENOENT` 时上溯，不用 `existsSync` 吞掉查询错误。允许回退的安装候选与能力探测也不能把失败缓存为成功。
+1. **不存在必须有证据。** 权限、I/O、格式损坏、截断和无法查询均属于未知，不能当成路径不存在、进程已退出或容器已清空。Linux `stat` 解析失败时仅重读一次；只有重读明确返回缺失错误才算进程不存在，持续坏数据保留有界原文与长度。每种接口只接受其明确约定的缺失错误；本地磁盘探测只在 `ENOENT` 时上溯，不用 `existsSync` 吞掉查询错误。允许回退的安装候选与能力探测也不能把失败缓存为成功。
 2. **信号必须绑定身份。** 每次终止都核对 PID 与创建时间，能固定目标时使用 pidfd 或已核对的 Windows 句柄。进程组经由仍属于该组的已核对成员发送；cgroup 只清理 hostkit 自己的 scope，逐 PID 退路还要核对成员资格。身份不符或无法核对时不能向替代进程发信号。
 3. **独立目标互不门控。** 一个后代、父分支、子 cgroup 或信号阶段失败，不能中断其他可确认目标的清理。部分列举继续保留可读子树和已知身份；pi 的最终身份核对与停止不依赖子树查询成功。
 4. **取得资源就有退出路径。** 取得锁、句柄、描述符或临时缓冲后，后续查询、校验、构造返回值失败都必须回收。资源释放本身失败也要交给调用方或报告；不能先宣布释放成功。POSIX `close` 被中断后不能盲目重试编号，避免关闭已复用的描述符。
 5. **先提交，再改变状态。** 会话记录经排他临时文件和原子改名提交；失败时旧记录与已持有的锁状态保持可解释，不启动未登记的写者。普通释放先确认写者退出，再提交 `released`，最后释放内核锁；更新与释放串行执行，不能在释放后再写记录。
-6. **未知残留必须可见。** 停止期间的操作失败写入 `StopReport.steps`，已知但无法确认退出的身份留在 `leftovers`。容器成员无法完整列出时用 PID 为 0、空创建时间的容器哨兵表示未知；空列表不代表查询成功。快照覆盖范围仍只限已观察目标，不能因列表为空承诺整棵树已清空。
+6. **未知残留必须可见。** 停止期间的操作失败写入 `StopReport.steps`，已知但无法确认退出的身份留在 `leftovers`。容器成员无法完整列出时用 PID 为 0、空创建时间的容器哨兵表示未知；空列表不代表查询成功。Windows Job 成员从列表移除后，已知身份仍须通过与 `isSameProcess` 相同的查询确认退出，不能单凭 Job 列表为空删去记录。快照覆盖范围仍只限已观察目标，不能因列表为空承诺整棵树已清空。
 7. **清理不能掩盖原始故障。** 主操作与回收同时失败时保留两者；密钥文件写入或最终隐私复查失败时尝试删除本次创建的文件，不能删除排他创建之前就存在的文件。记录临时文件失败也要尝试回收，并报告回收错误。
 8. **等待与缓冲有界。** 停止选项必须是合法的有限毫秒数；轮询、系统命令、原生扩容重试与记录改名重试有界。RPC 先序列化、再登记等待项，序列化与写失败不留下 pending、计时器、监听器或无限发送队列。
 9. **故障测试不改变生产契约。** 测试使用内部依赖注入、独立进程的模块 mock 或隔离源码副本，不增加公开测试接口或生产环境变量开关。真实 pi、锁和记录测试使用临时 HOME 与数据目录，不读取或修改开发者的真实设置。
@@ -222,6 +222,8 @@ pi 启动后用扩展在 `session_start` 中握手、宿主写入记录后再放
 | macOS | `sysctl(KERN_PROC)` 中的启动时间（`p_starttime`），格式 `秒.微秒`（微秒 6 位） |
 | Windows | `NtQuerySystemInformation(SystemProcessInformation)` 中的创建时间（FILETIME，100 纳秒单位）的十进制数，与 `GetProcessTimes` 的值相同 |
 
+Linux 读取 `/proc/<pid>/stat` 后遇到空内容、字段不足或字段格式错误时，再读取一次同一文件。重读确认 `ENOENT` 或 `ESRCH` 时返回 `null`；重读有效时使用该次内容；持续无法解析时抛出 `EHOSTKIT_PROC`，错误消息与内部诊断 `statReads` 保留两次内容的 UTF-8 字节长度及各自前 256 个 UTF-16 字符。重读的权限、I/O 等错误仍直接传播，并通过内部诊断 `statParseError` 保留首次解析故障，不能把重试失败当成进程已退出。
+
 进程表的父进程、进程组和创建时间必须来自同一个进程：macOS 用 `sysctl(KERN_PROC_ALL)`，Windows 用 `NtQuerySystemInformation`，两者都一次返回整张表。不用 Windows 的 Toolhelp 快照：它只给父 PID，再按 PID 打开进程读创建时间时，PID 可能已经属于另一个进程，会把无关进程误认为后代。
 
 - 只比较相等，不跨平台解析。按创建时间排序只用于“子进程不能早于父进程”的检查（见“快照模式”）。
@@ -272,7 +274,8 @@ pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令�
 ### Windows
 
 - 启动：每个受管 pi 放进一个独立的 Job Object，设置 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`，不允许 breakaway。加入 Job 前再次核对进程身份。加入发生在 gate 等待放行期间，pi 尚未加载，所以不会有子进程在加入 Job 之前启动。
-- 最终终止：`TerminateJobObject`（`step` 为 `TerminateJobObject`），然后复查 Job 内进程数为 0。Job 列举或逐成员身份查询失败时继续其他可确认成员，失败写入 `steps`，已知身份保留在 `leftovers`；Job 范围无法确认时加 `pid: 0`、`startTime: ""`、`exe: "Job Object <句柄>"` 哨兵。句柄在 `finally` 关闭，关闭失败也写入报告；重复 `stop()` 返回同一报告。
+- 停止前先记录 Job 成员身份，在 `TerminateJobObject` 前再次列举；最终终止使用 `TerminateJobObject`（`step` 为 `TerminateJobObject`）。随后在 2 秒内同时复查 Job 列表与已知身份。进程离开 Job 列表可能早于其进程对象进入已退出状态，因此已知身份只在 `processInfo` 确认不存在、僵尸或创建时间变化后移除；空列表本身不能证明这些身份已退出。成功确认时，使用方可立即用 `isSameProcess` 核对已知成员，无需另设退出等待。
+- Job 列举或逐成员身份查询失败时继续核对其他成员，失败写入 `steps`；仍存活或无法确认退出的身份保留在 `leftovers`。Job 范围无法确认时加 `pid: 0`、`startTime: ""`、`exe: "Job Object <句柄>"` 哨兵。句柄在 `finally` 关闭，关闭失败也写入报告；重复 `stop()` 返回同一报告。
 - Job 内的后代进程不论父进程是否已退出都在 Job 里，所以“pi 主进程先退出、孙进程还在”的情况同样能清理。
 - Job 句柄不可继承，只由宿主持有。宿主（daemon 或 pane 服务端）退出或被强杀时句柄关闭，Job 内所有进程随之终止。
 
@@ -479,7 +482,7 @@ pi 在打开已有会话文件时就可能改写它：文件为空时写入会�
 #### 外部写者与协议版本
 
 - 终端里直接运行的 pi 不参与这个协议，pi-hostkit 无法发现它。如何处理这种外部写者由使用方决定（pi-pane 见其 `docs/architecture.md`）。
-- 协议版本体现在名称中（`v1`）。pane 和 agora 尚未接入，所以这里的 Windows Global/SID 名称和释放语义仍使用 `v1`。改变锁文件或 mutex 的名称和位置、会话 key 的算法、共享记录的格式或语义，都属于不兼容修改，pane 和 agora 必须同时升级。
+- 协议版本体现在名称中（`v1`）。pane 和 agora 共用本协议，Windows Global/SID 名称和释放语义使用 `v1`。改变锁文件或 mutex 的名称和位置、会话 key 的算法、共享记录的格式或语义，都属于不兼容修改，pane 和 agora 必须同时升级。
 
 ## 密钥目录权限
 
@@ -525,7 +528,7 @@ export function isAncestorOf(dir: string, target: string): boolean;  // dir 是 
 
 1. **与 pi 解析工具路径的规则一致**，确保校验的是 pi 实际会打开的文件（`resolveToolPath`）：把 Unicode 空格（`U+00A0`、`U+2000–U+200A`、`U+202F`、`U+205F`、`U+3000`）换成普通空格，去掉开头的一个 `@`；Windows 上把 Git Bash、MSYS、Cygwin、WSL 形式的盘符路径（`/c/...`、`/mnt/c/...`、`/cygdrive/c/...`）转成 `C:\...`；展开 `~`；`file://` URL 转路径；再相对 `cwd` 解析（依据：`dist/utils/paths.js` 的 `normalizePath`、`resolvePath`，`dist/core/tools/path-utils.js` 的 `resolveToCwd`）。
 2. `mode = "read"` 时还按 pi 的 `resolveReadPath` 依次尝试 macOS 截图名的窄不换行空格变体、NFD 变体、弯引号变体及 NFD 加弯引号变体，取第一个存在的文件（`resolveReadToolPath`，依据：`dist/core/tools/path-utils.js`）。
-3. **真实路径**（`realPathOrPending`）：`fs.realpathSync.native` 解析符号链接和 Windows junction。目标不存在时（如 `write` 新文件），对最深的已存在祖先取真实路径，再拼上其余部分。悬空的符号链接被跟随到它指向的位置，即写入实际创建文件的位置；超过 40 层链接时抛出 `ELOOP`。比较路径前两方都必须是真实路径（macOS 上同一个临时目录可能表现为 `/private/var` 或 `/var`）。
+3. **真实路径**（`realPathOrPending`）：`fs.realpathSync.native` 解析符号链接和 Windows junction。目标不存在时（如 `write` 新文件），对最深的已存在祖先取真实路径，再拼上其余部分。悬空的符号链接被跟随到它指向的位置，即写入实际创建文件的位置；超过 40 层链接时抛出 `ELOOP`。首次真实路径查询报 `ENOENT` 后，若 `lstat` 发现目标已经存在且不是符号链接，则再执行一次真实路径查询，以处理并发创建；该次查询失败时原样传播其错误，不合成 `ENOTDIR`，也不无限重试。比较路径前两方都必须是真实路径（macOS 上同一个临时目录可能表现为 `/private/var` 或 `/var`）。
 4. **比较键**（`comparisonKey`）：
    - Windows：分隔符统一为 `\`，去掉 `\\?\` 前缀（`\\?\UNC\` 转为 `\\`），折叠大小写（与 pi 的 `getPathComparisonKey` 一致，忽略 NTFS 按目录开启的大小写敏感）。
    - macOS：先证实路径所在卷不区分大小写，再转为 NFC 并折叠大小写。大小写敏感或无法探测时抛出 `EHOSTKIT_CASE_SENSITIVE_FS`，不进行包含判断或生成锁 key。默认 APFS 上的比较行为不变。

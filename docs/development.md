@@ -69,9 +69,9 @@ npm test
 | `test/locate-faults.test.mjs` | 显式、官方、npm 候选的系统查询失败分类与失败缓存重试 |
 | `test/locks-faults.test.mjs` | 获取/释放与恢复查询、临时记录创建/写入/提交/删除、候选之间的独立清理、启动写者及回收双失败 |
 | `test/secrets-faults.test.mjs` | 私密目录与文件的查询、ACL、创建/写入/sync/关闭、最终复查与失败删除 |
-| `test/paths-faults.test.mjs` | 读取变体、真实路径/链接和 macOS 卷探测的失败分类 |
+| `test/paths-faults.test.mjs` | 读取变体、真实路径/链接和 macOS 卷探测的失败分类；真实路径首次缺失后并发创建文件/目录，以及重试次数与原始错误传播 |
 | `test/rpc-faults.test.mjs` | 输出流错误/关闭、挂起请求与背压队列清理、关闭输入时首错与收尾错误同时保留 |
-| `test/process-faults.test.mjs` | 独立模块 mock 进程的 Windows Job/恢复停止/启动回收与 Linux 进程表、pidfd/进程组退路故障 |
+| `test/process-faults.test.mjs` | 独立模块 mock 进程的 Windows Job/恢复停止/启动回收与 Linux 进程表、pidfd/进程组退路故障；Job 列表与退出可见性的时间差，坏 stat 的有界重读与有界诊断 |
 | `test/native-faults.test.mjs` | 临时编译带系统调用包装器的原生副本；原生查询、信号、截断、资源回收与结果构造故障 |
 | `test/native-loader.test.mjs` | 原生模块懒加载、加载失败后重试、函数缺失与调用错误 |
 | `test/paths-case.test.mjs` | macOS 大小写敏感/不明/跨设备检测、只读探测边界、无 native 加载；注入仅存在于隔离测试副本 |
@@ -147,7 +147,7 @@ npm test
 
 - **接口与行为**：修改公开接口、默认值或平台行为时，同步更新 [design.md](design.md)，并在 pi-pane、pi-agora 中检查引用它的文档。
 - **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 和 `test/piargs.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。
-- **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；接入方使用后需要不兼容修改时改用新的协议版本名；接入前的 Global/SID 名称与释放语义使用 `v1`，见 design.md。
+- **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；接入方使用后需要不兼容修改时改用新的协议版本名；现有 Global/SID 名称与释放语义使用 `v1`，见 design.md。
 - **启动门闩**：`src/gate.ts` 只依赖 `src/gate-protocol.ts` 和 Node 内置模块，不加载原生模块，在 pi 加载之前不做多余的事。修改放行行或退出码时，宿主和 gate 必须来自同一版本的 pi-hostkit。
 - **原生函数**：增加或修改原生函数时，同时修改对应的 C 文件和 `src/native.ts` 的 `NativeBinding`。只在部分平台存在的函数声明为可选，经 `nativeFn` 调用（不存在时抛出 `ENOTSUP`）。
 - **`pi-hostkit/paths`**：`src/paths.ts` 不导入 `src/native.ts` 或其他会加载原生模块的文件，因为这个入口在 pi 进程里的扩展中使用。

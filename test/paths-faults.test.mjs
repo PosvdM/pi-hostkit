@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { boundaryModule, fault } from "./fixtures/boundary-module.mjs";
@@ -41,6 +42,67 @@ for (const operation of ["realpath", "lstat", "readlink"]) {
       assert.equal(seen.length, 1);
     });
   }
+}
+
+for (const kind of ["普通文件", "目录"]) {
+  test(`首次解析缺失后并发创建${kind}，应重新解析真实路径`, async (t) => {
+    const dir = fs.mkdtempSync(path.join(tmpdir(), "hostkit-path-race-"));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const target = path.join(dir, "created");
+    const calls = [];
+    let realpaths = 0;
+    const mod = await boundaryModule("paths", { imports: { "node:fs": {
+      ...fs,
+      realpathSync: { native(p) {
+        calls.push({ operation: "realpath", path: p });
+        assert.equal(p, target);
+        assert.ok(++realpaths <= 2, "真实路径解析最多调用两次");
+        if (realpaths === 1) throw fault("ENOENT");
+        return fs.realpathSync.native(p);
+      } },
+      lstatSync(p) {
+        calls.push({ operation: "lstat", path: p });
+        assert.equal(p, target);
+        if (kind === "目录") fs.mkdirSync(p);
+        else fs.writeFileSync(p, "内容");
+        return fs.lstatSync(p);
+      },
+      readlinkSync() { assert.fail("普通文件或目录不得读取链接目标"); },
+    } } });
+    assert.equal(mod.realPathOrPending(target), fs.realpathSync.native(target));
+    assert.deepEqual(calls, [
+      { operation: "realpath", path: target },
+      { operation: "lstat", path: target },
+      { operation: "realpath", path: target },
+    ]);
+  });
+}
+
+for (const code of ["ENOENT", "EACCES", "EPERM", "EIO", "ENOTDIR", "ELOOP"]) {
+  test(`非链接目标第二次 realpath/${code} 应原样传播且不得继续重试`, async () => {
+    const target = path.resolve("created");
+    const error = Object.assign(fault(code), { path: target, syscall: "realpath" });
+    let realpaths = 0;
+    let lstats = 0;
+    const mod = await boundaryModule("paths", { imports: { "node:fs": {
+      ...fs,
+      realpathSync: { native(p) {
+        assert.equal(p, target);
+        assert.ok(++realpaths <= 2, "真实路径解析最多调用两次");
+        if (realpaths === 1) throw fault("ENOENT");
+        throw error;
+      } },
+      lstatSync(p) {
+        assert.equal(p, target);
+        assert.equal(++lstats, 1, "第二次解析失败后不得再次查询目标");
+        return { isSymbolicLink: () => false };
+      },
+      readlinkSync() { assert.fail("非链接目标不得读取链接目标"); },
+    } } });
+    assert.throws(() => mod.realPathOrPending(target), (e) => e === error);
+    assert.equal(realpaths, 2);
+    assert.equal(lstats, 1);
+  });
 }
 
 for (const operation of ["statSync", "realpath", "readdirSync", "original", "alias", "parent"]) {

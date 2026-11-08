@@ -241,6 +241,80 @@ function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport
 
 type Mode = { kind: "job"; job: number } | { kind: "cgroup"; dir: string } | { kind: "snapshot" };
 
+/** Job 枚举与进程退出是独立证据；成员离开列表后仍须核对原身份。 */
+class JobRecords {
+  private readonly known = new Map<string, StopReport["leftovers"][number]>();
+  private readonly failures = new Set<string>();
+  private listed = false;
+  private empty = false;
+
+  constructor(private readonly job: number, private readonly steps: Steps) {}
+
+  private key(id: { pid: number; startTime: string }): string {
+    return `${id.pid}:${id.startTime}`;
+  }
+
+  private failed(step: string, error: unknown): void {
+    const detail = errorDetail(error);
+    const key = `${step}: ${detail}`;
+    if (!this.failures.has(key)) this.steps.add(step, false, detail);
+    this.failures.add(key);
+  }
+
+  query(): boolean {
+    let pids: number[] = [];
+    try {
+      pids = nativeFn("jobProcessIds")(this.job);
+      this.listed = true;
+      this.empty = pids.length === 0;
+    } catch (error) {
+      this.listed = false;
+      this.failed("query Job Object", error);
+    }
+    for (const pid of new Set(pids)) {
+      try {
+        const row = processInfo(pid);
+        if (row && !row.zombie) {
+          const id = { pid, startTime: row.startTime };
+          this.known.set(this.key(id), id);
+        }
+        // 可读查询消除该 PID 的未知占位，不改写其他创建时间的身份。
+        this.known.delete(`${pid}:`);
+      } catch (error) {
+        const id = { pid, startTime: "" };
+        this.known.set(this.key(id), id);
+        this.failed(`query Job PID ${pid}`, error);
+      }
+    }
+    // 即使枚举失败，也独立核对每个身份；未知结果不能充当退出证据。
+    for (const [key, id] of [...this.known]) {
+      try {
+        const row = processInfo(id.pid);
+        if (!id.startTime) {
+          if (row && !row.zombie) {
+            const resolved = { pid: id.pid, startTime: row.startTime };
+            this.known.set(this.key(resolved), resolved);
+          }
+          this.known.delete(key);
+        } else if (!matches(row, id)) {
+          this.known.delete(key);
+        }
+      } catch (error) {
+        this.failed(`query Job PID ${id.pid}`, error);
+      }
+    }
+    return this.listed && this.empty && this.known.size === 0;
+  }
+
+  remaining(): StopReport["leftovers"] {
+    const leftovers = [...this.known.values()];
+    if (!this.listed || (!this.empty && !leftovers.length)) {
+      leftovers.push({ pid: 0, startTime: "", exe: `Job Object ${this.job}` });
+    }
+    return leftovers;
+  }
+}
+
 class Managed implements ManagedProcess {
   readonly rpc: StdioRpcTransport;
   readonly exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
@@ -356,6 +430,9 @@ class Managed implements ManagedProcess {
     const steps = new Steps();
     this.stopTimer();
     if (this.mode.kind === "snapshot") this.capture();
+    const jobRecords = this.mode.kind === "job" ? new JobRecords(this.mode.job, steps) : undefined;
+    // abort 和 EOF 都可能让成员离开 Job 列表，须先保存可读身份。
+    jobRecords?.query();
 
     if (this.exitInfo) {
       steps.add("abort", false, "process already exited");
@@ -370,6 +447,8 @@ class Managed implements ManagedProcess {
       }
     }
 
+    // abort 等待期间可能出现新成员，关闭输入前须再次保存身份。
+    jobRecords?.query();
     try {
       this.rpc.closeInput();
       steps.add("closeInput", true);
@@ -399,53 +478,18 @@ class Managed implements ManagedProcess {
     let leftovers: StopReport["leftovers"];
     if (this.mode.kind === "job") {
       const { job } = this.mode;
+      jobRecords!.query();
       try {
         nativeFn("jobTerminate")(job);
         steps.add("TerminateJobObject", true);
       } catch (error) {
         steps.add("TerminateJobObject", false, errorDetail(error));
       }
-      const known = new Map<number, StopReport["leftovers"][number]>();
-      const failures = new Set<string>();
-      const failed = (step: string, error: unknown) => {
-        const detail = errorDetail(error);
-        const key = `${step}: ${detail}`;
-        if (!failures.has(key)) steps.add(step, false, detail);
-        failures.add(key);
-      };
-      let queried = false;
-      const query = (): boolean => {
-        let pids: number[];
-        try {
-          pids = nativeFn("jobProcessIds")(job);
-          queried = true;
-        } catch (error) {
-          queried = false;
-          failed("query Job Object", error);
-          return false;
-        }
-        const members = new Set(pids);
-        for (const pid of known.keys()) if (!members.has(pid)) known.delete(pid);
-        for (const pid of members) {
-          try {
-            const row = processInfo(pid);
-            if (row && !row.zombie) known.set(pid, { pid, startTime: row.startTime });
-            else known.delete(pid);
-          } catch (error) {
-            if (!known.has(pid)) known.set(pid, { pid, startTime: pid === this.identity.pid ? this.identity.startTime : "" });
-            failed(`query Job PID ${pid}`, error);
-          }
-        }
-        return pids.length === 0;
-      };
       try {
-        await poll(query, SETTLE_CHECK_MS);
-        // 最后一次 Job 查询失败时，即使已知成员为空也不能报告清理完成。
-        const empty = query();
-        leftovers = [...known.values()];
-        if (!empty && (!queried || !leftovers.length)) {
-          leftovers.push({ pid: 0, startTime: "", exe: `Job Object ${job}` });
-        }
+        await poll(() => jobRecords!.query(), SETTLE_CHECK_MS);
+        // 最终枚举必须确认空，所有已知身份也必须有独立的退出证据。
+        jobRecords!.query();
+        leftovers = jobRecords!.remaining();
       } finally {
         try {
           nativeFn("handleClose")(job);
