@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, statSync, rmSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import path from "node:path";
@@ -106,6 +106,125 @@ if (win) {
   fails("jobProcessIds：持续 MORE_DATA 不能返回部分结果", "QueryInformationJobObject", () => b.jobProcessIds(job), { ...jobSetup, nth: 0, error: 234 });
   fails("jobProcessIds：成功状态但人口截断不能返回部分结果", "jobTruncated", () => b.jobProcessIds(job), { ...jobSetup, nth: 0, error: 234 });
   fails("jobProcessIds：数组创建失败回收列表", "napi_create_array", () => b.jobProcessIds(job), jobSetup);
+  // 只把独立子进程放入 Job，避免 KILL_ON_JOB_CLOSE 终止测试进程。
+  function identityFixture() {
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+    child.unref();
+    let j;
+    try {
+      assert.ok(child.pid);
+      j = b.jobCreate();
+      const identity = b.processInfo(child.pid);
+      assert.ok(identity);
+      b.jobAssign(j, child.pid, identity.startTime);
+      reset();
+      return { job: j, pid: child.pid, start: identity.startTime, close() {
+        try { b.handleClose(j); } finally { child.kill(); }
+      } };
+    } catch (error) {
+      reset();
+      try { if (j) b.handleClose(j); } finally { child.kill(); }
+      throw error;
+    }
+  }
+  function withIdentity(invoke) {
+    const f = identityFixture();
+    try { invoke(f); } finally { reset(); f.close(); }
+  }
+  const identityTrace = (j, sequence, { member = 1, times = 1, wait = 1 } = {}) => {
+    assert.deepEqual(b._identityStats(), [1, member, times, wait, 1, 0, sequence, j]);
+  };
+  let identity;
+  const identitySetup = { before: () => { identity = identityFixture(); }, after: () => identity.close() };
+  const queryIdentity = () => b.jobProcessIdentity(identity.job, identity.pid);
+  succeeds("jobProcessIdentity：成员身份与存活在同一个固定句柄上确认", () => withIdentity(f => {
+    assert.deepEqual(b.jobProcessIdentity(f.job, f.pid), { pid: f.pid, startTime: f.start });
+    identityTrace(f.job, 12345);
+  }));
+  succeeds("jobProcessIdentity：真实非成员不读取创建时间或返回身份", () => {
+    const j = b.jobCreate();
+    try {
+      reset();
+      assert.equal(b.jobProcessIdentity(j, process.pid), null);
+      identityTrace(j, 125, { times: 0, wait: 0 });
+    } finally { reset(); b.handleClose(j); }
+  });
+  succeeds("jobProcessIdentity：枚举 PID 复用为存活非成员对象时返回 null", () => withIdentity(f => {
+    assert.ok(b.jobProcessIds(f.job).includes(f.pid));
+    b._fault("jobIdentityReused", 1, 0);
+    assert.equal(b.jobProcessIdentity(f.job, f.pid), null);
+    assert.equal(b._stats()[3], 1);
+    identityTrace(f.job, 125, { times: 0, wait: 0 });
+  }));
+  succeeds("jobProcessIdentity：明确退出返回 null，且关闭固定句柄", () => withIdentity(f => {
+    b._fault("waitResult", 1, 0);
+    assert.equal(b.jobProcessIdentity(f.job, f.pid), null);
+    assert.equal(b._stats()[3], 1);
+    identityTrace(f.job, 12345);
+  }));
+  succeeds("jobProcessIdentity：OpenProcess 明确不存在才返回 null", () => {
+    const j = b.jobCreate();
+    try {
+      b._fault("OpenProcess", 1, 87);
+      assert.equal(b.jobProcessIdentity(j, process.pid), null);
+      assert.deepEqual(b._identityStats(), [1, 0, 0, 0, 0, 0, 1, 0]);
+      assert.equal(b._stats()[5], 0);
+    } finally { reset(); b.handleClose(j); }
+  });
+  for (const [op, error, code] of [
+    ["OpenProcess", 5, "EACCES"], ["OpenProcess", 6, "EWIN6"], ["OpenProcess", 2, "ENOENT"],
+    ["IsProcessInJob", 5, "EACCES"], ["IsProcessInJob", 6, "EWIN6"], ["IsProcessInJob", 87, "EINVAL"],
+    ["GetProcessTimes", 5, "EACCES"], ["WaitForSingleObject", 5, "EACCES"],
+    ["waitResult", 128, "EWIN13"], ["CloseHandle", 6, "EWIN6"],
+  ]) fails(`jobProcessIdentity：${op} 错误 ${error} 可见且释放临时句柄`, op, queryIdentity,
+    { ...identitySetup, error, code });
+  for (const [op, nth] of [
+    ["napi_create_object", 1], ["napi_create_uint32", 1], ["napi_create_string_utf8", 1],
+    ["napi_set_named_property", 1], ["napi_set_named_property", 2],
+  ]) fails(`jobProcessIdentity：${op} 第 ${nth} 次失败前已释放固定句柄`, op, () => {
+    try { return queryIdentity(); } finally { identityTrace(identity.job, 12345); }
+  }, { ...identitySetup, nth, code: "EHOSTKIT" });
+  for (const [op, error, code, sequence, trace] of [
+    ["IsProcessInJob", 5, "EACCES", 125, { times: 0, wait: 0 }],
+    ["GetProcessTimes", 5, "EACCES", 1235, { wait: 0 }],
+    ["WaitForSingleObject", 5, "EACCES", 12345, {}],
+    ["waitResult", 128, "EWIN13", 12345, {}],
+  ]) succeeds(`jobProcessIdentity：${op} 与关闭双失败保留主错误及关闭错误`, () => withIdentity(f => {
+    for (let i = 0; i < 3; i++) {
+      b._fault(op, 1, error, "CloseHandle", 1, 6);
+      assert.throws(() => b.jobProcessIdentity(f.job, f.pid), e => {
+        assert.equal(e.code, code);
+        assert.equal(e.errno, op === "waitResult" ? 13 : error);
+        assert.match(e.message, new RegExp(op === "waitResult" ? "WaitForSingleObject" : op));
+        assert.match(e.message, /CloseHandle\(process\).*Windows error 6/);
+        return true;
+      });
+      assert.deepEqual(b._stats().slice(3, 6), [1, 1, 1]);
+      identityTrace(f.job, sequence, trace);
+    }
+  }));
+  succeeds("jobProcessIdentity：非成员的关闭失败不能返回 null", () => {
+    const j = b.jobCreate();
+    try {
+      b._fault("CloseHandle", 1, 6);
+      assert.throws(() => b.jobProcessIdentity(j, process.pid), { code: "EWIN6", errno: 6 });
+      identityTrace(j, 125, { times: 0, wait: 0 });
+      assert.equal(b._stats()[5], 1);
+    } finally { reset(); b.handleClose(j); }
+  });
+  succeeds("jobProcessIdentity：退出结论的关闭失败不能返回 null", () => withIdentity(f => {
+    b._fault("waitResult", 1, 0, "CloseHandle", 1, 6);
+    assert.throws(() => b.jobProcessIdentity(f.job, f.pid), { code: "EWIN6", errno: 6 });
+    identityTrace(f.job, 12345);
+    assert.deepEqual(b._stats().slice(3, 6), [1, 1, 1]);
+  }));
+  succeeds("jobProcessIdentity：参数错误不打开进程句柄", () => {
+    for (const args of [[], [0, process.pid], [1, 0], [1, -1], [1, 0x100000000], ["job", process.pid]]) {
+      reset();
+      assert.throws(() => b.jobProcessIdentity(...args), { code: "EINVAL" });
+      assert.deepEqual(b._identityStats(), [0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+  });
   succeeds("Job 正常创建、查询、终止和关闭", () => {
     const j = b.jobCreate();
     try { assert.deepEqual(b.jobProcessIds(j), []); b.jobTerminate(j); } finally { b.handleClose(j); }

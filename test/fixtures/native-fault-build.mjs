@@ -26,10 +26,16 @@ export function buildFaultBinding() {
   // 关闭/释放故障在真实释放后返回错误，用于检查错误可见及无重复释放。
   // 这不证明操作系统真正拒绝释放时资源已经消失；该状态仍应视为未知。
   if (win) {
-    wrap("HANDLE", "OpenProcess", "DWORD a, BOOL b, DWORD c", "a,b,c", "return NULL;", "if (result) hk_handles++;");
-    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; SetLastError(hk_error); return FALSE;", "if (result) hk_handles--;", "hk_close_calls++;");
-    wrap("DWORD", "WaitForSingleObject", "HANDLE h, DWORD t", "h,t", "return WAIT_FAILED;");
-    wrap("BOOL", "GetProcessTimes", "HANDLE h, LPFILETIME a, LPFILETIME b, LPFILETIME c, LPFILETIME d", "h,a,b,c,d", "return FALSE;");
+    // 固定首个打开的进程句柄，记录后续查询与关闭是否仍指向同一对象。
+    wrap("HANDLE", "OpenProcess", "DWORD a, BOOL b, DWORD c", "a,b,c", "return NULL;", "if (result) { hk_handles++; if (!hk_identity_handle) hk_identity_handle = result; }", `
+      hk_identity_trace(0,NULL);
+      if (a != (PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE) || b) hk_identity_mismatches++;
+      // 用存活的非成员对象模拟枚举 PID 后，该编号已指向新对象。
+      if (hk_hit("jobIdentityReused")) c = GetCurrentProcessId();`);
+    wrap("BOOL", "CloseHandle", "HANDLE h", "h", "BOOL closed = CloseHandle(h); if (closed) hk_handles--; SetLastError(hk_error); return FALSE;", "if (result) hk_handles--;", "hk_close_calls++; if (h == hk_identity_handle) hk_identity_trace(4,h);");
+    wrap("BOOL", "IsProcessInJob", "HANDLE h, HANDLE j, PBOOL member", "h,j,member", "return FALSE;", "", "hk_identity_job = j; hk_identity_trace(1,h);");
+    wrap("DWORD", "WaitForSingleObject", "HANDLE h, DWORD t", "h,t", "return WAIT_FAILED;", "", `hk_identity_trace(3,h); if (t != 0) hk_identity_mismatches++; if (hk_hit("waitResult")) return hk_error;`);
+    wrap("BOOL", "GetProcessTimes", "HANDLE h, LPFILETIME a, LPFILETIME b, LPFILETIME c, LPFILETIME d", "h,a,b,c,d", "return FALSE;", "", "hk_identity_trace(2,h);");
     wrap("BOOL", "TerminateProcess", "HANDLE h, UINT c", "h,c", "return FALSE;");
     wrap("HANDLE", "CreateJobObjectW", "LPSECURITY_ATTRIBUTES a, LPCWSTR b", "a,b", "return NULL;", "if (result) hk_handles++;");
     wrap("BOOL", "SetInformationJobObject", "HANDLE h, JOBOBJECTINFOCLASS c, LPVOID p, DWORD n", "h,c,p,n", "return FALSE;");
@@ -112,6 +118,8 @@ export function buildFaultBinding() {
   for (const [name, params, args] of [
     ["napi_create_int32", "napi_env e, int32_t i, napi_value *v", "e,i,v"],
     ["napi_create_int64", "napi_env e, int64_t i, napi_value *v", "e,i,v"],
+    ["napi_create_uint32", "napi_env e, uint32_t i, napi_value *v", "e,i,v"],
+    ["napi_create_string_utf8", "napi_env e, const char *s, size_t n, napi_value *v", "e,s,n,v"],
     ["napi_create_object", "napi_env e, napi_value *v", "e,v"],
     ["napi_create_array", "napi_env e, napi_value *v", "e,v"],
     ["napi_set_element", "napi_env e, napi_value a, uint32_t i, napi_value v", "e,a,i,v"],
@@ -125,6 +133,28 @@ static char hk_target[128] = "", hk_target2[128] = "";
 static int hk_nth = 0, hk_calls = 0, hk_heap = 0, hk_handles = 0, hk_local = 0;
 static int hk_nth2 = 0, hk_calls2 = 0, hk_close_calls = 0, hk_delete_calls = 0;
 static uint32_t hk_error = 0, hk_error1 = 0, hk_error2 = 0;
+${win ? `
+static HANDLE hk_identity_handle = NULL, hk_identity_job = NULL;
+static int hk_identity_ops[5] = {0}, hk_identity_mismatches = 0;
+static uint32_t hk_identity_sequence = 0;
+static void hk_identity_reset(void) {
+  hk_identity_handle = hk_identity_job = NULL;
+  memset(hk_identity_ops,0,sizeof(hk_identity_ops));
+  hk_identity_mismatches = 0; hk_identity_sequence = 0;
+}
+static void hk_identity_trace(int op, HANDLE h) {
+  hk_identity_ops[op]++;
+  hk_identity_sequence = hk_identity_sequence * 10 + op + 1;
+  if (op && h != hk_identity_handle) hk_identity_mismatches++;
+}
+static napi_value hk_identity_stats(napi_env e, napi_callback_info i) {
+  (void)i; napi_value a,v; napi_create_array(e,&a);
+  int64_t counts[8] = {hk_identity_ops[0],hk_identity_ops[1],hk_identity_ops[2],
+    hk_identity_ops[3],hk_identity_ops[4],hk_identity_mismatches,hk_identity_sequence,
+    (int64_t)(intptr_t)hk_identity_job};
+  for (int k=0;k<8;k++) { napi_create_int64(e,counts[k],&v); napi_set_element(e,a,k,v); }
+  return a;
+}` : ""}
 static int hk_hit(const char *name) {
   if (!strcmp(hk_target,name)) {
     hk_error = hk_error1;
@@ -147,6 +177,7 @@ static napi_value hk_fault(napi_env e, napi_callback_info i) {
     napi_get_value_int32(e,a[4],&hk_nth2); napi_get_value_uint32(e,a[5],&hk_error2);
   }
   hk_calls=hk_calls2=hk_close_calls=hk_delete_calls=0;
+  ${win ? "hk_identity_reset();" : ""}
   napi_get_undefined(e,&u); return u;
 }
 static napi_value hk_stats(napi_env e, napi_callback_info i) {
@@ -164,7 +195,8 @@ ${names.map(n => `#define ${n}(...) hk_${n}(__VA_ARGS__)`).join("\n")}
     source = source.replace("#define CHECK(call)", `${header}\n#define CHECK(call)`);
     source = source.replace("napi_property_descriptor props[] = {", `napi_property_descriptor props[] = {
       {"_fault",NULL,hk_fault,NULL,NULL,NULL,napi_default,NULL},
-      {"_stats",NULL,hk_stats,NULL,NULL,NULL,napi_default,NULL},`);
+      {"_stats",NULL,hk_stats,NULL,NULL,NULL,napi_default,NULL},
+      ${win ? '{"_identityStats",NULL,hk_identity_stats,NULL,NULL,NULL,napi_default,NULL},' : ""}`);
     writeFileSync(path.join(dir, "hostkit.c"), source);
     const gyp = JSON.parse(readFileSync(path.join(root, "binding.gyp"), "utf8"));
     for (const condition of gyp.targets[0].conditions) condition[1].sources = ["hostkit.c"];

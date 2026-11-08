@@ -606,6 +606,62 @@ static napi_value job_process_ids(napi_env env, napi_callback_info info) {
   }
 }
 
+// 在同一个进程对象句柄上验证 Job 成员关系、创建时间和存活状态。
+static napi_value job_process_identity(napi_env env, napi_callback_info info) {
+  napi_value argv[2];
+  HANDLE job;
+  DWORD pid;
+  if (!get_args(env, info, 2, argv) || !get_handle(env, argv[0], &job) || !get_pid(env, argv[1], &pid))
+    return NULL;
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+  if (!h) {
+    DWORD err = GetLastError();
+    if (err == ERROR_INVALID_PARAMETER) return js_null(env);
+    return throw_win(env, "OpenProcess", err);
+  }
+  const char *op = NULL;
+  DWORD err = ERROR_SUCCESS;
+  BOOL member = FALSE, alive = FALSE, closed;
+  DWORD wait, close_err;
+  FILETIME created, exited, kernel, user;
+  if (!IsProcessInJob(h, job, &member)) {
+    op = "IsProcessInJob";
+    err = GetLastError();
+    goto cleanup;
+  }
+  if (!member) goto cleanup;
+  if (!GetProcessTimes(h, &created, &exited, &kernel, &user)) {
+    op = "GetProcessTimes";
+    err = GetLastError();
+    goto cleanup;
+  }
+  wait = WaitForSingleObject(h, 0);
+  if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) {
+    op = "WaitForSingleObject";
+    err = wait == WAIT_FAILED ? GetLastError() : ERROR_INVALID_DATA;
+    goto cleanup;
+  }
+  alive = wait == WAIT_TIMEOUT;
+
+cleanup:
+  closed = CloseHandle(h);
+  close_err = GetLastError();
+  if (op && !closed) return throw_win_pair(env, op, err, "CloseHandle(process)", close_err);
+  if (op) return throw_win(env, op, err);
+  if (!closed) return throw_win(env, "CloseHandle(process)", close_err);
+  if (!member || !alive) return js_null(env);
+  // 先关闭原生句柄，避免 N-API 失败产生额外的清理路径。
+  char start[32];
+  format_start(&created, start, sizeof(start));
+  napi_value obj, v;
+  CHECK(napi_create_object(env, &obj));
+  CHECK(napi_create_uint32(env, pid, &v));
+  CHECK(napi_set_named_property(env, obj, "pid", v));
+  CHECK(napi_create_string_utf8(env, start, NAPI_AUTO_LENGTH, &v));
+  CHECK(napi_set_named_property(env, obj, "startTime", v));
+  return obj;
+}
+
 static napi_value handle_close(napi_env env, napi_callback_info info) {
   napi_value argv[1];
   HANDLE h;
@@ -1016,6 +1072,7 @@ static napi_value init(napi_env env, napi_value exports) {
     {"jobAssign", NULL, job_assign, NULL, NULL, NULL, napi_default, NULL},
     {"jobTerminate", NULL, job_terminate, NULL, NULL, NULL, napi_default, NULL},
     {"jobProcessIds", NULL, job_process_ids, NULL, NULL, NULL, napi_default, NULL},
+    {"jobProcessIdentity", NULL, job_process_identity, NULL, NULL, NULL, napi_default, NULL},
     {"handleClose", NULL, handle_close, NULL, NULL, NULL, napi_default, NULL},
     {"mutexAcquire", NULL, mutex_acquire, NULL, NULL, NULL, napi_default, NULL},
     {"mutexRelease", NULL, mutex_release, NULL, NULL, NULL, napi_default, NULL},
