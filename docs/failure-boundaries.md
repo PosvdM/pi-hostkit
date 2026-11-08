@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | `localfs.ts:filesystemInfo` | 真实路径解析、逐层 `statSync`、原生 `fsInfo` | 仅 `ENOENT` 上溯；其他错误直接失败，不跨挂载边界借用本地祖先；`test/localfs-faults.test.mjs`。 |
 | `paths.ts:resolveReadToolPath` | 依次查询读取路径与拼写变体 | 未知查询不换成另一个文件；`test/paths-faults.test.mjs`。 |
-| `paths.ts:realPathOrPending` | `realpathSync.native`、`lstatSync`、`readlinkSync` | 权限、I/O 与链接查询错误直接传播，不当成缺失；悬空链接跟随实际目标；`test/paths-faults.test.mjs`、`test/paths.test.mjs`。 |
+| `paths.ts:realPathOrPending` | `realpathSync.native`、`lstatSync`、`readlinkSync` | 权限、I/O 与链接查询错误直接传播，不当成缺失；悬空链接跟随实际目标；首次 ENOENT 后发现非链接目标已存在时仅重试真实路径一次，保留重试原始错误；`test/paths-faults.test.mjs` 用确定性并发创建覆盖文件与目录，`test/paths.test.mjs` 覆盖路径规则。 |
 | `paths.ts:detectCaseSensitivity` | `statSync`、真实路径、`readdirSync`、原始及大小写别名 `lstatSync` | 无法证明不区分大小写就拒绝；不跨设备推断；`test/paths-faults.test.mjs`、`test/paths-case.test.mjs`。 |
 | `fs-probe.ts:pathExistsStrict` | 严格 `statSync` 存在性查询 | 仅 `ENOENT`/`ENODEV` 算缺失；`test/existence-faults.test.mjs`。此规则服务 cgroup 与 gate 恢复，不用于本地磁盘祖先上溯。 |
 | `locate.ts:readPackage`、`installAt` | 包记录读取与 JSON、`realpath`、入口 `stat` | 损坏或缺失候选按定位规则处理；系统查询错误不能伪装成不存在；`test/locate-faults.test.mjs`、`test/locate.test.mjs`。 |
@@ -33,14 +33,14 @@
 | `secrets.ts:writePrivateFile` | 父目录检查、排他创建/重新打开、ACL、写入、`sync`、`close`、最终复查、失败删除 | 仅清理本次创建文件；关闭、删除与原故障保留；最终复查失败也清理；`test/secrets-faults.test.mjs`。 |
 | `gate.ts:readLine` | `readSync` 读取放行行 | `EAGAIN` 有界间隔重试；EOF、EPIPE、权限与 I/O 错误拒绝加载入口；`test/gate-faults.test.mjs`、`test/gate.test.mjs`。 |
 | `rpc.ts` | stdin `write`/回调/`drain`/`end`，stdout data/error/end/close | 失败清理队列、pending、计时器和监听器，收尾失败不能覆盖首错；`test/rpc-faults.test.mjs`、`test/rpc.test.mjs`。 |
-| `proctable.ts:linuxRow`、`bootId` | `/proc/<pid>/stat`、`boot_id` | 只有确认缺失返回 null；截断、格式和 boot 查询失败可见且不缓存失败；`test/process-faults.test.mjs` 的 `proctable-faults.mjs`。 |
+| `proctable.ts:linuxRow`、`bootId` | `/proc/<pid>/stat`、`boot_id` | 只有确认缺失返回 null；空或截断的 stat 最多重读一次，覆盖坏数据后消失、恢复有效、持续损坏及重读权限/I/O 失败；持续损坏保留两次字节长度与有界原文，未知不当成退出；boot 查询失败可见且不缓存失败；`test/process-faults.test.mjs` 的 `proctable-faults.mjs`。 |
 | `proctable.ts:listProcesses` | `/proc` 列举与逐 PID 查询；原生整表查询 | 单 PID 失败保留可读行及错误，快照继续独立分支；`test/process-faults.test.mjs`、`test/snapshot-faults.test.mjs`。 |
 | `proctable.ts:processCommandLine` | `/proc/<pid>/cmdline` 或原生命令行 | 不可读返回未知或抛错，由恢复 fail closed；`test/process-faults.test.mjs`、`test/existence-faults.test.mjs`、原生故障 worker。 |
 | `proctable.ts:signalProcess`、`signalGroupLinux` | pidfd 打开、成员/组长身份复查、pidfd 发信号、`process.kill`、fd 关闭 | 只对身份一致目标发送；只为已约定的不支持错误退路；原始与关闭失败同时保留；`test/process-faults.test.mjs` 的 `proctable-faults.mjs`。 |
 | `snapshots.ts:SnapshotRecords` | 进程表、父身份、逐目标身份、组和单进程信号、退出复查 | 局部失败不取消独立分支或 pi；已知未知身份留在报告；`test/snapshot-faults.test.mjs`、`test/process-faults.test.mjs`、`test/fixtures/capture-fault.mjs`。 |
 | `process.ts` 的 Linux 能力与启动查询 | 控制器/可执行文件探测、`execFile(systemd-run)`、`/proc/<pid>/cgroup` | 不可用只选择有限覆盖的快照模式；启动失败不得放行 gate，不能用能力探测推断进程已退出；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
 | `process.ts:spawnManaged` | `spawn`、初始身份、Job 创建与分配、RPC/Managed 构造、门闩放行及失败回收 | 启动失败关闭/销毁 gate 输入，收集 kill 抛错、false 与 error 事件，2 秒有界确认退出；未知时 cause 保留 PID/身份/错误，Job 不重放关闭；清理错误不覆盖首错；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
-| `process.ts:Managed.runStop` | abort、关闭输入、SIGTERM、Job 终止/列举/逐成员身份/关闭、最终 pi 复查 | 每阶段故障进入报告，Job 查询未知使用容器哨兵；句柄始终进入关闭路径；`test/process-faults.test.mjs`。 |
+| `process.ts:Managed.runStop` | abort、关闭输入、SIGTERM、Job 终止/列举/逐成员身份/关闭、最终 pi 复查 | 每阶段故障进入报告，Job 查询未知使用容器哨兵；停止前及最终终止前记录 Job 身份，成员离开列表后仍按身份独立复查，alive 或未知不得因空列表丢弃；句柄始终进入关闭路径；`test/process-faults.test.mjs` 注入列表已空而身份延迟退出、持续存活、查询失败及 PID 复用，`test/process.test.mjs` 在 Windows 重复核对 stop 返回后的退出可见性。 |
 | `process.ts:stopByIdentity` | 根身份、Windows 快照/逐目标终止、recorded scope 查询、SIGTERM、最终停止 | 单目标失败不跳过其余目标；未知身份与快照失败可见；`test/process-faults.test.mjs`、`test/existence-faults.test.mjs`。 |
 | `cgroups.ts:cgroupPopulated` | `cgroup.events`、目录严格存在性 | 文件缺失须确认整个目录已回收才算空；格式与查询失败均未知；`test/cgroup-faults.test.mjs`。 |
 | `cgroups.ts:stopCgroup` 的列举 | 各层 `cgroup.procs`、`readdir`、缺失目录查询、逐 PID 身份 | 一棵子树失败不丢其他子树或已知身份；未知范围加哨兵；`test/cgroup-faults.test.mjs`、`test/cgroup-subtree.test.mjs`。 |
