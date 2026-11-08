@@ -12,7 +12,7 @@ function stat(pid = 100, ticks = "10", group = 100) {
   return `${pid} (带空格及 ) 的命令) ${fields.join(" ")}`;
 }
 function reset() {
-  state = { files: new Map([["/proc/100/stat", stat()]]), entries: ["100"], boot: "boot", calls: [] };
+  state = { files: new Map([["/proc/100/stat", stat()]]), entries: ["100"], boot: "boot", calls: [], readCalls: [] };
 }
 mock.module("node:fs", { namedExports: {
   readdirSync: (dir) => {
@@ -21,6 +21,7 @@ mock.module("node:fs", { namedExports: {
     return state.entries;
   },
   readFileSync: (file) => {
+    state.readCalls.push(file);
     if (state.read) {
       const result = state.read(file);
       if (result !== undefined) return result;
@@ -46,6 +47,97 @@ mock.method(process, "kill", (pid, signal) => {
   return true;
 });
 const load = () => import(`../../dist/proctable.js?fault=${++serial}`);
+const statReadCount = () => state.readCalls.filter((file) => file === "/proc/100/stat").length;
+function statReadSequence(...results) {
+  let index = 0;
+  state.read = (file) => {
+    if (file !== "/proc/100/stat") return;
+    assert.ok(index < results.length, "stat 读取次数不得超过指定序列");
+    const result = results[index++];
+    if (result instanceof Error) throw result;
+    return result;
+  };
+}
+
+for (const [kind, initial] of [["空内容", ""], ["截断内容", "100 (命令) S 1 100"]]) {
+  for (const code of ["ENOENT", "ESRCH"]) {
+    test(`stat ${kind}后重读 ${code} 返回 null`, async () => {
+      reset();
+      const { processInfo } = await load();
+      statReadSequence(initial, fault(code));
+      assert.equal(processInfo(100), null);
+      assert.equal(statReadCount(), 2);
+      assert.ok(!state.readCalls.some((file) => file.includes("boot_id")));
+    });
+  }
+
+  test(`stat ${kind}后重读有效内容使用新身份并缓存 boot ID`, async () => {
+    reset();
+    const { processInfo } = await load();
+    const recovered = stat(100, "42", 202);
+    statReadSequence(initial, recovered);
+    const expected = { pid: 100, ppid: 1, pgid: 202, startTime: "boot:42", zombie: false };
+    assert.deepEqual(processInfo(100), expected);
+    assert.equal(statReadCount(), 2);
+    state.read = undefined;
+    state.files.set("/proc/100/stat", recovered);
+    state.boot = "另一次启动";
+    assert.deepEqual(processInfo(100), expected);
+    assert.equal(statReadCount(), 3);
+    assert.equal(state.readCalls.filter((file) => file.includes("boot_id")).length, 1);
+  });
+
+  for (const code of ["EACCES", "EPERM", "EIO", "ENOTDIR"]) {
+    test(`stat ${kind}后重读 ${code} 传播原错误并保留首次解析故障`, async () => {
+      reset();
+      const { processInfo } = await load();
+      const existingCause = new Error("底层读取原因");
+      const readError = Object.assign(new Error("stat 重读失败", { cause: existingCause }), { code });
+      statReadSequence(initial, readError);
+      assert.throws(() => processInfo(100), (error) => {
+        assert.equal(error, readError);
+        assert.equal(error.code, code);
+        assert.equal(error.cause, existingCause);
+        assert.equal(error.statParseError.code, "EHOSTKIT_PROC");
+        assert.deepEqual(error.statParseError.statReads, [{ byteLength: Buffer.byteLength(initial), excerpt: initial }]);
+        return true;
+      });
+      assert.equal(statReadCount(), 2);
+      assert.ok(!state.readCalls.some((file) => file.includes("boot_id")));
+    });
+  }
+}
+
+for (const [kind, initial, retry] of [
+  ["持续空内容", "", ""],
+  ["持续截断内容", "100 (命令) S 1 100", "100 (命令) S 1"],
+  ["超长坏内容", `首${"坏".repeat(300)}首次尾部`, `次${"错".repeat(400)}重读尾部`],
+]) {
+  test(`stat ${kind}在两次读取后保留有限诊断并抛错`, async () => {
+    reset();
+    const { processInfo } = await load();
+    statReadSequence(initial, retry);
+    const expected = [initial, retry].map((value) => ({ byteLength: Buffer.byteLength(value), excerpt: value.slice(0, 256) }));
+    assert.throws(() => processInfo(100), (error) => {
+      assert.equal(error.code, "EHOSTKIT_PROC");
+      assert.deepEqual(error.statReads, expected);
+      assert.ok(error.statReads.every(({ excerpt }) => excerpt.length <= 256));
+      assert.ok(error.message.includes(JSON.stringify(expected)));
+      assert.equal(error.cause.code, "EHOSTKIT_PROC");
+      assert.deepEqual(error.cause.statReads, expected.slice(0, 1));
+      if (kind === "超长坏内容") {
+        assert.ok(!error.message.includes("首次尾部"));
+        assert.ok(!error.message.includes("重读尾部"));
+        assert.ok(!error.cause.message.includes("首次尾部"));
+        assert.equal(error.statReads[0].excerpt.length, 256);
+        assert.equal(error.statReads[1].excerpt.length, 256);
+      }
+      return true;
+    });
+    assert.equal(statReadCount(), 2);
+    assert.ok(!state.readCalls.some((file) => file.includes("boot_id")));
+  });
+}
 
 for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM", "EIO", "ENOTDIR"]) {
   test(`processInfo 的 ${code} 只在确认不存在时返回 null`, async () => {
@@ -54,6 +146,7 @@ for (const code of ["ENOENT", "ESRCH", "EACCES", "EPERM", "EIO", "ENOTDIR"]) {
     state.read = (file) => { if (file === "/proc/100/stat") throw fault(code); };
     if (["ENOENT", "ESRCH"].includes(code)) assert.equal(processInfo(100), null);
     else assert.throws(() => processInfo(100), { code });
+    assert.equal(statReadCount(), 1);
   });
 }
 
@@ -65,6 +158,7 @@ test("stat 损坏的启动时间、父 PID、进程组和状态都不能产生�
     fields[index] = value;
     state.files.set("/proc/100/stat", `100 (命令) ${fields.join(" ")}`);
     assert.throws(() => processInfo(100), { code: "EHOSTKIT_PROC" });
+    assert.equal(statReadCount(), 2);
   }
 });
 
@@ -77,6 +171,10 @@ test("boot ID 读取失败或空内容向上传播，成功结果才缓存", asy
   assert.throws(() => processInfo(100), { code: "EHOSTKIT_PROC" });
   state.boot = "boot";
   assert.equal(processInfo(100).startTime, "boot:10");
+  state.boot = "另一次启动";
+  assert.equal(processInfo(100).startTime, "boot:10");
+  assert.equal(state.readCalls.filter((file) => file.includes("boot_id")).length, 3);
+  assert.equal(statReadCount(), 4);
 });
 
 test("listProcesses 保留可读行并报告每个坏行，消失行不算故障", async () => {

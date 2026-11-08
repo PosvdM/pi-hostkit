@@ -29,6 +29,26 @@ function isAbsent(error: unknown): boolean {
   return code === "ENOENT" || code === "ESRCH";
 }
 
+function linuxStatFields(stat: string): string[] | null {
+  const close = stat.lastIndexOf(")");
+  const fields = close < 0 ? [] : stat.slice(close + 2).split(" ");
+  // fields[0] 对应 stat 的第 3 字段，fields[19] 对应启动时钟计数。
+  const ticks = fields[19];
+  if (!ticks || !/^\d+$/.test(ticks) || !/^[A-Za-z]$/.test(fields[0] ?? "") ||
+      ![fields[1], fields[2]].every((value) => value !== undefined && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)))) {
+    return null;
+  }
+  return fields;
+}
+
+function linuxStatParseError(pid: number, samples: string[], cause?: Error): Error {
+  // 只保留每次读取的字节长度及前 256 个 UTF-16 字符，避免错误持有完整原文。
+  const statReads = samples.map((stat) => ({ byteLength: Buffer.byteLength(stat, "utf8"), excerpt: stat.slice(0, 256) }));
+  return Object.assign(new Error(`无法解析 /proc/${pid}/stat；读取诊断：${JSON.stringify(statReads)}`, { cause }), {
+    code: "EHOSTKIT_PROC", statReads,
+  });
+}
+
 /**
  * Linux: `/proc/<pid>/stat` field 22 (start time in clock ticks since boot),
  * prefixed with the boot id. The boot id changes on every reboot, so a
@@ -44,14 +64,22 @@ function linuxRow(pid: number): ProcessRow | null {
     if (isAbsent(error)) return null;
     throw error;
   }
-  const close = stat.lastIndexOf(")");
-  const fields = close < 0 ? [] : stat.slice(close + 2).split(" ");
-  // fields[0] is field 3 (state); field N is fields[N - 3].
-  const ticks = fields[19];
-  if (!ticks || !/^\d+$/.test(ticks) || !/^[A-Za-z]$/.test(fields[0] ?? "") ||
-      ![fields[1], fields[2]].every((value) => value !== undefined && /^\d+$/.test(value) && Number.isSafeInteger(Number(value)))) {
-    throw Object.assign(new Error(`cannot parse /proc/${pid}/stat`), { code: "EHOSTKIT_PROC" });
+  let fields = linuxStatFields(stat);
+  if (!fields) {
+    const firstFailure = linuxStatParseError(pid, [stat]);
+    let retry: string;
+    // 解析失败不能证明退出；同一路径只重读一次，以读取错误确认进程消失。
+    try {
+      retry = readFileSync(`/proc/${pid}/stat`, "utf8");
+    } catch (error) {
+      if (isAbsent(error)) return null;
+      if (error instanceof Error) Object.assign(error, { statParseError: firstFailure });
+      throw error;
+    }
+    fields = linuxStatFields(retry);
+    if (!fields) throw linuxStatParseError(pid, [stat, retry], firstFailure);
   }
+  const ticks = fields[19];
   const state = fields[0];
   return {
     pid,
