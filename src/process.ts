@@ -241,7 +241,7 @@ function rowsToLeftovers(rows: { pid: number; startTime: string }[]): StopReport
 
 type Mode = { kind: "job"; job: number } | { kind: "cgroup"; dir: string } | { kind: "snapshot" };
 
-/** Job 枚举与进程退出是独立证据；成员离开列表后仍须核对原身份。 */
+/** Job 归属与身份须绑定同一句柄；已知成员离开列表后仍须核对原身份。 */
 class JobRecords {
   private readonly known = new Map<string, StopReport["leftovers"][number]>();
   private readonly failures = new Set<string>();
@@ -273,12 +273,9 @@ class JobRecords {
     }
     for (const pid of new Set(pids)) {
       try {
-        const row = processInfo(pid);
-        if (row && !row.zombie) {
-          const id = { pid, startTime: row.startTime };
-          this.known.set(this.key(id), id);
-        }
-        // 可读查询消除该 PID 的未知占位，不改写其他创建时间的身份。
+        const id = nativeFn("jobProcessIdentity")(this.job, pid);
+        if (id) this.known.set(this.key(id), id);
+        // 同句柄查询确认成员身份、退出或不属于本 Job 后，消除未知占位。
         this.known.delete(`${pid}:`);
       } catch (error) {
         const id = { pid, startTime: "" };
@@ -289,14 +286,12 @@ class JobRecords {
     // 即使枚举失败，也独立核对每个身份；未知结果不能充当退出证据。
     for (const [key, id] of [...this.known]) {
       try {
-        const row = processInfo(id.pid);
         if (!id.startTime) {
-          if (row && !row.zombie) {
-            const resolved = { pid: id.pid, startTime: row.startTime };
-            this.known.set(this.key(resolved), resolved);
-          }
+          // 未知占位只能通过绑定 Job 的查询解析，不能收录复用 PID 的无关进程。
+          const resolved = nativeFn("jobProcessIdentity")(this.job, id.pid);
+          if (resolved) this.known.set(this.key(resolved), resolved);
           this.known.delete(key);
-        } else if (!matches(row, id)) {
+        } else if (!matches(processInfo(id.pid), id)) {
           this.known.delete(key);
         }
       } catch (error) {

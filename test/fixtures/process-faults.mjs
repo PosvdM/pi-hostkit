@@ -47,6 +47,11 @@ mock.module(new URL("../../dist/native.js", import.meta.url), { namedExports: {
         if (state.terminateJob) return state.terminateJob();
         state.live.clear(); state.pids = []; return;
       case "jobProcessIds": return state.jobQuery ? state.jobQuery() : state.pids;
+      case "jobProcessIdentity": {
+        if (state.jobIdentity) return state.jobIdentity(...args);
+        const member = query(args[1]);
+        return member && !member.zombie ? { pid: member.pid, startTime: member.startTime } : null;
+      }
       case "handleClose":
         state.closeCount++;
         if (state.close) return state.close();
@@ -397,6 +402,83 @@ test("Job 同一 PID 的新身份不能覆盖仍未知的旧身份", async () =>
   const report = await proc.stop(fast);
   assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }, { pid: 101, startTime: "202" }]);
   assert.ok(failed(report, "旧身份退出未知"));
+  assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
+});
+
+test("Job 首次列举与登记之间 PID 复用时不收录无关身份", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  const reused = { ...row(101), startTime: "202" };
+  let lists = 0, memberships = 0;
+  state.jobQuery = () => {
+    if (++lists === 1) {
+      // 列举保留旧 PID；原成员在打开固定句柄前退出，新进程复用该 PID。
+      state.live.set(101, reused);
+      state.pids = [];
+      return [101];
+    }
+    return [];
+  };
+  state.jobIdentity = (job, pid) => {
+    assert.equal(job, 42);
+    assert.equal(pid, 101);
+    memberships++;
+    return null; // 固定句柄指向的新进程不属于该 Job。
+  };
+  state.terminateJob = () => {};
+  const report = await proc.stop(fast);
+  assert.equal(memberships, 1);
+  assert.deepEqual(report.leftovers, []);
+  assert.equal(report.steps.find((step) => step.step === "verify").ok, true);
+  assert.equal(await isSameProcess(reused), "alive");
+  assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
+  assert.equal(state.closeCount, 1);
+});
+
+for (const resolvesToMember of [false, true]) {
+  test(`Job 未知占位通过绑定归属的查询解析（仍是成员=${resolvesToMember}）`, async () => {
+    reset();
+    state.pids = [101];
+    state.live.set(101, row(101));
+    const proc = await spawn();
+    const replacement = { ...row(101), startTime: "202" };
+    let bindings = 0;
+    state.jobIdentity = (job, pid) => {
+      assert.equal(job, 42);
+      assert.equal(pid, 101);
+      if (++bindings === 1) {
+        state.pids = [];
+        if (!resolvesToMember) state.live.set(101, replacement);
+        throw fault("首次归属查询失败");
+      }
+      return resolvesToMember ? { pid, startTime: "101" } : null;
+    };
+    state.terminateJob = () => {};
+    const report = await proc.stop(fast);
+    assert.equal(bindings, 2, "未知占位必须重查 Job 归属，不能仅凭进程表登记");
+    assert.deepEqual(report.leftovers, resolvesToMember ? [{ pid: 101, startTime: "101" }] : []);
+    assert.ok(failed(report, "首次归属查询失败"));
+    assert.equal(await isSameProcess(resolvesToMember ? row(101) : replacement), "alive");
+    assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
+    assert.equal(state.closeCount, 1);
+  });
+}
+
+test("Job 已登记身份后再次列举命中无关复用 PID 时不登记新身份", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  const reused = { ...row(101), startTime: "202" };
+  let replaced = false;
+  state.jobIdentity = (_job, pid) => replaced ? null : { pid, startTime: "101" };
+  state.eof = () => { replaced = true; state.live.set(101, reused); };
+  state.terminateJob = () => { state.pids = []; };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, []);
+  assert.equal(await isSameProcess(reused), "alive");
   assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
 });
 

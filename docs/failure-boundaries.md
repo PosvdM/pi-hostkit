@@ -40,7 +40,7 @@
 | `snapshots.ts:SnapshotRecords` | 进程表、父身份、逐目标身份、组和单进程信号、退出复查 | 局部失败不取消独立分支或 pi；已知未知身份留在报告；`test/snapshot-faults.test.mjs`、`test/process-faults.test.mjs`、`test/fixtures/capture-fault.mjs`。 |
 | `process.ts` 的 Linux 能力与启动查询 | 控制器/可执行文件探测、`execFile(systemd-run)`、`/proc/<pid>/cgroup` | 不可用只选择有限覆盖的快照模式；启动失败不得放行 gate，不能用能力探测推断进程已退出；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
 | `process.ts:spawnManaged` | `spawn`、初始身份、Job 创建与分配、RPC/Managed 构造、门闩放行及失败回收 | 启动失败关闭/销毁 gate 输入，收集 kill 抛错、false 与 error 事件，2 秒有界确认退出；未知时 cause 保留 PID/身份/错误，Job 不重放关闭；清理错误不覆盖首错；`test/process-faults.test.mjs`、`test/process.test.mjs`。 |
-| `process.ts:Managed.runStop` | abort、关闭输入、SIGTERM、Job 终止/列举/逐成员身份/关闭、最终 pi 复查 | 每阶段故障进入报告，Job 查询未知使用容器哨兵；停止前及最终终止前记录 Job 身份，成员离开列表后仍按身份独立复查，alive 或未知不得因空列表丢弃；句柄始终进入关闭路径；`test/process-faults.test.mjs` 注入列表已空而身份延迟退出、持续存活、查询失败及 PID 复用，`test/process.test.mjs` 在 Windows 重复核对 stop 返回后的退出可见性。 |
+| `process.ts:JobRecords`、`Managed.runStop` | abort、关闭输入、SIGTERM、Job 终止/列举/绑定归属的身份查询/关闭、最终 pi 复查 | 每阶段故障进入报告，Job 查询未知使用容器哨兵；候选 PID 首次登记和未知占位解析均调用 `jobProcessIdentity`，只收录同句柄确认属于 Job 的存活身份，失败保留未知占位；已知成员离开列表后仍按身份独立复查，alive 或未知不得因空列表丢弃；句柄始终进入关闭路径；`test/process-faults.test.mjs` 注入首次登记前、未知占位解析时及再次列举时的无关 PID 复用，并覆盖列表已空而身份延迟退出、持续存活和查询失败；`test/process.test.mjs` 在 Windows 重复核对 stop 返回后的退出可见性。 |
 | `process.ts:stopByIdentity` | 根身份、Windows 快照/逐目标终止、recorded scope 查询、SIGTERM、最终停止 | 单目标失败不跳过其余目标；未知身份与快照失败可见；`test/process-faults.test.mjs`、`test/existence-faults.test.mjs`。 |
 | `cgroups.ts:cgroupPopulated` | `cgroup.events`、目录严格存在性 | 文件缺失须确认整个目录已回收才算空；格式与查询失败均未知；`test/cgroup-faults.test.mjs`。 |
 | `cgroups.ts:stopCgroup` 的列举 | 各层 `cgroup.procs`、`readdir`、缺失目录查询、逐 PID 身份 | 一棵子树失败不丢其他子树或已知身份；未知范围加哨兵；`test/cgroup-faults.test.mjs`、`test/cgroup-subtree.test.mjs`。 |
@@ -78,6 +78,7 @@
 | `jobAssign` | `open_live`、身份比较、`AssignProcessToJobObject` | 任一查询、身份或分配失败拒绝并关闭临时句柄。 |
 | `jobTerminate` | `TerminateJobObject` | 系统失败交给停止报告。 |
 | `jobProcessIds` | `QueryInformationJobObject`、MORE_DATA 扩容、已分配数与返回数核对 | 持续扩容或成功但截断的结果不能当作完整或空 Job。 |
+| `jobProcessIdentity` | 同一个固定进程句柄上的 `IsProcessInJob`、`GetProcessTimes`、`WaitForSingleObject`，以及打开与关闭 | 明确不存在、非成员或已退出返回 null；查询失败不能返回有效身份或伪造缺失；原生故障 worker 验证归属、创建时间与等待使用同一句柄，非成员不登记，失败路径回收临时句柄，关闭错误可见。 |
 | `handleClose` | `CloseHandle` | 关闭错误可见。 |
 | `current_user_sid`、`userSid` | `OpenProcessToken`、两阶段 `GetTokenInformation`、SID 复制、`ConvertSidToStringSidW` | 各查询与分配失败抛错，token、SID 与转换缓冲回收，不能返回 null SID。 |
 | `user_mutex`、`mutexAcquire` | SID、`SetEntriesInAclW`、安全描述符初始化/owner/DACL/control、`CreateMutexW`、`GetSecurityInfo`、owner 验证、`WaitForSingleObject` | 任一步失败拒绝，清理 ACL/SD/SID/句柄；取得所有权后结果构造失败也释放所有权。 |
