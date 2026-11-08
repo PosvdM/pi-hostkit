@@ -193,6 +193,35 @@ describe("spawnManaged", () => {
     await until(() => !pidExists(escaped), 3_000);
   });
 
+  test("Windows 多次停止真实 pi 后立即核对已知后代身份", { skip: !isWin, timeout: 180_000 }, async () => {
+    for (let round = 0; round < 5; round++) {
+      const f = await fixture();
+      const pidFile = path.join(f.root, `job-descendant-${round}.pid`);
+      await f.setScript({
+        turns: [{ segments: [{ type: "toolCall", name: "bash", arguments: { command: escapingCommand(pidFile) } }] }],
+      });
+      const proc = await spawnManaged({ argv: await piArgv(), ...spec(f) });
+      let descendant;
+      try {
+        const started = waitForEvent(proc.rpc, (event) => event.type === "tool_execution_start");
+        const accepted = await proc.rpc.send({ type: "prompt", message: "执行命令" }, { timeoutMs: 20_000 });
+        assert.equal(accepted.success, true);
+        await started;
+        await until(() => existsSync(pidFile) && readFileSync(pidFile, "utf8").trim().length > 0, 20_000);
+        const pid = Number(readFileSync(pidFile, "utf8").trim());
+        const row = processInfo(pid);
+        assert.ok(row && !row.zombie, "停止之前必须记录仍在运行的后代身份");
+        descendant = { pid, startTime: row.startTime };
+      } finally {
+        const report = await proc.stop({ abortTimeoutMs: 0, graceMs: 0, termGraceMs: 0 });
+        // 此处不得等待；报告返回时，已知后代必须已经退出。
+        if (descendant) assert.equal(await isSameProcess(descendant), "gone", `第 ${round + 1} 轮后代仍存活`);
+        assert.equal(await isSameProcess(proc.identity), "gone");
+        assert.deepEqual(report.leftovers, [], JSON.stringify(report, null, 2));
+      }
+    }
+  });
+
   test("explicit undefined stop options keep the defaults; invalid values are rejected", async () => {
     const f = await fixture();
     const proc = await spawnManaged({ argv: await piArgv(), ...spec(f) });

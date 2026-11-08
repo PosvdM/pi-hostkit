@@ -110,7 +110,7 @@ const failed = (report, text) => report.steps.some((step) => !step.ok && step.de
 const timeout = globalThis.setTimeout;
 mock.method(globalThis, "setTimeout", (fn, ms, ...args) => timeout(fn, Math.min(ms, 1), ...args));
 let clock = 0;
-mock.method(Date, "now", () => (clock += 1_000));
+mock.method(Date, "now", () => (clock += state?.clockStep ?? 1_000));
 
 test("spawn 事件之前不查询身份或创建 Job，事件到达后才返回 Managed", async () => {
   reset();
@@ -221,7 +221,9 @@ test("Job 单个 PID 查询失败不跳过其他成员，已知身份不丢失",
     return state.live.get(pid) ?? null;
   };
   const report = await proc.stop(fast);
-  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }, { pid: 102, startTime: "102" }]);
+  assert.deepEqual(report.leftovers, [
+    { pid: 101, startTime: "101" }, { pid: 102, startTime: "102" }, { pid: 101, startTime: "" },
+  ]);
   assert.ok(failed(report, "成员查询失败"));
 });
 
@@ -234,6 +236,181 @@ test("Job 成员第一次查询失败保留未知 PID，不能当作 gone", asyn
   const report = await proc.stop(fast);
   assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "" }]);
   assert.ok(failed(report, "身份不可读"));
+});
+
+for (const action of ["abort", "eof", "terminateJob"]) {
+  test(`Job 在 ${action} 前记录成员，列表立即空后仍等待身份连续存活至退出`, async () => {
+    reset();
+    state.clockStep = 100;
+    state.pids = [101];
+    state.live.set(101, row(101));
+    const proc = await spawn();
+    proc.release();
+    let disappearing = false;
+    let before = 0, after = 0;
+    state.query = (pid) => {
+      if (pid === 101) {
+        if (!disappearing) before++;
+        else if (++after > 5) state.live.delete(101);
+      }
+      return state.live.get(pid) ?? null;
+    };
+    state[action] = () => {
+      assert.ok(before > 0, "退出动作之前必须读取成员身份");
+      disappearing = true;
+      state.pids = [];
+      return { success: true };
+    };
+    // TerminateJobObject 替身保留进程对象尚未标记为退出的成员。
+    if (action !== "terminateJob") state.terminateJob = () => {};
+    const report = await proc.stop(fast);
+    assert.ok(after > 5, "stop 返回之前必须独立确认成员退出");
+    assert.deepEqual(report.leftovers, []);
+    assert.equal(await isSameProcess({ pid: 101, startTime: "101" }), "gone");
+    assert.equal(state.closeCount, 1);
+  });
+}
+
+test("Job 列表空但已知成员持续存活时有界等待并保留身份", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  state.terminateJob = () => { state.pids = []; };
+  let checks = 0;
+  state.query = (pid) => { if (pid === 101) checks++; return state.live.get(pid) ?? null; };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }]);
+  assert.ok(checks >= 7 && checks < 30);
+  assert.equal(report.steps.find((step) => step.step === "verify").ok, false);
+  assert.equal(state.closeCount, 1);
+});
+
+for (const unreadable of [false, true]) {
+  test(`Job 枚举持续失败仍独立核对已知身份（身份不可读=${unreadable}）`, async () => {
+    reset();
+    state.pids = [101];
+    state.live.set(101, row(101));
+    const proc = await spawn();
+    let terminated = false, independent = 0;
+    state.terminateJob = () => { terminated = true; };
+    state.jobQuery = () => {
+      if (terminated) throw fault("终止后枚举失败");
+      return state.pids;
+    };
+    state.query = (pid) => {
+      if (pid === 101 && terminated) {
+        independent++;
+        if (unreadable) throw fault("终止后身份失败");
+        return null;
+      }
+      return state.live.get(pid) ?? null;
+    };
+    const report = await proc.stop(fast);
+    assert.ok(independent > 0);
+    assert.equal(report.leftovers.some((id) => id.pid === 101), unreadable);
+    assert.ok(report.leftovers.some((id) => id.pid === 0));
+    assert.ok(failed(report, "终止后枚举失败"));
+    if (unreadable) assert.ok(failed(report, "终止后身份失败"));
+    assert.equal(state.closeCount, 1);
+  });
+}
+
+test("Job 列表空且已知身份查询失败时保留原创建时间", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  let terminated = false;
+  state.terminateJob = () => { terminated = true; state.pids = []; };
+  state.query = (pid) => {
+    if (pid === 101 && terminated) throw fault("成员退出未知");
+    return state.live.get(pid) ?? null;
+  };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }]);
+  assert.ok(failed(report, "成员退出未知"));
+});
+
+test("Job 身份暂时不可读后可由独立查询恢复，不因旧错误锁死", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  let reads = 0;
+  state.query = (pid) => {
+    if (pid === 101 && ++reads <= 3) throw fault("成员暂时不可读");
+    return state.live.get(pid) ?? null;
+  };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, []);
+  assert.ok(failed(report, "成员暂时不可读"));
+  assert.ok(state.calls.some(([name]) => name === "jobTerminate"));
+});
+
+test("Job 在 abort 期间出现的新成员须在关闭输入前记录", async () => {
+  reset();
+  const proc = await spawn();
+  proc.release();
+  state.abort = () => {
+    state.pids = [101];
+    state.live.set(101, row(101));
+    return { success: true };
+  };
+  let reads = 0;
+  state.query = (pid) => { if (pid === 101) reads++; return state.live.get(pid) ?? null; };
+  state.eof = () => {
+    assert.ok(reads > 0, "关闭输入前须记录 abort 期间出现的新成员");
+    state.pids = [];
+  };
+  state.terminateJob = () => {};
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }]);
+});
+
+test("Job 终止前和等待期间继续收集成员，消失后仍保留可读身份", async () => {
+  reset();
+  const proc = await spawn();
+  state.eof = () => { state.pids = [101]; state.live.set(101, row(101)); };
+  let terminated = false, lists = 0;
+  state.terminateJob = () => { terminated = true; state.live.set(102, row(102)); };
+  state.jobQuery = () => terminated ? (++lists === 1 ? [102] : []) : state.pids;
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }, { pid: 102, startTime: "102" }]);
+});
+
+test("Job 同一 PID 的新身份不能覆盖仍未知的旧身份", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  let generation = 0, checks = 0;
+  state.eof = () => { generation = 1; };
+  state.terminateJob = () => { generation = 2; state.pids = []; };
+  state.query = (pid) => {
+    if (pid !== 101) return state.live.get(pid) ?? null;
+    if (generation === 0) return row(101);
+    // 终止前枚举读到新身份，随后旧身份的独立查询失败。
+    if (generation === 1 && ++checks === 1) return { ...row(101), startTime: "202" };
+    throw fault("旧身份退出未知");
+  };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, [{ pid: 101, startTime: "101" }, { pid: 101, startTime: "202" }]);
+  assert.ok(failed(report, "旧身份退出未知"));
+  assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
+});
+
+test("Job 列表空后 PID 被无关进程复用时确认旧身份退出，不终止新身份", async () => {
+  reset();
+  state.pids = [101];
+  state.live.set(101, row(101));
+  const proc = await spawn();
+  const reused = { ...row(101), startTime: "202" };
+  state.terminateJob = () => { state.pids = []; state.live.set(101, reused); };
+  const report = await proc.stop(fast);
+  assert.deepEqual(report.leftovers, []);
+  assert.equal(await isSameProcess(reused), "alive");
+  assert.ok(!state.calls.some(([name]) => name === "terminateProcess"));
 });
 
 test("Job 终止与句柄关闭同时失败都写入报告", async () => {
