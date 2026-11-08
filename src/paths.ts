@@ -132,8 +132,8 @@ export function realPathOrPending(target: string, depth = 0): string {
     const link = readlinkSync(target);
     return realPathOrPending(path.resolve(path.dirname(target), link), depth + 1);
   }
-  // Exists but cannot be resolved (for example a component is a regular file).
-  throw Object.assign(new Error(`Cannot resolve path: ${target}`), { code: "ENOTDIR" });
+  // 目标可能在首次解析与 lstat 之间创建；仅重试一次，失败时原样传播错误。
+  return realpathSync.native(target);
 }
 
 /** Read-only probe on the nearest existing directory's device; no native addon or probe files. */
