@@ -88,14 +88,17 @@ describe("local file system", () => {
 });
 
 describe("locatePi", () => {
-  test("version range is >=1.5.0 <1.6.0 without prereleases", () => {
-    for (const v of ["1.5.0", "1.5.9", "1.5.12"]) assert.equal(isSupportedPiVersion(v), true, v);
-    for (const v of ["1.4.9", "1.6.0", "2.0.0", "1.5.0-rc.1", "1.5", ""]) assert.equal(isSupportedPiVersion(v), false, v);
+  test("version range is >=1.5.0 <1.7.0 without prereleases", () => {
+    for (const v of ["1.5.0", "1.5.9", "1.5.12", "1.6.0", "1.6.9", "1.6.12"]) assert.equal(isSupportedPiVersion(v), true, v);
+    for (const v of ["1.4.9", "1.7.0", "1.10.0", "2.0.0", "1.5.0-rc.1", "1.6.1-beta.1", "1.6", ""]) {
+      assert.equal(isSupportedPiVersion(v), false, v);
+    }
   });
 
   test("piPath accepts the package directory or cli.js", async () => {
     const pi = await piInstall();
-    assert.equal(pi.supported, true, `tests need pi 1.5.x, found ${pi.version}`);
+    assert.equal(pi.supported, true, `tests need pi 1.5.x or 1.6.x, found ${pi.version}`);
+    if (process.env.HOSTKIT_TEST_PI_VERSION) assert.equal(pi.version, process.env.HOSTKIT_TEST_PI_VERSION);
     const byDir = await locatePi({ piPath: pi.packageDir });
     const byCli = await locatePi({ piPath: pi.cliEntry });
     assert.deepEqual(byDir, pi);

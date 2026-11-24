@@ -3,10 +3,10 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// Path rules mirror pi 1.5.0 so that a path checked here is the file pi opens:
-// dist/utils/paths.js (normalizePath, resolvePath, normalizeWindowsShellPath)
-// and dist/core/tools/path-utils.js (resolveToCwd, resolveReadPath).
-// test/paths.test.mjs pins the behaviour; run it before supporting a new pi version.
+// 路径规则照搬 pi 的 dist/utils/paths.js（normalizePath、resolvePath、
+// normalizeWindowsShellPath）和 dist/core/tools/path-utils.js（resolveToCwd、
+// resolveReadPath），这里检查过的路径就是 pi 实际打开的文件。这两个文件在 pi 1.5.0
+// 和 1.6.0 中相同。test/paths.test.mjs 与所装 pi 逐项比对，支持新的 pi 版本前先跑它。
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 const NARROW_NO_BREAK_SPACE = "\u202F";
