@@ -11,20 +11,25 @@ permissions:
 
 jobs:
   test:
-    name: test (${{ matrix.os }}, ${{ matrix.containment }})
+    name: test (${{ matrix.os }}, pi ${{ matrix.pi }}, ${{ matrix.containment }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        containment: [auto]
-        include:
-          # Linux 的第二轮覆盖快照退路，不使用 cgroup scope。
-          - os: ubuntu-latest
+        # 支持范围内的每个次版本各测一个；差分测试对照所装 pi 的内部模块。
+        pi: ["1.5.0", "1.6.0"]
+        # Linux 的第二轮覆盖快照退路，不使用 cgroup scope。
+        containment: [auto, snapshot]
+        exclude:
+          - os: macos-latest
+            containment: snapshot
+          - os: windows-latest
             containment: snapshot
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     env:
       HOSTKIT_TEST_CONTAINMENT: ${{ matrix.containment }}
+      HOSTKIT_TEST_PI_VERSION: ${{ matrix.pi }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -32,8 +37,8 @@ jobs:
           node-version: 24
           cache: npm
       - run: npm ci
-      - name: Install pi 1.5.0
-        run: npm install -g @earendil-works/pi-coding-agent@1.5.0
+      - name: Install pi ${{ matrix.pi }}
+        run: npm install -g @earendil-works/pi-coding-agent@${{ matrix.pi }}
       - name: Start a user systemd instance (Linux cgroup v2 scopes)
         if: runner.os == 'Linux'
         run: |
