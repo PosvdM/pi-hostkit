@@ -29,7 +29,7 @@ pi-hostkit 封装托管 [pi](https://www.npmjs.com/package/@earendil-works/pi-co
 
 - Windows、macOS、Linux。CI 测试的是 x64 的 Linux、Windows 和 Apple 芯片的 macOS；预编译模块覆盖 linux x64/arm64、darwin arm64/x64、win32 x64/arm64。
 - Node.js 24 及以上。
-- pi 1.5.x（`>=1.5.0 <1.6.0`，不含预发布版本）。
+- pi 1.5.x 和 1.6.x（`>=1.5.0 <1.7.0`，不含预发布版本）。
 - Linux 上使用 cgroup 模式需要 cgroup v2 和当前用户的 systemd 实例（`systemd-run --user --scope` 可用）；不满足时自动使用快照模式。
 
 ## 安装
@@ -119,7 +119,7 @@ await lock.release(); // 再次核对 pi 已退出；核对或写记录失败时
 ```sh
 npm install      # 依赖、原生模块、dist/
 npm run build    # 只重新编译 TypeScript
-npm test         # 需要通过官方脚本或全局 npm 安装 pi 1.5.0，或用 PI_PACKAGE 指向 pi 的包目录
+npm test         # 需要通过官方脚本或全局 npm 安装 pi 1.5.x 或 1.6.x，或用 PI_PACKAGE 指向 pi 的包目录
 ```
 
 源码结构、原生模块的构建、测试的环境变量和 CI 见 [docs/development.md](docs/development.md)。

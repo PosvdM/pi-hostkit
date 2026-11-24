@@ -52,7 +52,7 @@ const toolInputs = () => [
   "~\\win.txt",
 ];
 
-describe("pi path rules (differential against pi 1.5.0 internals)", () => {
+describe("pi path rules (differential against the installed pi internals)", () => {
   test("resolveToolPath matches pi resolveToCwd", () => {
     for (const cwd of [root, path.join(root, "sub"), "~"]) {
       for (const input of toolInputs()) {

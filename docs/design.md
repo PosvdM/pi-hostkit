@@ -40,7 +40,7 @@ pi-hostkit 封装托管 pi 子进程时与操作系统相关的能力。pi-agora
 
 - Windows、macOS、Linux 同时支持。三个平台的行为在本文逐项写明；同一功能在不同平台上的结果一致，实现方式可以不同。各平台的覆盖范围不同之处（进程树终止）在 `StopReport.coverage` 中标明。
 - Node.js 24 及以上（`package.json` 的 `engines`）。
-- pi 1.5.x（`>=1.5.0 <1.6.0`），见“定位 pi”。
+- pi 1.5.x 和 1.6.x（`>=1.5.0 <1.7.0`），见“定位 pi”。
 
 ### 原生模块
 
@@ -68,7 +68,7 @@ export function assertLocalFilesystem(target: string): void; // 非本地时抛�
 
 ## 定位 pi
 
-本文和其他文档中对 pi 行为的依据都以 pi 1.5.0 的文件为准，路径相对于 pi 包目录。
+本文和其他文档中对 pi 行为的依据都以 pi 1.5.0 的文件为准，并在 pi 1.6.0 中核对过；两个版本内容或行号不同的地方分别注明。路径相对于 pi 包目录。
 
 ```ts
 export function locatePi(opts?: { piPath?: string }): Promise<PiInstall>;
@@ -77,7 +77,7 @@ export const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 export interface PiInstall {
   packageDir: string;   // pi 包目录（真实路径）
-  cliEntry: string;     // package.json 的 bin.pi，1.5.0 中为 dist/bundle/cli.js
+  cliEntry: string;     // package.json 的 bin.pi，1.5.x 和 1.6.x 中为 dist/bundle/cli.js
   version: string;      // package.json 的 version
   supported: boolean;   // version 是否在支持区间内
 }
@@ -93,7 +93,7 @@ export interface PiInstall {
 官方 Windows `install.ps1` 和 macOS/Linux `install.sh` 使用相同的 `releases-v1` 布局，默认在 agent 目录下的 `install` 中。目录和环境变量的依据为 pi 1.5.0 的 `dist/config.js`、`dist/package-manager-cli.js`、安装生成的 `pi-launcher.js`，并与 README 链接的官方安装脚本交叉核对。显式 `piPath` 无效时直接报错，不回退。
 
 - 包目录的 `package.json` 的 `name` 必须是 `@earendil-works/pi-coding-agent`，`bin.pi` 的目标必须是普通文件，目录等非文件入口被拒；显式 `piPath` 不回退，损坏的官方候选继续查找其他候选。
-- 只有 `x.y.z` 形式且在 `>=1.5.0 <1.6.0` 内的版本算支持；带预发布后缀（如 `1.5.1-beta.1`）的版本不算。`supported` 为 false 时，使用方拒绝启动受管会话，提示改用支持的 pi 版本。
+- 只有 `x.y.z` 形式且在 `>=1.5.0 <1.7.0` 内的版本算支持；带预发布后缀（如 `1.5.1-beta.1`）的版本不算。`supported` 为 false 时，使用方拒绝启动受管会话，提示改用支持的 pi 版本。
 - 启动 pi 时用 `process.execPath`（Node）经启动门闩运行 `cliEntry`，不经 shell、`pi.cmd` 或 Git Bash，见“启动门闩”。
 
 ## RPC 传输
@@ -255,7 +255,7 @@ export interface StopReport {
 | `cgroup` | Linux（cgroup v2 可用） | scope 内的所有进程 |
 | `snapshot_visible` | macOS；Linux 无 cgroup 或 `containment: "snapshot"` | 只覆盖快照见过的进程，`leftovers` 为空不证明没有残留 |
 
-pi 1.5.0 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令（新会话、新进程组，依据：`dist/core/tools/bash.js:65`），只对 pi 自己的进程组发信号杀不到这些命令。pi 在 RPC 模式下收到 SIGTERM 或 SIGHUP 时会先终止它记录的命令进程树（依据：`dist/modes/rpc/rpc-mode.js:276–283`），但被 SIGKILL 时来不及清理。
+pi 的 `bash` 工具在 POSIX 上以 `detached` 方式启动每条命令（新会话、新进程组，依据：`dist/core/tools/bash.js`，1.5.0 第 65 行，1.6.0 第 77 行），只对 pi 自己的进程组发信号杀不到这些命令。pi 在 RPC 模式下收到 SIGTERM 或 SIGHUP 时会先终止它记录的命令进程树（依据：`dist/modes/rpc/rpc-mode.js`，1.5.0 第 276–283 行，1.6.0 第 287–305 行），但被 SIGKILL 时来不及清理。stdin 关闭后 pi 开始有序关闭；这期间收到 SIGTERM 时，pi 1.5.0 不等关闭完成就退出，1.5.1 起只有第二个信号才这样退出，单个 SIGTERM 不打断有序关闭。两种情况下 pi 都先终止记录的命令进程树。
 
 ### 停止步骤
 
@@ -540,7 +540,7 @@ macOS 的探测只使用 JavaScript 的 `stat`、`readdir`、`lstat`：定位最
 
 pi 1.5.0 的 `dist/utils/paths.js#getPathComparisonKey` 只在 Windows 折叠大小写，在 macOS 保留拼写；工具路径解析和读文件变体仍按 pi 的实际规则执行。hostkit 的 macOS NFC/大小写比较用于锁和访问范围校验，是额外的平台约束；因此明确拒绝大小写敏感卷，而不声称 pi 本身不支持这种卷。
 
-pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-hostkit 自行实现同样的规则。`test/paths.test.mjs` 直接导入 pi 1.5.0 的内部模块逐项比对；升级支持的 pi 版本时先跑这组测试。
+pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-hostkit 自行实现同样的规则。`test/paths.test.mjs` 直接导入所装 pi 的内部模块逐项比对；升级支持的 pi 版本时先跑这组测试。
 
 ## 平台差异汇总
 
@@ -561,10 +561,10 @@ pi 的这些函数位于内部模块，不在包的公开导出里，所以 pi-h
 
 ### 自动测试覆盖
 
-CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模式各一次）、macos-latest、windows-latest 上用 pi 1.5.0 运行全部测试。测试用本地假 provider（`test/fixtures/fake-provider.ts`）驱动真实的 pi 进程，不联网。覆盖：
+CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模式各一次）、macos-latest、windows-latest 上分别用 pi 1.5.0 和 1.6.0 运行全部测试。测试用本地假 provider（`test/fixtures/fake-provider.ts`）驱动真实的 pi 进程，不联网。覆盖：
 
 - **锁**：单实例锁在同一进程内重复获取被拒、持有进程被强杀后由操作系统释放；会话写锁的获取、记录、占用结果和释放；`recoverPreviousWriter` 之前 `update` 被拒；恢复与释放并发时按调用顺序执行、释放后不能再拉起写者；`spawnWriter` 按 pi 的参数规则校验（`--` 之后的 `--session`、`--session=…`、带 `--continue` 都被拒）并限制同时一个写者。
-- **pi 参数规则**：`parsePiArgs` 与 pi 1.5.0 的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models`、`--tools` 写法错误、`@file` 等情况；依赖 pi 环境的路径（相对、`~`、Windows 无盘符）判为无法判断，`spawnWriter` 拒绝它们。
+- **pi 参数规则**：`parsePiArgs` 与所装 pi（1.5.0、1.6.0）的 `parseArgs` 差分比对，覆盖 `--`、取值选项吃掉下一个参数、未知选项、`-p`、`--list-models`、`--tools` 写法错误、`@file` 等情况；依赖 pi 环境的路径（相对、`~`、Windows 无盘符）判为无法判断，`spawnWriter` 拒绝它们。
 - **跨宿主恢复**：宿主进程用 `spawnWriter` 拉起 pi 后被强杀，另一个宿主取锁并停止遗留写者（用例以 pi-pane 为前者、pi-agora 为后者；`app` 字段只是标签，两个方向走同一代码路径）。Windows 上 pi 随 Job 终止，结果为 `none` 或 `stopped`（Job 结束可能略晚于 mutex 被释放）。
 - **fail closed**：部分进程表仍清理可读的候选写者，之后汇总枚举和停止错误；宿主在 pi 停在 gate 时被杀，gate 自行退出，下一个持锁方得到 `failed`，`assumeNoWriter` 后为 `none`；仍停在 gate 的未记录进程按命令行找到并停止；打开 `<会话>.bak` 的 gate、`--session <会话>` 出现在 `--` 之后（只是消息）的 gate、`--session` 为相对路径的 gate 都不被停止，结果为 `failed`；不按协议放行的未记录 pi 无法排除时返回 `failed`；记录不是合法 JSON 或内容不完整时返回 `failed` 且记录不变。
 - **启动门闩**：小于放行行的发送限额在 spawn 前被拒；从不读取 stdin 的真实子进程验证发送队列限额与停止。用已存在的空会话文件验证放行前 pi 没有加载（pi 加载后立即写入会话头），放行前 RPC 发送被拒；直接测试 gate：stdin 结束、内容不符、超长无换行时以退出码 75 退出且不加载入口，放行行与第一条 RPC 在同一次写入中到达时入口拿到完整的参数和下一行，CRLF 放行行被接受；停在 gate 的进程被 `stop` 时以退出码 75 退出（POSIX；Windows 上可能先被 Job 终止）。
@@ -574,7 +574,7 @@ CI（`.github/workflows/ci.yml`）在 ubuntu-latest（cgroup 模式和快照模�
 - **密钥权限**：`ensurePrivateDir` 创建与收紧、`writePrivateFile` 排他且私有、父目录不私密时拒绝写入、Windows 上带私密 DACL 创建文件、`checkPrivate` 报告过宽的权限；macOS 上扩展 ACL 被报告并被 `ensurePrivateDir` 清除。
 - **本地磁盘**：系统临时目录被判为本地，不存在的路径按最深的已存在祖先检查。隔离注入覆盖远程挂载边界、目标/祖先查询失败、原生卷查询失败、根目录缺失及悬空链接的实际写入位置。Linux auto CI 使用本机 SSH 服务经 SSHFS 建立真实远程挂载，验证拒绝挂载内的新路径，并以不可遍历目录验证查询失败不能借用本地祖先的结论。
 - **定位 pi**：版本区间与预发布后缀、`piPath` 的两种写法和显式失败不回退、目录入口拒绝；agent 环境变量的 file URL、Windows shell 路径、波浪号和默认规范化差分边界；临时 HOME 的官方安装布局、环境变量优先级、激活版本切换、损坏 marker/路径穿越/版本不符/CLI 缺失后的 npm 回退；自动定位安装。测试通过隔离副本注入 npm 根目录，不依赖 CI 机器有官方安装。
-- **路径**：与 pi 1.5.0 内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
+- **路径**：与所装 pi（1.5.0、1.6.0）内部函数的差分比对（`resolveToolPath`、`resolveReadToolPath`、`normalizeWindowsShellPath`）、符号链接与不存在的部分、悬空链接、链接循环、`isWithin` 的前缀边界、三个平台的比较键；macOS 上大小写不同的路径共用一把会话写锁。
 - **故障注入**：记录路径探测抛错按损坏处理、获取或探测的意外异常后仍可重新取锁；严格存在性判断只把 ENOENT/ENODEV 当不存在，recorded scope 查询失败仍保留 cgroup 覆盖和未知 scope，gate 协议文件查询不明不能被其他已恢复候选掩盖；快照最后一次读取失败可见、单父查询失败保留独立分支。释放记录改名失败后锁与记录保持原样、可重试（含会话切换）；活写者和查询失败拒绝普通释放、显式切走可释放；单个后代 `EPERM` 或查询失败时其他后代与 pi 进程组继续清理，失败进入报告；RPC gate/命令/UI 有序背压、UTF-8/LF 字节限额、超限恢复、序列化抛错无 pending/计时器残留、写回调或同步写失败清理。Windows 验证 Global/SID 名称、创建的 owner/DACL、真实异主对象即使 DACL 允许 FullControl 也拒绝；CI 要求该异主测试执行，本机未提权可明确跳过。
 - **macOS 卷检测**：CI 用 `hdiutil` 创建并挂载真实大小写敏感 APFS 磁盘映像，在其中验证路径比较、待创建路径和会话锁被拒绝。隔离测试副本注入探测函数及文件系统调用，覆盖敏感、不明、权限错误、挂载边界、文件级挂载、大小写硬链接、符号链接目标；确认 `pi-hostkit/paths` 禁用 native 加载仍可工作。测试接口不进入生产源码或公开类型化 API；快照依赖注入只在不导出的内部模块，进程查询模拟只在显式启用 Node 测试模块 mock 的子进程中使用。没有生产环境变量测试开关。
 - **RPC 分帧**：只按 LF 切分（`U+2028`、`U+2029` 保留）、CR 去除、跨块拼接与多字节字符、记录上限、末尾半条记录、乱序响应、事件与 UI 请求分发、超时与迟到响应、超过 1024 次超时后迟到响应也不会交给复用了调用方 id 的新命令、非法 JSON、stdout 结束、监听器异常。

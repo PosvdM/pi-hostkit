@@ -189,11 +189,33 @@ test("a managed bin.pi directory falls back to the next official candidate befor
 test("managed activation is reread and an unsupported active release is not hidden by npm", async (t) => {
   const f = await fixture(t);
   const first = await managedAt(f.defaultRoot, "1.5.0");
-  const second = await packageAt(path.join(f.defaultRoot, "releases", "1.6.0", "node_modules", ...packageParts), "1.6.0");
-  const result = await locateIn(f.home, {}, [{}, { activate: { root: f.defaultRoot, version: "1.6.0" } }]);
+  const second = await packageAt(path.join(f.defaultRoot, "releases", "1.7.0", "node_modules", ...packageParts), "1.7.0");
+  const result = await locateIn(f.home, {}, [{}, { activate: { root: f.defaultRoot, version: "1.7.0" } }]);
   assert.equal(result.npmCalls, 0);
   assert.deepEqual(result.results.map((r) => r.install.packageDir), [first, second]);
   assert.equal(result.results[1].install.supported, false);
+});
+
+test("located 1.6.x releases are supported and 1.7.0 is not", async (t) => {
+  const f = await fixture(t);
+  const versions = ["1.6.0", "1.6.9", "1.7.0"];
+  const dirs = [await managedAt(f.defaultRoot, versions[0])];
+  for (const version of versions.slice(1)) {
+    dirs.push(await packageAt(path.join(f.defaultRoot, "releases", version, "node_modules", ...packageParts), version));
+  }
+  const explicit = await packageAt(path.join(f.root, "explicit-1.7.0"), "1.7.0");
+  const result = await locateIn(f.home, {}, [
+    {},
+    ...versions.slice(1).map((version) => ({ activate: { root: f.defaultRoot, version } })),
+    { piPath: explicit },
+  ]);
+  assert.equal(result.npmCalls, 0);
+  assert.deepEqual(result.results.map((r) => [r.install.packageDir, r.install.version, r.install.supported]), [
+    [dirs[0], "1.6.0", true],
+    [dirs[1], "1.6.9", true],
+    [dirs[2], "1.7.0", false],
+    [explicit, "1.7.0", false],
+  ]);
 });
 
 test("invalid or incomplete managed installs fall back to the npm root", async (t) => {

@@ -6,7 +6,7 @@
 
 - Node.js 24 及以上和 npm。
 - 编译原生模块所需的工具链，见 [node-gyp 的安装说明](https://github.com/nodejs/node-gyp#installation)：Python 3，以及 C 编译器（macOS 为 Xcode Command Line Tools，Linux 为 gcc 和 make，Windows 为带“使用 C++ 的桌面开发”的 Visual Studio Build Tools）。
-- 运行测试需要 pi 1.5.0：通过官方脚本或全局 npm 安装，或用环境变量 `PI_PACKAGE` 指向 pi 的包目录。未设置 `PI_PACKAGE` 时按 `locatePi` 的顺序定位，见 [design.md](design.md#定位-pi)。
+- 运行测试需要支持范围内的 pi（1.5.x 或 1.6.x）：通过官方脚本或全局 npm 安装，或用环境变量 `PI_PACKAGE` 指向 pi 的包目录。未设置 `PI_PACKAGE` 时按 `locatePi` 的顺序定位，见 [design.md](design.md#定位-pi)。
 
 ## 源码结构
 
@@ -29,7 +29,7 @@
 | `src/native.ts` | 第一次使用时用 `node-gyp-build` 加载原生模块；`NativeBinding` 接口列出原生模块的全部函数 |
 | `src/native/hostkit_posix.c` | macOS 和 Linux 的原生模块：`flock` 锁（`flockAcquire`、`fdClose`）、`fsInfo`；仅 macOS：进程表（`processInfo`、`listProcesses`，用 `sysctl(KERN_PROC)`）、命令行（`processArgs`）、扩展 ACL（`aclEntryCount`、`aclClear`）；仅 Linux：pidfd（`pidfdOpen`、`pidfdSignal`） |
 | `src/native/hostkit_win.c` | Windows 的原生模块：进程表与身份（`NtQuerySystemInformation`）、命令行（拆成参数）、按身份终止进程、Job Object、命名 mutex、`fsInfo`、当前用户 SID、DACL 的设置与读取、带私密 DACL 创建文件（`createPrivateFile`） |
-| `src/piargs.ts` | 按 pi 1.5.0 `parseArgs` 的规则解析 pi 参数，判断 pi 实际以 RPC 模式打开哪个会话文件（`spawnWriter` 校验和恢复时的候选判断） |
+| `src/piargs.ts` | 按 pi `parseArgs` 的规则解析 pi 参数，判断 pi 实际以 RPC 模式打开哪个会话文件（`spawnWriter` 校验和恢复时的候选判断） |
 | `binding.gyp` | 按平台选择 C 源文件；Windows 链接 `advapi32.lib`（ACL、令牌）和 `shell32.lib`（`CommandLineToArgvW`）；`NAPI_VERSION=8` |
 | `test/` | 测试，见“测试” |
 
@@ -83,9 +83,9 @@ npm test
 | `test/cgroup-subtree.test.mjs` | 真实委派 scope 的两棵子 cgroup；整体清理与部分查询失败时独立清理 |
 | `test/cgroup-faults.test.mjs` | cgroup 旧内核退回、逐 PID 信号与查询错误、部分/最终列举失败、已知身份及未知哨兵、独立 pi 保底 |
 | `test/windows-mutex.test.mjs` | Windows mutex 的 owner、DACL、跨进程互斥、真实异主对象拒绝；CI 不允许异主测试跳过 |
-| `test/piargs.test.mjs` | pi 参数解析；与 pi 1.5.0 内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
+| `test/piargs.test.mjs` | pi 参数解析；与所装 pi 的内部模块 `dist/cli/args.js` 的 `parseArgs` 差分比对 |
 | `test/gate.test.mjs` | 启动门闩本身：用 `test/fixtures/marker-entry.mjs` 代替 pi 的入口，检查拒绝放行时入口没有加载、放行后入口拿到的参数和下一行输入 |
-| `test/paths.test.mjs` | 路径规则；与 pi 1.5.0 内部模块 `dist/utils/paths.js`、`dist/core/tools/path-utils.js` 的差分比对 |
+| `test/paths.test.mjs` | 路径规则；与所装 pi 的内部模块 `dist/utils/paths.js`、`dist/core/tools/path-utils.js` 的差分比对 |
 | `test/process.test.mjs` | `spawnManaged`、启动门闩、进程树终止、进程身份、`stopByIdentity`、Linux cgroup |
 | `test/locks.test.mjs` | 单实例锁、会话写锁、跨宿主恢复和 fail closed 的各种情况 |
 | `test/misc.test.mjs` | 密钥权限、本地磁盘检查、`locatePi` |
@@ -108,6 +108,7 @@ npm test
 | 变量 | 作用 |
 | --- | --- |
 | `PI_PACKAGE` | pi 的包目录。设置后测试使用该安装，并跳过自动定位 smoke 用例；隔离 HOME 的定位测试仍执行 |
+| `HOSTKIT_TEST_PI_VERSION` | 设置后要求测试找到的 pi 版本与之相同；CI 用它确认矩阵中的 pi 版本确实被测到 |
 | `HOSTKIT_TEST_CONTAINMENT` | `auto`（默认）或 `snapshot`，传给 `spawnManaged` 的 `containment`；在 Linux 上用 `snapshot` 测试快照模式 |
 | `HOSTKIT_TEST_REQUIRE_CGROUP` | 设为 `1` 时，Linux 上 cgroup v2 user scope 不可用则测试失败；用于防止 CI 静默退回快照模式 |
 | `HOSTKIT_TEST_APFS` | CI 用 `hdiutil` 创建并挂载的大小写敏感 APFS 测试卷；未设置时只跳过该真实挂载用例 |
@@ -122,8 +123,8 @@ npm test
 
 `test` 任务：
 
-- 矩阵：ubuntu-latest、macos-latest、windows-latest 各以 `containment=auto` 运行一次，ubuntu-latest 再以 `containment=snapshot` 运行一次。
-- 步骤：安装 Node 24，`npm ci`（构建原生模块和 `dist/`），全局安装 pi 1.5.0，`npm test`。
+- 矩阵：pi 1.5.0 和 1.6.0 各一组；每组中 ubuntu-latest、macos-latest、windows-latest 各以 `containment=auto` 运行一次，ubuntu-latest 再以 `containment=snapshot` 运行一次，共 8 个任务。支持范围内的每个次版本至少测一个版本。
+- 步骤：安装 Node 24，`npm ci`（构建原生模块和 `dist/`），全局安装矩阵指定的 pi 版本，`npm test`。`HOSTKIT_TEST_PI_VERSION` 设为同一版本。
 - Linux 的用户 systemd：运行器上没有登录会话，所以先 `sudo loginctl enable-linger "$USER"` 启动用户的 systemd 实例，等待 `/run/user/<uid>/bus` 出现，再把 `XDG_RUNTIME_DIR` 和 `DBUS_SESSION_BUS_ADDRESS` 写入后续步骤的环境。`auto` 模式下同时设置 `HOSTKIT_TEST_REQUIRE_CGROUP=1`。子树用例另建带 `Delegate=yes` 的 scope，创建两个实际子 cgroup；CI 不允许因缺少 cgroup 支持跳过。
 - macOS 用 `hdiutil create -fs "Case-sensitive APFS"` 创建 256 MiB 的大小写敏感 APFS 磁盘映像并挂载，在其中验证路径比较与会话锁拒绝；测试结束后卸载。
 - Linux auto 安装 SSHFS 与 OpenSSH server，用运行器临时目录中的专用密钥启动本机端口 2222 的 SSH 服务并挂载 SFTP 目录。远程卷用例同时检查明确非本地和无法遍历目录的 `EACCES`，不改宿主真实 HOME 下的 SSH 配置；测试结束后卸载并停止该 SSH 服务。
@@ -146,11 +147,11 @@ npm test
 ## 修改约定
 
 - **接口与行为**：修改公开接口、默认值或平台行为时，同步更新 [design.md](design.md)，并在 pi-pane、pi-agora 中检查引用它的文档。
-- **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 和 `test/piargs.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。
+- **支持的 pi 版本**：修改 `src/locate.ts` 的 `SUPPORTED_PI_RANGE` 之前，先用 `PI_PACKAGE` 指向新版本跑 `test/paths.test.mjs` 和 `test/piargs.test.mjs` 的差分测试，再跑全部测试；pi 的路径规则变化时同步修改 `src/paths.ts`。design.md 中“依据”引用的 pi 文件和行号也要按新版本核对。同时修改 README 和 design.md 中的版本范围、`test/misc.test.mjs` 与 `test/locate.test.mjs` 的范围边界用例，以及 CI 矩阵的 `pi` 版本。
 - **会话写锁协议**：锁文件和 mutex 的名称与位置、会话 key 的算法、共享记录的格式和语义都属于协议 `v1`。修改其中任何一项都是不兼容修改，pane 和 agora 要同时升级；接入方使用后需要不兼容修改时改用新的协议版本名；现有 Global/SID 名称与释放语义使用 `v1`，见 design.md。
 - **启动门闩**：`src/gate.ts` 只依赖 `src/gate-protocol.ts` 和 Node 内置模块，不加载原生模块，在 pi 加载之前不做多余的事。修改放行行或退出码时，宿主和 gate 必须来自同一版本的 pi-hostkit。
 - **原生函数**：增加或修改原生函数时，同时修改对应的 C 文件和 `src/native.ts` 的 `NativeBinding`。只在部分平台存在的函数声明为可选，经 `nativeFn` 调用（不存在时抛出 `ENOTSUP`）。
 - **`pi-hostkit/paths`**：`src/paths.ts` 不导入 `src/native.ts` 或其他会加载原生模块的文件，因为这个入口在 pi 进程里的扩展中使用。
 - **发信号和终止进程**：一律经过核对进程身份的函数（POSIX 用 `src/proctable.ts` 的 `signalProcess`，Linux 上经 pidfd；Windows 用按创建时间核对的 `terminateProcess`），不直接对 PID 调用 `process.kill`。没有 `cgroup.kill` 的内核上逐个终止 scope 成员时，同样经 `signalProcess`，并在发信号前核对该进程仍在这个 scope 里。
 - **进程表遍历**：按父子关系找后代用内部 `verifiedDescendants`，它在读完进程表后重新核对每个父进程，丢掉经由已换了进程的 PID 找到的行。快照提供逐父核对函数，将查询错误记入报告并只否决相关分支。`stopCgroup` 的调用方必须确认是 hostkit 自己的 scope，并提供有界的 settle 等待。
-- **pi 参数规则**：`src/piargs.ts` 照搬 pi 1.5.0 的 `parseArgs`，`test/piargs.test.mjs` 与 pi 的实现做差分比对。升级支持的 pi 版本时先跑这组测试，pi 增减选项时同步修改。
+- **pi 参数规则**：`src/piargs.ts` 照搬 pi 的 `parseArgs`（1.5.0 和 1.6.0 只有帮助文本不同），`test/piargs.test.mjs` 与所装 pi 的实现做差分比对。升级支持的 pi 版本时先跑这组测试，pi 增减选项时同步修改。

@@ -1,9 +1,8 @@
 import { environmentIndependentPath } from "./paths.js";
 
-// Mirror of pi 1.5.0 `parseArgs` (dist/cli/args.js): which arguments consume
-// a value, `--` ending options, `@file` arguments and unknown flags. Only the
-// fields hostkit needs are kept. test/piargs.test.mjs compares it with pi's
-// own parser; run it before supporting a new pi version.
+// 照搬 pi `parseArgs`（dist/cli/args.js）的规则：哪些参数取下一个值、`--` 结束选项、
+// `@file` 参数和未知选项，只保留 hostkit 需要的字段。pi 1.5.0 和 1.6.0 的 args.js 只有
+// 帮助文本不同。test/piargs.test.mjs 与所装 pi 的解析器逐项比对，支持新的 pi 版本前先跑它。
 
 export interface PiArgs {
   mode?: string;
@@ -24,7 +23,7 @@ export interface PiArgs {
   errors: string[];
 }
 
-/** pi 1.5.0 `getToolListError` (dist/core/settings-manager.js). */
+/** pi `getToolListError`（dist/core/settings-manager.js，1.5.0 和 1.6.0 相同）。 */
 function toolListError(entries: string[]): string | undefined {
   const modifiers = entries.filter((e) => e.startsWith("+") || e.startsWith("-"));
   if (modifiers.length === 0) return undefined;
@@ -165,14 +164,12 @@ export function parsePiArgs(args: readonly string[]): PiArgs {
 }
 
 /**
- * The session file a pi started with `args` opens for writing in RPC mode,
- * following pi 1.5.0 `main` and `createSessionManager`. Returns `{}` when pi
- * would not run as an RPC writer of a file given by path: parser errors,
- * `--version`, `--export`, not RPC mode, `@file` arguments in RPC mode,
- * `--fork`, `--session-id` together with `--session`, `--no-session`,
- * `--help`, `--list-models`, no `--session`, or a value pi treats as a session
- * id. Returns `{ uncertain: true }` when the value is a path whose meaning
- * depends on the pi process (relative, `~`, Windows path without a drive).
+ * 按 pi 1.5.0 和 1.6.0 的 `main`、`createSessionManager`，求以 `args` 启动的 pi 在
+ * RPC 模式下写入的会话文件。pi 不会以 RPC 模式写入按路径给出的文件时返回 `{}`：
+ * 解析出错、`--version`、`--export`、不是 RPC 模式、RPC 模式下有 `@file` 参数、
+ * `--fork`、`--session-id` 与 `--session` 同时出现、`--no-session`、`--help`、
+ * `--list-models`、没有 `--session`，或 pi 把该值当作会话 id。该值是含义取决于
+ * pi 进程的路径（相对路径、`~`、Windows 无盘符路径）时返回 `{ uncertain: true }`。
  */
 export function rpcSessionFile(args: readonly string[]): { file?: string; uncertain?: true } {
   const p = parsePiArgs(args);

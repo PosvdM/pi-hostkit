@@ -5,13 +5,13 @@ import path from "node:path";
 import { resolveToolPath } from "./paths.js";
 
 export const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-/** Supported pi versions: `>=1.5.0 <1.6.0`. */
-export const SUPPORTED_PI_RANGE = { min: [1, 5, 0], below: [1, 6, 0] } as const;
+/** 支持的 pi 版本：`>=1.5.0 <1.7.0`，即 1.5.x 和 1.6.x。 */
+export const SUPPORTED_PI_RANGE = { min: [1, 5, 0], below: [1, 7, 0] } as const;
 
 export interface PiInstall {
   /** `@earendil-works/pi-coding-agent` package directory (real path). */
   packageDir: string;
-  /** `bin.pi` from package.json (`dist/bundle/cli.js` in 1.5.0). */
+  /** package.json 的 `bin.pi`，1.5.x 和 1.6.x 中为 `dist/bundle/cli.js`。 */
   cliEntry: string;
   version: string;
   /** Whether `version` is within `SUPPORTED_PI_RANGE`. */

@@ -52,7 +52,7 @@ const cases = [
   ["--mode", "rpc", "--session-id", "x", "--session", abs],
 ];
 
-describe("parsePiArgs (differential against pi 1.5.0 parseArgs)", () => {
+describe("parsePiArgs (differential against the installed pi parseArgs)", () => {
   test("session-related fields and errors match pi", () => {
     for (const args of cases) {
       const mine = parsePiArgs(args);
